@@ -108,12 +108,12 @@ if "__main__" == __name__:
         help="On Slurm cluster, do not copy data to the local scratch.",
     )
     parser.add_argument(
-        "--base_data_dir", type=str, default=None, help="Base path to the datasets."
+        "--base_data_dir", type=str, default="/mnt/data/dataset/marigold/vkitti", help="Base path to the datasets."
     )
     parser.add_argument(
         "--base_ckpt_dir",
         type=str,
-        default=None,
+        default="/mnt/data/model/marigold/",
         help="Base path to the pretrained checkpoints.",
     )
     parser.add_argument(

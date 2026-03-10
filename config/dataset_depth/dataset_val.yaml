@@ -23,23 +23,30 @@ dataset:
 
   # Smaller subsets for faster validation during training
   # The first dataset is used to calculate main eval metric.
-  - name: hypersim_depth
-    disp_name: hypersim_depth_val_small_80
-    dir: hypersim/hypersim_processed_val.tar
-    filenames: data_split/hypersim_depth/filename_list_val_filtered_small_80.txt
-    resize_to_hw:
-    - 480
-    - 640
+  # - name: hypersim_depth
+  #   disp_name: hypersim_depth_val_small_80
+  #   dir: hypersim/hypersim_processed_val.tar
+  #   filenames: data_split/hypersim_depth/filename_list_val_filtered_small_80.txt
+  #   resize_to_hw:
+  #   - 480
+  #   - 640
 
-  - name: nyu_depth
-    disp_name: nyu_depth_train_small_100
-    dir: nyuv2/nyu_labeled_extracted.tar
-    filenames: data_split/nyu_depth/labeled/filename_list_train_small_100.txt
-    eigen_valid_mask: true
+  # - name: nyu_depth
+  #   disp_name: nyu_depth_train_small_100
+  #   dir: nyuv2/nyu_labeled_extracted.tar
+  #   filenames: data_split/nyu_depth/labeled/filename_list_train_small_100.txt
+  #   eigen_valid_mask: true
 
-  - name: kitti_depth
-    disp_name: kitti_depth_val_from_train_sub_100
-    dir: kitti/kitti_sampled_val_800.tar
-    filenames: data_split/kitti_depth/eigen_val_from_train_sub_100.txt
-    kitti_bm_crop: true
-    valid_mask_crop: eigen
+  # - name: kitti_depth
+  #   disp_name: kitti_depth_val_from_train_sub_100
+  #   dir: kitti/kitti_sampled_val_800.tar
+  #   filenames: data_split/kitti_depth/eigen_val_from_train_sub_100.txt
+  #   kitti_bm_crop: true
+  #   valid_mask_crop: eigen
+
+    - name: vkitti_depth
+      disp_name: vkitti_depth_val
+      dir: /
+      filenames: data_split/vkitti_depth/vkitti_val.txt
+      kitti_bm_crop: true
+      valid_mask_crop: null  

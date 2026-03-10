@@ -1,9 +1,16 @@
 dataset:
   vis:
-  - name: hypersim_depth
-    disp_name: hypersim_depth_vis
-    dir: hypersim/hypersim_processed_val.tar
-    filenames: data_split/hypersim_depth/selected_vis_sample.txt
-    resize_to_hw:
-    - 480
-    - 640
+  # - name: hypersim_depth
+  #   disp_name: hypersim_depth_vis
+  #   dir: hypersim/hypersim_processed_val.tar
+  #   filenames: data_split/hypersim_depth/selected_vis_sample.txt
+  #   resize_to_hw:
+  #   - 480
+  #   - 640
+
+    - name: vkitti_depth
+      disp_name: vkitti_depth_vis
+      dir: /
+      filenames: data_split/vkitti_depth/vkitti_vis.txt
+      kitti_bm_crop: true
+      valid_mask_crop: null 

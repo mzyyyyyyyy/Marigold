@@ -2,6 +2,7 @@
 set -e
 set -x
 
+BASE_DATA_DIR="/mnt/data/dataset/marigold"
 subfolder=${1:-"eval"}
 
 python script/depth/eval.py \

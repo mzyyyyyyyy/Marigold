@@ -93,7 +93,7 @@ class MarigoldDepthTrainer:
         self.model.encode_empty_text()
         self.empty_text_embed = self.model.empty_text_embed.detach().clone().to(device)
 
-        self.model.unet.enable_xformers_memory_efficient_attention()
+        # self.model.unet.enable_xformers_memory_efficient_attention()
 
         # Trainability
         self.model.vae.requires_grad_(False)

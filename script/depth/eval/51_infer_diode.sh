@@ -3,12 +3,13 @@ set -e
 set -x
 
 # Use specified checkpoint path, otherwise, default value
-ckpt=${1:-"prs-eth/marigold-depth-v1-1"}
-subfolder=${2:-"eval"}
-n_ensemble=${3:-10}
+# ckpt=${1:-"prs-eth/marigold-depth-v1-1"}
+BASE_DATA_DIR="/mnt/data/dataset/marigold"
+subfolder="eval"
+n_ensemble=10
 
 python script/depth/infer.py \
-    --checkpoint $ckpt \
+    --checkpoint /mnt/data/model/marigold/marigold-depth-v1-1 \
     --seed 1234 \
     --base_data_dir $BASE_DATA_DIR \
     --denoise_steps 1 \

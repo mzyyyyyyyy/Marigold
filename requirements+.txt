@@ -2,3 +2,4 @@ omegaconf
 pandas
 tabulate
 torchmetrics
+opencv-python

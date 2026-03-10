@@ -3,5 +3,5 @@ opencv-python
 tensorboard
 wandb
 scikit-learn
-xformers==0.0.28
+# xformers==0.0.28
 

@@ -44,7 +44,7 @@ from tqdm.auto import tqdm
 
 from marigold import MarigoldDepthPipeline, MarigoldDepthOutput
 
-EXTENSION_LIST = [".jpg", ".jpeg", ".png"]
+EXTENSION_LIST = [".jpg", ".jpeg", ".png", ".tif"]
 
 
 if "__main__" == __name__:
@@ -235,12 +235,43 @@ if "__main__" == __name__:
     )
 
     # -------------------- Inference and saving --------------------
+    def load_image(path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".tif", ".tiff"):
+            import rasterio
+            with rasterio.open(path) as ds:
+                profile = ds.profile.copy()
+                bands = [ds.read(i) for i in range(1, min(ds.count, 3) + 1)]
+                if len(bands) == 1:
+                    bands = bands * 3
+                arr = np.stack(bands, axis=-1).astype(np.float32)
+            lo, hi = np.percentile(arr, (2, 98))
+            arr = np.clip((arr - lo) / (hi - lo + 1e-8) * 255, 0, 255).astype(np.uint8)
+            return Image.fromarray(arr, mode="RGB"), profile
+        else:
+            return Image.open(path), None
+
+    def save_depth_tif(depth_np, save_path, src_profile=None):
+        import rasterio
+        if src_profile is not None:
+            profile = src_profile.copy()
+            profile.update(dtype=rasterio.float32, count=1, compress="deflate")
+        else:
+            h, w = depth_np.shape
+            profile = dict(driver="GTiff", dtype=rasterio.float32,
+                        width=w, height=h, count=1, compress="deflate")
+        with rasterio.open(save_path, "w", **profile) as ds:
+            ds.write(depth_np.astype(np.float32), 1)
+
+
     with torch.no_grad():
         os.makedirs(output_dir, exist_ok=True)
 
         for rgb_path in tqdm(rgb_filename_list, desc="Depth Inference", leave=True):
             # Read input image
-            input_image = Image.open(rgb_path)
+
+            # input_image = Image.open(rgb_path) # 自然图像
+            input_image, src_profile = load_image(rgb_path) # 遥感ps图像
 
             # Random number generator
             if seed is None:
@@ -280,6 +311,13 @@ if "__main__" == __name__:
             if os.path.exists(png_save_path):
                 logging.warning(f"Existing file: '{png_save_path}' will be overwritten")
             Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")
+
+            # Save as GeoTIFF (float32, [0,1])
+            tif_save_path = os.path.join(output_dir_tif, f"{pred_name_base}.tif")
+            if os.path.exists(tif_save_path):
+                logging.warning(f"Existing file: '{tif_save_path}' will be overwritten")
+            save_depth_tif(depth_pred, tif_save_path, src_profile=src_profile)
+
 
             # Colorize
             colored_save_path = os.path.join(
