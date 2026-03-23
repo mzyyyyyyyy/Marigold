@@ -28,6 +28,7 @@
 # If you find Marigold useful, we kindly ask you to cite our papers.
 # --------------------------------------------------------------------------
 
+import json
 import sys
 import os
 
@@ -38,11 +39,13 @@ import logging
 import os
 import shutil
 import torch
+from torch.utils.data import random_split
 from datetime import datetime, timedelta
 from omegaconf import OmegaConf
 from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 from typing import List, Union
+import numpy as np
 
 from marigold import MarigoldDepthPipeline
 from src.dataset import BaseDepthDataset, DatasetMode, get_dataset
@@ -64,7 +67,8 @@ from src.util.logging_util import (
     save_wandb_job_id,
     tb_logger,
 )
-from src.util.slurm_util import get_local_scratch_dir, is_on_slurm
+from src.util.ps_data_transform import get_multiscale_transforms
+from src.util.ps_dataset import SameSizeBatchDataset, LazyMultiScaleDataset
 
 
 if "__main__" == __name__:
@@ -78,7 +82,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--config",
         type=str,
-        default="config/train_marigold_depth.yaml",
+        default="config/ps_mrg_v2.yaml",
         help="Path to config file.",
     )
     parser.add_argument(
@@ -162,7 +166,7 @@ if "__main__" == __name__:
             out_dir_run = os.path.join("./output", job_name)
         os.makedirs(out_dir_run, exist_ok=False)
 
-    cfg_data = cfg.dataset
+    
 
     # Other directories
     out_dir_ckpt = os.path.join(out_dir_run, "checkpoint")
@@ -230,26 +234,7 @@ if "__main__" == __name__:
         os.system(f"rm -rf {_temp_code_dir}")
         logging.info(f"Code snapshot saved to: {_code_snapshot_path}")
 
-    # -------------------- Copy data to local scratch (Slurm) --------------------
-    if is_on_slurm() and (not args.do_not_copy_data):
-        # local scratch dir
-        original_data_dir = base_data_dir
-        base_data_dir = os.path.join(get_local_scratch_dir(), "Marigold_data")
-        # copy data
-        required_data_list = find_value_in_omegaconf("dir", cfg_data)
-        # if cfg_train.visualize.init_latent_path is not None:
-        #     required_data_list.append(cfg_train.visualize.init_latent_path)
-        required_data_list = list(set(required_data_list))
-        logging.info(f"Required_data_list: {required_data_list}")
-        for d in tqdm(required_data_list, desc="Copy data to local scratch"):
-            ori_dir = os.path.join(original_data_dir, d)
-            dst_dir = os.path.join(base_data_dir, d)
-            os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
-            if os.path.isfile(ori_dir):
-                shutil.copyfile(ori_dir, dst_dir)
-            elif os.path.isdir(ori_dir):
-                shutil.copytree(ori_dir, dst_dir)
-        logging.info(f"Data copied to: {base_data_dir}")
+
 
     # -------------------- Gradient accumulation steps --------------------
     eff_bs = cfg.dataloader.effective_batch_size
@@ -261,83 +246,218 @@ if "__main__" == __name__:
         f"Effective batch size: {eff_bs}, accumulation steps: {accumulation_steps}"
     )
 
+    # -------------------- Data_PS --------------------
+    cfg_data = cfg.dataset
+    patch_sizes=[(size, size) for size in cfg_data.patch_sizes]
+    
+    if cfg.dataset.efficient_batching:
+        print('Using efficient batching')
+        base_dataset = LazyMultiScaleDataset(
+            input_dir=cfg_data.input_dir, 
+            output_dir=cfg_data.output_dir,
+            selected_bands=cfg_data.selected_bands,
+            file_type_input=cfg_data.file_type_input,
+            file_type_output= cfg_data.file_type_output,
+            target_name = cfg_data.target_name,
+            patch_sizes=patch_sizes,
+            patches_per_tile=cfg_data.num_patches_per_tile, 
+            min_valid_ratio=cfg_data.min_valid_ratio,
+            normalize_target=cfg_data.normalize_target,
+            year=cfg_data.year,
+            selected_percentile=cfg_data.selected_percentile,
+            patch_coord_path = cfg_data.patch_coord_path,
+            tile_emphasis = cfg_data.tile_emphasis,
+            nodata_cleaning = cfg_data.nodata_cleaning,
+            correlation_cleaning = cfg_data.correlation_cleaning,
+            input_dir_m2 = cfg_data.input_dir_m2,
+            input_multimodal = cfg_data.input_multimodal,
+            use_geo_location = cfg_data.use_geo_location,
+            file_type_m2 = cfg_data.file_type_m2,
+            selected_bands_m2 = cfg_data.selected_bands_m2,
+            target_range_edges = cfg_data.target_range_edges,
+            num_patches_per_target_range = cfg_data.num_patches_per_target_range
+        )
+
+        total_size = len(base_dataset)
+        train_size = int(cfg_data.train_split * total_size)
+        val_size = int(cfg_data.val_split * total_size)
+        test_size = total_size - train_size - val_size
+        
+        train_dataset, val_dataset, test_dataset = random_split(
+            base_dataset, [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(cfg_data.split_seed)
+        )
+        
+        train_indices = set(train_dataset.indices)
+        val_indices = set(val_dataset.indices)
+        test_indices = set(test_dataset.indices)
+
+        assert len(train_indices.intersection(val_indices)) == 0
+        assert len(train_indices.intersection(test_indices)) == 0
+        assert len(val_indices.intersection(test_indices)) == 0
+
+        input_channels = base_dataset.input_channels
+        in_out_scale_factor = base_dataset.in_out_scale_factor # width, input/output
+        # in_out_scale_factor = round(in_out_scale_factor) if (in_out_scale_factor>1) else in_out_scale_factor # for planet
+        if cfg_data.input_multimodal:
+            input_m2_channels = base_dataset.input_m2_channels
+
+    else:
+       raise ValueError('Crop-first batching is not supported yet')
+
+    # collect global norm statistics if using global norm
+    if cfg_data.use_global_norm or cfg_data.use_global_minmax:
+        with open(cfg_data.globalnorm_stats_file, "r") as f:
+            all_stats = json.load(f)
+            try:
+                # ipdb.set_trace()
+                gb_stats = all_stats[str(cfg_data.year)]
+
+            except:
+                print(f'Can not load input statistics for year {cfg_data.year}')
+    else:
+        gb_stats = None
+
+    # collect target norm statistics if using target normalization
+    if cfg_data.normalize_target or cfg_data.minmax_target:
+        with open(cfg_data.targetnorm_stats_file, "r") as f:
+            all_tn_stats = json.load(f)
+            try:
+                tn_stats = all_tn_stats[str(cfg_data.year)]
+            except:
+                print(f'Can not load target statistics for year {cfg_data.year}')
+    else:
+        tn_stats = None
+
+
+    train_input_transform = get_multiscale_transforms( # 这个函数的作用是根据配置参数创建多尺度数据变换操作的组合。即，train_input_transform是包含多个操作的函数
+        patch_sizes, num_channels=input_channels, is_training=True, is_output=False,
+        use_global_minmax= cfg_data.use_global_minmax,
+        use_global_norm=cfg_data.use_global_norm,
+        use_local_norm = cfg_data.use_local_norm,
+        globalnorm_stats=gb_stats
+    )
+    train_output_transform = get_multiscale_transforms(
+        patch_sizes, num_channels=input_channels, is_training=True, is_output=True, 
+        normalize_target=cfg_data.normalize_target,
+        minmax_target=cfg_data.minmax_target,
+        unit_scale_ratio=cfg_data.unit_scale_ratio,
+        target_mean = base_dataset.target_mean if cfg_data.normalize_target else None,
+        target_std = base_dataset.target_std if cfg_data.normalize_target else None,
+        targetnorm_stats= tn_stats
+        # use_shift_augmentation=config['data']['use_shift_augmentation'],
+        # shift_limit=config['data']['shift_limit'],
+        # shift_augmentation_p=config['data']['shift_augmentation_p']
+    )
+    val_input_transform = get_multiscale_transforms(
+        patch_sizes, num_channels=input_channels, is_training=False, is_output=False,
+        use_global_minmax=cfg_data.use_global_minmax,
+        use_global_norm=cfg_data.use_global_norm,
+        use_local_norm=cfg_data.use_local_norm,
+        globalnorm_stats=gb_stats
+    )
+    val_output_transform = get_multiscale_transforms(
+        patch_sizes, num_channels=input_channels, is_training=False, is_output=True,
+        normalize_target=cfg_data.normalize_target,
+        minmax_target=cfg_data.minmax_target,
+        unit_scale_ratio=cfg_data.unit_scale_ratio,
+        target_mean = base_dataset.target_mean if cfg_data.normalize_target else None,
+        target_std = base_dataset.target_std if cfg_data.normalize_target else None,
+        targetnorm_stats= tn_stats
+    )
+    test_input_transform = get_multiscale_transforms(
+        patch_sizes, num_channels=input_channels, is_training=False, is_output=False,
+        use_global_minmax=cfg_data.use_global_minmax,
+        use_global_norm=cfg_data.use_global_norm,
+        use_local_norm=cfg_data.use_local_norm,
+        globalnorm_stats=gb_stats
+    )
+    test_output_transform = get_multiscale_transforms(
+        patch_sizes, num_channels=input_channels, is_training=False, is_output=True,
+        normalize_target=cfg_data.normalize_target,
+        minmax_target=cfg_data.minmax_target,
+        unit_scale_ratio=cfg_data.unit_scale_ratio,
+        target_mean = base_dataset.target_mean if cfg_data.normalize_target else None,
+        target_std = base_dataset.target_std if cfg_data.normalize_target else None,
+        targetnorm_stats= tn_stats
+    )
+
+    print('Warning: target mean and std are calculated on the whole dataset (after filtering), not excluding test set!')
+    
+
+    # Create efficient batching datasets
+    train_dataset = SameSizeBatchDataset(
+        train_dataset, 
+        patch_sizes, 
+        eff_bs,
+        transform_input=train_input_transform,
+        transform_output=train_output_transform,
+        lons=np.array(cfg_data.tile_lon_range),
+        lats=np.array(cfg_data.tile_lat_range)
+    )
+    
+    val_dataset = SameSizeBatchDataset(
+        val_dataset, 
+        patch_sizes, 
+        1, # for validation, we can set batch size to 1 in marigold
+        transform_input=val_input_transform,
+        transform_output=val_output_transform,
+        lons=np.array(cfg_data.tile_lon_range),
+        lats=np.array(cfg_data.tile_lat_range)
+    )
+    
+    test_dataset = SameSizeBatchDataset(
+        test_dataset, 
+        patch_sizes, 
+        1, # for testing, we can set batch size to 1 in marigold
+        transform_input=test_input_transform,
+        transform_output=test_output_transform,
+        lons=np.array(cfg_data.tile_lon_range),
+        lats=np.array(cfg_data.tile_lat_range)
+    )
+    
+    # Create distributed samplers if using multiple GPUs
+    train_sampler = None
+    val_sampler = None
+    test_sampler = None
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=1,  # SameSizeBatchDataset already returns batches, iter(dataloader) will reture (1, bs, dimension)
+        shuffle=(train_sampler is None), 
+        num_workers=cfg_data.workers, 
+        pin_memory=True,
+        sampler=train_sampler
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=1,  # SameSizeBatchDataset already returns batches
+        shuffle=(val_sampler is None), # shuffle because not all samples are used in one epoch
+        num_workers=cfg_data.workers, 
+        pin_memory=True,
+        sampler=val_sampler
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,  # SameSizeBatchDataset already returns batches
+        shuffle=(test_sampler is None), # shuffle because not all samples are used in one epoch
+        num_workers=cfg_data.workers,
+        pin_memory=True,
+        sampler=test_sampler
+    )
+
+
+    print(f'Total patches: {len(base_dataset)}')
+    print(f'Train patches (len(base_dataset) // batch_size): {len(train_dataset)}')  # len(base_dataset) // batch_size
+    print(f'Val patches (len(base_dataset) // batch_size): {len(val_dataset)}')
+
+
+
+
+
     # -------------------- Data --------------------
-    loader_seed = cfg.dataloader.seed
-    if loader_seed is None:
-        loader_generator = None
-    else:
-        loader_generator = torch.Generator().manual_seed(loader_seed)
 
-    # Training dataset
-    depth_transform: DepthNormalizerBase = get_depth_normalizer(
-        cfg_normalizer=cfg.depth_normalization
-    )
-    train_dataset: Union[BaseDepthDataset, List[BaseDepthDataset]] = get_dataset(
-        cfg_data.train,
-        base_data_dir=base_data_dir,
-        mode=DatasetMode.TRAIN,
-        augmentation_args=cfg.augmentation,
-        depth_transform=depth_transform,
-    )
-    logging.debug("Augmentation: ", cfg.augmentation)
-    if "mixed" == cfg_data.train.name:
-        dataset_ls = train_dataset
-        assert len(cfg_data.train.prob_ls) == len(
-            dataset_ls
-        ), "Lengths don't match: `prob_ls` and `dataset_list`"
-        concat_dataset = ConcatDataset(dataset_ls)
-        mixed_sampler = MixedBatchSampler(
-            src_dataset_ls=dataset_ls,
-            batch_size=cfg.dataloader.max_train_batch_size,
-            drop_last=True,
-            prob=cfg_data.train.prob_ls,
-            shuffle=True,
-            generator=loader_generator,
-        )
-        train_loader = DataLoader(
-            concat_dataset,
-            batch_sampler=mixed_sampler,
-            num_workers=cfg.dataloader.num_workers,
-        )
-    else:
-        train_loader = DataLoader(
-            dataset=train_dataset,
-            batch_size=cfg.dataloader.max_train_batch_size,
-            num_workers=cfg.dataloader.num_workers,
-            shuffle=True,
-            generator=loader_generator,
-        )
-    # Validation dataset
-    val_loaders: List[DataLoader] = []
-    for _val_dict in cfg_data.val:
-        _val_dataset = get_dataset(
-            _val_dict,
-            base_data_dir=base_data_dir,
-            mode=DatasetMode.EVAL,
-        )
-        _val_loader = DataLoader(
-            dataset=_val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=cfg.dataloader.num_workers,
-        )
-        val_loaders.append(_val_loader)
-
-    # Visualization dataset
-    vis_loaders: List[DataLoader] = []
-    for _vis_dict in cfg_data.vis:
-        _vis_dataset = get_dataset(
-            _vis_dict,
-            base_data_dir=base_data_dir,
-            mode=DatasetMode.EVAL,
-        )
-        _vis_loader = DataLoader(
-            dataset=_vis_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=cfg.dataloader.num_workers,
-        )
-        vis_loaders.append(_vis_loader)
 
     # -------------------- Model --------------------
     _pipeline_kwargs = cfg.pipeline.kwargs if cfg.pipeline.kwargs is not None else {}
@@ -364,8 +484,8 @@ if "__main__" == __name__:
         out_dir_eval=out_dir_eval,
         out_dir_vis=out_dir_vis,
         accumulation_steps=accumulation_steps,
-        val_dataloaders=val_loaders,
-        vis_dataloaders=vis_loaders,
+        val_dataloaders=[val_loader],
+        vis_dataloaders=[test_loader],
     )
 
     # -------------------- Checkpoint --------------------

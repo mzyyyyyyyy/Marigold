@@ -188,6 +188,18 @@ def silog_rmse(depth_pred, depth_gt, valid_mask=None):
     return loss
 
 
+def r2(output, target, valid_mask=None):
+    if valid_mask is not None:
+        o = output[valid_mask]
+        t = target[valid_mask]
+    else:
+        o = output.flatten()
+        t = target.flatten()
+    ss_res = torch.sum((t - o) ** 2)
+    ss_tot = torch.sum((t - t.mean()) ** 2)
+    return 1 - ss_res / (ss_tot + 1e-8)
+
+
 # -------------------- Normals Metrics --------------------
 
 

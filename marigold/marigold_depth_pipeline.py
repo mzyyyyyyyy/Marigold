@@ -248,9 +248,12 @@ class MarigoldDepthPipeline(DiffusionPipeline):
                 resample_method=resample_method,
             )
 
-        # Normalize rgb values
-        rgb_norm: torch.Tensor = rgb / 255.0 * 2.0 - 1.0  #  [0, 255] -> [-1, 1]
-        rgb_norm = rgb_norm.to(self.dtype)
+        # # Normalize rgb values
+        # rgb_norm: torch.Tensor = rgb / 255.0 * 2.0 - 1.0  #  [0, 255] -> [-1, 1]
+        # rgb_norm = rgb_norm.to(self.dtype)
+        # assert rgb_norm.min() >= -1.0 and rgb_norm.max() <= 1.0
+
+        rgb_norm = rgb
         assert rgb_norm.min() >= -1.0 and rgb_norm.max() <= 1.0
 
         # ----------------- Predicting depth -----------------

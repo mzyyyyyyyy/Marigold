@@ -44,6 +44,8 @@ def get_loss(loss_name, **kwargs):
         criterion = L1LossWithMask(**kwargs)
     elif "mean_abs_rel" == loss_name:
         criterion = MeanAbsRelLoss()
+    elif "huber_loss" == loss_name:
+        criterion = torch.nn.HuberLoss(**kwargs)
     else:
         raise NotImplementedError
 

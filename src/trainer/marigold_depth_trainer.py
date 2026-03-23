@@ -45,6 +45,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import List, Union
 
+import wandb
+
 from marigold.marigold_depth_pipeline import MarigoldDepthPipeline, MarigoldDepthOutput
 from src.util import metric
 from src.util.alignment import align_depth_least_square
@@ -238,11 +240,39 @@ class MarigoldDepthTrainer:
 
                 # >>> With gradient accumulation >>>
 
-                # Get data
-                rgb = batch["rgb_norm"].to(device)
-                depth_gt_for_latent = batch[self.gt_depth_type].to(device)
+                # Get PS data
+                input_set, targets = batch
 
-                if self.gt_mask_type is not None:
+                if self.cfg.dataset.input_multimodal:
+                    inputs, inputs_m2 = input_set
+                else:
+                    if self.cfg.dataset.use_geo_location:
+                        inputs, inputs_loc = input_set
+                    else:
+                        inputs = input_set
+                
+                # Remove extra dimension from SameSizeDataLoader (batch_size=1)
+                if inputs.dim() == 5:  # (1, batch_size, C, H, W)
+                    inputs = inputs.squeeze(0)  # (batch_size, C, H, W)
+                if self.cfg.dataset.input_multimodal:
+                    if inputs_m2.dim() == 5:  # (1, batch_size, C, H, W)
+                        inputs_m2 = inputs_m2.squeeze(0)  # (batch_size, C, H, W)
+                if self.cfg.dataset.use_geo_location:
+                    if inputs_loc.dim() == 3:
+                        inputs_loc = inputs_loc.squeeze(0)
+
+                if targets.dim() == 5:  # (1, batch_size, 1, H, W)
+                    targets = targets.squeeze(0)  # (batch_size, 1, H, W)
+                
+                if self.cfg.dataset.input_multimodal:
+                    inputs_m2 = inputs_m2.to(self.device)
+                if self.cfg.dataset.use_geo_location:
+                    inputs_loc = inputs_loc.to(self.device)   
+
+                rgb = inputs[:, :3].to(self.device)
+                depth_gt_for_latent = targets.to(self.device)
+
+                if self.gt_mask_type:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
                     invalid_mask = ~valid_mask_for_latent
                     valid_mask_down = ~torch.max_pool2d(
@@ -325,7 +355,7 @@ class MarigoldDepthTrainer:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
 
                 # Masked latent loss
-                if self.gt_mask_type is not None:
+                if self.gt_mask_type:
                     latent_loss = self.loss(
                         model_pred[valid_mask_down].float(),
                         target[valid_mask_down].float(),
@@ -494,19 +524,82 @@ class MarigoldDepthTrainer:
                         ckpt_name=self._get_backup_ckpt_name(), save_train_state=False
                     )
 
-    def visualize(self):
-        for val_loader in self.vis_loaders:
-            vis_dataset_name = val_loader.dataset.disp_name
-            vis_out_dir = os.path.join(
-                self.out_dir_vis, self._get_backup_ckpt_name(), vis_dataset_name
-            )
-            os.makedirs(vis_out_dir, exist_ok=True)
-            _ = self.validate_single_dataset(
-                data_loader=val_loader,
-                metric_tracker=self.val_metrics,
-                save_to_dir=vis_out_dir,
-            )
+    # def visualize(self):
+    #     for val_loader in self.vis_loaders:
+    #         vis_dataset_name = val_loader.dataset.disp_name
+    #         vis_out_dir = os.path.join(
+    #             self.out_dir_vis, self._get_backup_ckpt_name(), vis_dataset_name
+    #         )
+    #         os.makedirs(vis_out_dir, exist_ok=True)
+    #         _ = self.validate_single_dataset(
+    #             data_loader=val_loader,
+    #             metric_tracker=self.val_metrics,
+    #             save_to_dir=vis_out_dir,
+    #         )
 
+    @torch.no_grad()
+    def visualize(self):
+        # sizhuo's visualization code
+        import random
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        for vis_loader in self.vis_loaders:
+            # 收集所有样本
+            all_batches = list(vis_loader)
+            selected = random.sample(all_batches, min(6, len(all_batches)))
+
+            wandb_images = []
+            for batch in selected:
+                input_set, targets = batch
+                inputs = input_set[0] if isinstance(input_set, (list, tuple)) else input_set
+                if inputs.dim() == 5:
+                    inputs = inputs.squeeze(0)
+                if targets.dim() == 5:
+                    targets = targets.squeeze(0)
+
+                # 取第一张图
+                rgb = inputs[0, :3]          # [3, H, W]
+                band4 = inputs[0, 3]         # [H, W]
+                gt = targets.squeeze()       # [H, W]
+
+                # 模型推理
+                pipe_out = self.model(
+                    rgb.unsqueeze(0).to(self.device),
+                    denoising_steps=self.cfg.validation.denoising_steps,
+                    ensemble_size=1,
+                    processing_res=self.cfg.validation.processing_res,
+                    match_input_res=self.cfg.validation.match_input_res,
+                    batch_size=1,
+                    color_map=None,
+                    show_progress_bar=False,
+                    resample_method=self.cfg.validation.resample_method,
+                )
+                pred = pipe_out.depth_np  # [H, W]
+
+                # 拼成一行四张图
+                fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+                axes[0].imshow(rgb.permute(1, 2, 0).cpu().numpy().clip(0, 1))
+                axes[0].set_title("RGB")
+                axes[1].imshow(band4.cpu().numpy(), cmap="gray")
+                axes[1].set_title("Band 4")
+                axes[2].imshow(pred, cmap="plasma")
+                axes[2].set_title("Pred Depth")
+                axes[3].imshow(gt.cpu().numpy(), cmap="plasma")
+                axes[3].set_title("GT Depth")
+                for ax in axes:
+                    ax.axis("off")
+                plt.tight_layout()
+
+                wandb_images.append(wandb.Image(fig))
+                plt.close(fig)
+
+            wandb.log(
+                {f"vis/{vis_loader.dataset.disp_name}": wandb_images},
+                step=self.effective_iter,
+            )
+            
     @torch.no_grad()
     def validate_single_dataset(
         self,
@@ -526,13 +619,43 @@ class MarigoldDepthTrainer:
             start=1,
         ):
             assert 1 == data_loader.batch_size
-            # Read input image
-            rgb_int = batch["rgb_int"]  # [B, 3, H, W]
+
+            # Get PS data
+            input_set, targets = batch
+
+            if self.cfg.dataset.input_multimodal:
+                inputs, inputs_m2 = input_set
+            else:
+                if self.cfg.dataset.use_geo_location:
+                    inputs, inputs_loc = input_set
+                else:
+                    inputs = input_set
+            
+            # Remove extra dimension from SameSizeDataLoader (batch_size=1)
+            if inputs.dim() == 5:  # (1, batch_size, C, H, W)
+                inputs = inputs.squeeze(0)  # (batch_size, C, H, W)
+            if self.cfg.dataset.input_multimodal:
+                if inputs_m2.dim() == 5:  # (1, batch_size, C, H, W)
+                    inputs_m2 = inputs_m2.squeeze(0)  # (batch_size, C, H, W)
+            if self.cfg.dataset.use_geo_location:
+                if inputs_loc.dim() == 3:
+                    inputs_loc = inputs_loc.squeeze(0)
+
+            if targets.dim() == 5:  # (1, batch_size, 1, H, W)
+                targets = targets.squeeze(0)  # (batch_size, 1, H, W)
+            
+            if self.cfg.dataset.input_multimodal:
+                inputs_m2 = inputs_m2.to(self.device)
+            if self.cfg.dataset.use_geo_location:
+                inputs_loc = inputs_loc.to(self.device)   
+
+            rgb = inputs[:, :3].to(self.device)      
             # GT depth
-            depth_raw_ts = batch["depth_raw_linear"].squeeze()
+            depth_raw_ts = targets.squeeze() # [H, W]
             depth_raw = depth_raw_ts.numpy()
             depth_raw_ts = depth_raw_ts.to(self.device)
-            valid_mask_ts = batch["valid_mask_raw"].squeeze()
+            # ps_eur 数据集里没有 valid_mask_raw，所以这里直接设置全 True
+            valid_mask_ts = torch.ones_like(depth_raw_ts.cpu(), dtype=torch.bool)
             valid_mask = valid_mask_ts.numpy()
             valid_mask_ts = valid_mask_ts.to(self.device)
 
@@ -546,7 +669,7 @@ class MarigoldDepthTrainer:
 
             # Predict depth
             pipe_out: MarigoldDepthOutput = self.model(
-                rgb_int,
+                rgb,
                 denoising_steps=self.cfg.validation.denoising_steps,
                 ensemble_size=self.cfg.validation.ensemble_size,
                 processing_res=self.cfg.validation.processing_res,
@@ -593,10 +716,10 @@ class MarigoldDepthTrainer:
 
             # Save as 16-bit uint png
             if save_to_dir is not None:
-                img_name = batch["rgb_relative_path"][0].replace("/", "_")
-                png_save_path = os.path.join(save_to_dir, f"{img_name}.png")
+                png_save_path = os.path.join(save_to_dir, f"{i}.png")
                 depth_to_save = (pipe_out.depth_np * 65535.0).astype(np.uint16)
                 Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")
+
 
         return metric_tracker.result()
 

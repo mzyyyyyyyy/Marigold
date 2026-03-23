@@ -240,7 +240,8 @@ if "__main__" == __name__:
             dataloader, desc=f"Depth Inference on {dataset.disp_name}", leave=True
         ):
             # Read input image
-            rgb_int = batch["rgb_int"].squeeze().numpy().astype(np.uint8)  # [3, H, W]
+            rgb_int = batch["rgb_int"]
+            rgb_int = rgb_int.squeeze().numpy().astype(np.uint8)  # [3, H, W]
             rgb_int = np.moveaxis(rgb_int, 0, -1)  # [H, W, 3]
             input_image = Image.fromarray(rgb_int)
 
