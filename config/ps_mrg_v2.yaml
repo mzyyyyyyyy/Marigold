@@ -1,8 +1,13 @@
 base_config:
 - config/logging.yaml
-- config/wandb.yaml
 - config/model_sdv2.yaml
 
+wandb:
+  # entity: your_entity
+  project: marigold
+  name: ps_mrg_v2
+
+# rgb: [-1, 1], depth: not change.
 dataset:
   input_dir: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_resize" # '/mnt/ssdc/china/LC_comb2023/' #"/nfs/Landsat/south_china/2023/"
   output_dir:  "/mnt/data/dataset/CHM_EUR_3m_area_test2" # "/mnt/ssdc/china/chm_reference_2nd/GF2_CH_5m_same_dim/"

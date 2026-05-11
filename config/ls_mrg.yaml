@@ -5,24 +5,24 @@ base_config:
 wandb:
   # entity: your_entity
   project: marigold
-  name: ps_mrg_v0
+  name: ls_mrg
 
 # rgb: [-1, 1], depth: [-1, 1].
 dataset:
-  input_dir: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_resize" # '/mnt/ssdc/china/LC_comb2023/' #"/nfs/Landsat/south_china/2023/"
+  input_dir: "/mnt/data/data/Landsat/eur_test2/2019" # '/mnt/ssdc/china/LC_comb2023/' #"/nfs/Landsat/south_china/2023/"
   output_dir:  "/mnt/data/dataset/CHM_EUR_3m_area_test2" # "/mnt/ssdc/china/chm_reference_2nd/GF2_CH_5m_same_dim/"
   file_type_input: "jp2"
   file_type_output: "tif"
   target_name: "canopy_height_" # strict formating! output file has names like "canopy_height_110,98.tif"; this is used to separate tile id from the target name
   year: 2019
-  # selected_bands: [0, 1, 2, 3, 4, 5, 6]  # Which bands to select from input (0-indexed), for landsat
-  selected_bands: [2, 1, 0, 3] # planet blue green red, nir
+  selected_bands: [0, 1, 2, 3, 4, 5, 6]  # Which bands to select from input (0-indexed), for landsat
+  # selected_bands: [2, 1, 0, 3] # planet blue green red, nir
   selected_percentile: ["p50"] # which will not be used for planetscope
   use_global_minmax: True # gb norm for input image to [-1, 1]
   use_global_norm: False # global mean std norm
   use_local_norm: False # patch level norm
   use_geo_location: False # set to true to allow separate location encoder
-  globalnorm_stats_file: "/mnt/data/dataset/CHM_EUR/PS_test2_statistics.json" # json file storing statistics for each year of landsat
+  globalnorm_stats_file: "/mnt/data/dataset/CHM_EUR/LS_test2_statistics.json" # json file storing statistics for each year of landsat
   targetnorm_stats_file: "/mnt/data/dataset/CHM_EUR/EUR_CHM_test_statistics.json" # json file storing statistics for each year of target
 
   # multimodal
@@ -65,7 +65,7 @@ dataset:
   normalize_target: False # using target global mean and std
   minmax_target: True # scale target to [-1, 1] based on global min max
   workers: 6
-  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/save_20260317.pkl" # if None, generate new patch coordinates
+  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/save_20260329.pkl" # if None, generate new patch coordinates
   # Data cleaning configuration
   nodata_cleaning: False # remove patches with high no data ratio
   correlation_cleaning: False # spearman r between ndvi and target, True for chm, False for height

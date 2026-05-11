@@ -82,7 +82,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--config",
         type=str,
-        default="config/ps_mrg_v2.yaml",
+        default="config/ls_mrg.yaml",
         help="Path to config file.",
     )
     parser.add_argument(
@@ -275,7 +275,10 @@ if "__main__" == __name__:
             file_type_m2 = cfg_data.file_type_m2,
             selected_bands_m2 = cfg_data.selected_bands_m2,
             target_range_edges = cfg_data.target_range_edges,
-            num_patches_per_target_range = cfg_data.num_patches_per_target_range
+            num_patches_per_target_range = cfg_data.num_patches_per_target_range,
+            minmax_target=cfg_data.minmax_target,
+            use_global_minmax=cfg_data.use_global_minmax,
+
         )
 
         total_size = len(base_dataset)

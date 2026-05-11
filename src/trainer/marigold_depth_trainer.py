@@ -29,6 +29,7 @@
 # --------------------------------------------------------------------------
 
 import logging
+from matplotlib import axes
 import numpy as np
 import os
 import shutil
@@ -563,6 +564,7 @@ class MarigoldDepthTrainer:
                 rgb = inputs[0, :3]          # [3, H, W]
                 band4 = inputs[0, 3]         # [H, W]
                 gt = targets.squeeze()       # [H, W]
+                print(f"DEBUG gt after squeeze: min={gt.min():.4f}, max={gt.max():.4f}, shape={gt.shape}")
 
                 # 模型推理
                 pipe_out = self.model(
@@ -578,16 +580,23 @@ class MarigoldDepthTrainer:
                 )
                 pred = pipe_out.depth_np  # [H, W]
 
+                # # 反归一化
+                # pred = pred * (target_p99 - target_p1) + target_p1
+
                 # 拼成一行四张图
-                fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-                axes[0].imshow(rgb.permute(1, 2, 0).cpu().numpy().clip(0, 1))
+                fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+
                 axes[0].set_title("RGB")
+                # # RGB 需要从 [-1, 1] 转回 [0, 1]，并转到 HWC 格式
+                rgb_vis = (rgb.permute(1, 2, 0).cpu().numpy() + 1.0) / 2.0
+                axes[0].imshow(rgb_vis.clip(0, 1))
+
                 axes[1].imshow(band4.cpu().numpy(), cmap="gray")
                 axes[1].set_title("Band 4")
                 axes[2].imshow(pred, cmap="plasma")
-                axes[2].set_title("Pred Depth")
+                axes[2].set_title(f"Pred  mean={pred.mean():.2f}  [{pred.min():.2f}, {pred.max():.2f}]")
                 axes[3].imshow(gt.cpu().numpy(), cmap="plasma")
-                axes[3].set_title("GT Depth")
+                axes[3].set_title(f"GT    mean={gt.cpu().numpy().mean():.2f}  [{gt.cpu().numpy().min():.2f}, {gt.cpu().numpy().max():.2f}]")
                 for ax in axes:
                     ax.axis("off")
                 plt.tight_layout()
@@ -694,15 +703,15 @@ class MarigoldDepthTrainer:
             else:
                 raise RuntimeError(f"Unknown alignment type: {self.cfg.eval.alignment}")
 
-            # Clip to dataset min max
-            depth_pred = np.clip(
-                depth_pred,
-                a_min=data_loader.dataset.min_depth,
-                a_max=data_loader.dataset.max_depth,
-            )
+            # # Clip to dataset min max
+            # depth_pred = np.clip(
+            #     depth_pred,
+            #     a_min=data_loader.dataset.min_depth,
+            #     a_max=data_loader.dataset.max_depth,
+            # )
 
-            # clip to d > 0 for evaluation
-            depth_pred = np.clip(depth_pred, a_min=1e-6, a_max=None)
+            # # clip to d > 0 for evaluation
+            # depth_pred = np.clip(depth_pred, a_min=1e-6, a_max=None)
 
             # Evaluate
             sample_metric = []

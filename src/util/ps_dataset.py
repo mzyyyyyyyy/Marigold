@@ -52,8 +52,8 @@ class SameSizeBatchDataset(Dataset):
         self.base_dataset = base_dataset
 
         self.disp_name = getattr(base_dataset, "disp_name", "ps_eur_dataset") # 为 marigold 添加一个属性便于 val
-        self.min_depth = getattr(base_dataset, "min_depth", 0.0)
-        self.max_depth = getattr(base_dataset, "max_depth", 28.0) # marigold 需要 dataset 的极值
+        # self.min_depth = getattr(base_dataset, "min_depth", 0.0)
+        # self.max_depth = getattr(base_dataset, "max_depth", 28.0) # marigold 需要 dataset 的极值
         self.filename_ls_path = getattr(base_dataset, "filename_ls_path", None)
 
 
@@ -222,18 +222,30 @@ class SameSizeBatchDataset(Dataset):
             input_m2_batch = torch.stack(inputs_m2, dim=0).squeeze()
             # print(f'shape is {input_m2_batch.shape}')
         
-        # Set all invalid values to 0 using torch.nan_to_num
-        target_batch = torch.nan_to_num(target_batch, nan=0.0, posinf=0.0, neginf=0.0)
-        input_batch = torch.nan_to_num(input_batch, nan=0.0, posinf=0.0, neginf=0.0)
-        # target_batch = torch.clamp(target_batch, min=0.0, max=1000)
-        target_batch = torch.clamp(target_batch, min=0.0, max=5000) # for CHM
+        # Set all invalid values to 0 or -1 using torch.nan_to_num
+        if self.base_dataset.dataset.minmax_target:
+            target_batch = torch.nan_to_num(target_batch, nan=-1.0, posinf=-1.0, neginf=-1.0) # if minmax target
+        else:
+            target_batch = torch.clamp(target_batch, min=0.0, max=30) # if not minmax target, directly clamp to a reasonable range to avoid extreme values, can be tuned based on the data distribution
+        
+        if self.base_dataset.dataset.use_global_minmax:
+            input_batch = torch.nan_to_num(input_batch, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        
+        # Resample input to match target resolution
+        if input_batch.shape[-2:] != target_batch.shape[-2:]:
+            input_batch = torch.nn.functional.interpolate(
+                input_batch,
+                size=target_batch.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
 
         if self.base_dataset.dataset.input_multimodal:
-            input_m2_batch = torch.nan_to_num(input_m2_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            input_m2_batch = torch.nan_to_num(input_m2_batch, nan=-1.0, posinf=-1.0, neginf=-1.0)
             return (input_batch, input_m2_batch), target_batch
         else:
             if self.base_dataset.dataset.use_geo_location:
-                loc_batch = torch.nan_to_num(loc_batch, nan=0.0, posinf=0.0, neginf=0.0)
+                loc_batch = torch.nan_to_num(loc_batch, nan=-1.0, posinf=-1.0, neginf=-1.0)
                 # print(loc_batch)
                 return (input_batch, loc_batch), target_batch
             else:
@@ -266,7 +278,9 @@ class LazyMultiScaleDataset(Dataset):
                  file_type_m2: str = '',
                  selected_bands_m2: list = [0, 1, 2],
                  target_range_edges: list = [0, 100, 200, 300, 400, 1000],
-                 num_patches_per_target_range: int = 200
+                 num_patches_per_target_range: int = 200,
+                 minmax_target: bool = False,
+                 use_global_minmax: bool = False,
                  ):
         
         self.input_dir = input_dir
@@ -293,6 +307,9 @@ class LazyMultiScaleDataset(Dataset):
         self.correlation_cleaning = correlation_cleaning
         self.target_range_edges = target_range_edges
         self.num_patches_per_target_range = num_patches_per_target_range
+        self.minmax_target = minmax_target
+        self.use_global_minmax = use_global_minmax
+
 
         
         if not os.path.exists(self.patch_coord_path):
@@ -489,17 +506,21 @@ class LazyMultiScaleDataset(Dataset):
         gather all tile ids from the output directory,
         take the intersection of the two lists to form the tile_ids"""
         self.tile_ids = []
-        # all_input_files = glob.glob(f'{self.input_dir}/**/*{self.selected_percentile[0]}*.{self.file_type_input}') # for landsat
-        all_input_files = glob.glob(f'{self.input_dir}/*.{self.file_type_input}') # for planetscope
+        
+        all_input_files = glob.glob(f'{self.input_dir}/**/*{self.selected_percentile[0]}*.{self.file_type_input}') # for landsat
+        
+        # all_input_files = glob.glob(f'{self.input_dir}/*.{self.file_type_input}') # for planetscope
+
         all_output_files = glob.glob(f'{self.output_dir}/*.{self.file_type_output}')
         print(f"Found {len(all_input_files)} input files and {len(all_output_files)} output files")
-        # tiles1 = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0] for file in all_input_files] # for landsat
 
-        tiles1 = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0:2] for file in all_input_files] # for planetscope
-        tiles1 = [(int(t[0]), int(t[1])) for t in tiles1]
-        tiles1 = [f"{x},{y}" for x, y in tiles1]
+        tiles1 = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0] for file in all_input_files] # for landsat
 
-        tiles2 = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0:2] for file in all_output_files] # for planetscope chm
+        # tiles1 = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0:2] for file in all_input_files] # for planetscope
+        # tiles1 = [(int(t[0]), int(t[1])) for t in tiles1]
+        # tiles1 = [f"{x},{y}" for x, y in tiles1]
+
+        tiles2 = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0:2] for file in all_output_files] # for chm
         tiles2 = [(int(t[0]), int(t[1])) for t in tiles2]
         tiles2 = [f"{x},{y}" for x, y in tiles2]
 
@@ -731,17 +752,19 @@ def process_tile(tile_id, input_dir, output_dir, selected_percentile, file_type,
     elif len(selected_percentile) == 1:
         indc = [0, 3]
 
-    tile_id_input = f"{int(tile_id.split(',')[0]):05d}_{int(tile_id.split(',')[1]):05d}" # for planetscope
-    tile_id_output = f"{int(tile_id.split(',')[0]):05d}_{int(tile_id.split(',')[1]):05d}" # for chm dataset
+    # tile_id_input = f"{int(tile_id.split(',')[0]):05d}_{int(tile_id.split(',')[1]):05d}" # for planetscope
+    # tile_id_output = f"{int(tile_id.split(',')[0]):05d}_{int(tile_id.split(',')[1]):05d}"
+
+    tile_id_output = f"{int(tile_id.split(',')[0]):05d}_{int(tile_id.split(',')[1]):05d}" # for ls
 
     try:
 
-        # input_path = glob.glob(f'{input_dir}/**/*{tile_id}*{selected_percentile[0]}*.{file_type}', recursive=True)[0] # for landsat
-        # output_path = glob.glob(f'{output_dir}/*{tile_id_output}*.tif')[0] # for chm dataset
+        input_path = glob.glob(f'{input_dir}/**/*{tile_id}*{selected_percentile[0]}*.{file_type}', recursive=True)[0] # for landsat
+        output_path = glob.glob(f'{output_dir}/*{tile_id_output}*.tif')[0] # for chm dataset
 
 
-        input_path = glob.glob(f'{input_dir}/*{tile_id_input}*.{file_type}', recursive=True)[0] # for planetscope
-        output_path = glob.glob(f'{output_dir}/*{tile_id_output}*.tif')[0]
+        # input_path = glob.glob(f'{input_dir}/*{tile_id_input}*.{file_type}', recursive=True)[0] # for planetscope
+        # output_path = glob.glob(f'{output_dir}/*{tile_id_output}*.tif')[0]
 
         with rasterio.open(input_path) as src:
             input_height, input_width = src.height, src.width

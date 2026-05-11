@@ -1,0 +1,56 @@
+# Default configuration predicting
+
+# Data configuration
+data:
+  input_dir: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_resize_map"
+  year: 2019
+  output_dir: "/mnt/data/result/chm/EUR_pss_mrg_v2"
+  output_suffix: 'chm' # this will be added as suffix to the output folder name
+  file_type: "jp2" # input file type
+  dtype: "float32"
+  use_gb_minmax: True # if true, using global minmax-scaling,
+
+  use_patch_norm: False # if true, using local patch norm
+  use_gb_norm: False # if true, using global mean std norm
+  globalnorm_stats_file: "/mnt/data/dataset/CHM_EUR/PS_test2_statistics.json"
+  use_geo_location: False # use geo lat lon
+  tile_lon_range: [4.4915, 14.3730] # no matter in depth anything, it is moved from da model.
+  tile_lat_range: [44.0174, 53.8989] 
+  grid_id_file: "/mnt/data/dataset/CHM_EUR/EUR_test_grids_1deg_lc.geojson"
+  exclude_list: ['original_data', 'lowres', '30m'] # subdirs to ignore under the input_dir folder
+  selected_bands: [2, 1, 0, 3]  # Which bands (in correct order) to select from input (0-indexed)
+  selected_percentile: ["p50"] # needs to align with the trained model
+  selected_resolution: "" # input file name must contain this string, use to clean older version of landsat..
+  selected_test_tile: [] # ["122,31", "121,31"] # ["112,24", "117,28"]  #"111,26" # for debug, test only this tile
+  exclude_strings: ["lowres", "1000m", "100m", "30m"] # to filter out input files
+  patch_size: 480 # for model input
+  out_scale: 1.0 # same as the ratio between output and input resolution. "output shape = input*out_scale". 0.5 if input is 2x higher resolution etc.
+
+# Model configuration
+model:
+  model_path: "/mnt/data/model/marigold/marigold-depth_ps_mrg_v2" # with "_r" means the model saved by the best r2 score, default is the lowest loss.
+
+  input_channels: 4
+  output_channels: 1
+  remove_encoder_bn: False # remove bn to preserve pixel scales
+  up_norm_option: 'group' # batch, group, layer, none
+  use_attn_skip: False # use attention skip connections
+  channel_reduce_ratio_latlon_features: 1.5
+  cali_model_path: "" # calibration model used to correct systematic bias
+  use_cali_model: False # wether to use cali model for calibration
+
+  seed: 1234
+  denoise_steps: 1
+  ensemble_size: 1
+  processing_res: 640
+  resample_method: 'bilinear'
+
+  half_precision: True # Run with half-precision (16-bit float), might lead to suboptimal result."
+
+# predict configuration
+prediction:
+  batch_size: 16
+  operator: 'blend' # use weighing mask for merging predictions
+  stride: 64
+  file_type: "tif"
+  data_type: "float32"
