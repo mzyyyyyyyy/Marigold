@@ -241,36 +241,21 @@ class MarigoldDepthTrainer:
 
                 # >>> With gradient accumulation >>>
 
-                # Get PS data
-                input_set, targets = batch
+                # Get PS data — batch is (inputs_lr, inputs_hr, targets)
+                inputs_lr, inputs_hr, targets = batch
 
-                if self.cfg.dataset.input_multimodal:
-                    inputs, inputs_m2 = input_set
-                else:
-                    if self.cfg.dataset.use_geo_location:
-                        inputs, inputs_loc = input_set
-                    else:
-                        inputs = input_set
-                
-                # Remove extra dimension from SameSizeDataLoader (batch_size=1)
-                if inputs.dim() == 5:  # (1, batch_size, C, H, W)
-                    inputs = inputs.squeeze(0)  # (batch_size, C, H, W)
-                if self.cfg.dataset.input_multimodal:
-                    if inputs_m2.dim() == 5:  # (1, batch_size, C, H, W)
-                        inputs_m2 = inputs_m2.squeeze(0)  # (batch_size, C, H, W)
-                if self.cfg.dataset.use_geo_location:
-                    if inputs_loc.dim() == 3:
-                        inputs_loc = inputs_loc.squeeze(0)
+                # Remove extra dimension added by DataLoader(batch_size=1)
+                if inputs_lr.dim() == 5:
+                    inputs_lr = inputs_lr.squeeze(0)   # (B, C, H, W)
+                if inputs_hr.dim() == 5:
+                    inputs_hr = inputs_hr.squeeze(0)   # (B, C, H, W)
+                if targets.dim() == 5:
+                    targets = targets.squeeze(0)       # (B, 1, H, W)
 
-                if targets.dim() == 5:  # (1, batch_size, 1, H, W)
-                    targets = targets.squeeze(0)  # (batch_size, 1, H, W)
-                
-                if self.cfg.dataset.input_multimodal:
-                    inputs_m2 = inputs_m2.to(self.device)
-                if self.cfg.dataset.use_geo_location:
-                    inputs_loc = inputs_loc.to(self.device)   
+                inputs_lr = inputs_lr.to(self.device)
+                inputs_hr = inputs_hr.to(self.device)
 
-                rgb = inputs[:, :3].to(self.device)
+                rgb = inputs_hr[:, :3]                 # HR image as primary RGB
                 depth_gt_for_latent = targets.to(self.device)
 
                 if self.gt_mask_type:
@@ -553,16 +538,16 @@ class MarigoldDepthTrainer:
 
             wandb_images = []
             for batch in selected:
-                input_set, targets = batch
-                inputs = input_set[0] if isinstance(input_set, (list, tuple)) else input_set
-                if inputs.dim() == 5:
-                    inputs = inputs.squeeze(0)
+                inputs_lr, inputs_hr, targets = batch
+                if inputs_lr.dim() == 5:
+                    inputs_lr = inputs_lr.squeeze(0)
+                if inputs_hr.dim() == 5:
+                    inputs_hr = inputs_hr.squeeze(0)
                 if targets.dim() == 5:
                     targets = targets.squeeze(0)
 
                 # 取第一张图
-                rgb = inputs[0, :3]          # [3, H, W]
-                band4 = inputs[0, 3]         # [H, W]
+                rgb = inputs_hr[0, :3]       # [3, H, W] — HR as primary RGB
                 gt = targets.squeeze()       # [H, W]
                 print(f"DEBUG gt after squeeze: min={gt.min():.4f}, max={gt.max():.4f}, shape={gt.shape}")
 
@@ -583,20 +568,17 @@ class MarigoldDepthTrainer:
                 # # 反归一化
                 # pred = pred * (target_p99 - target_p1) + target_p1
 
-                # 拼成一行四张图
-                fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+                # 拼成一行三张图
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
-                axes[0].set_title("RGB")
-                # # RGB 需要从 [-1, 1] 转回 [0, 1]，并转到 HWC 格式
+                axes[0].set_title("RGB (HR)")
                 rgb_vis = (rgb.permute(1, 2, 0).cpu().numpy() + 1.0) / 2.0
                 axes[0].imshow(rgb_vis.clip(0, 1))
 
-                axes[1].imshow(band4.cpu().numpy(), cmap="gray")
-                axes[1].set_title("Band 4")
-                axes[2].imshow(pred, cmap="plasma")
-                axes[2].set_title(f"Pred  mean={pred.mean():.2f}  [{pred.min():.2f}, {pred.max():.2f}]")
-                axes[3].imshow(gt.cpu().numpy(), cmap="plasma")
-                axes[3].set_title(f"GT    mean={gt.cpu().numpy().mean():.2f}  [{gt.cpu().numpy().min():.2f}, {gt.cpu().numpy().max():.2f}]")
+                axes[1].imshow(pred, cmap="plasma")
+                axes[1].set_title(f"Pred  mean={pred.mean():.2f}  [{pred.min():.2f}, {pred.max():.2f}]")
+                axes[2].imshow(gt.cpu().numpy(), cmap="plasma")
+                axes[2].set_title(f"GT    mean={gt.cpu().numpy().mean():.2f}  [{gt.cpu().numpy().min():.2f}, {gt.cpu().numpy().max():.2f}]")
                 for ax in axes:
                     ax.axis("off")
                 plt.tight_layout()
@@ -629,36 +611,20 @@ class MarigoldDepthTrainer:
         ):
             assert 1 == data_loader.batch_size
 
-            # Get PS data
-            input_set, targets = batch
+            # Get PS data — batch is (inputs_lr, inputs_hr, targets)
+            inputs_lr, inputs_hr, targets = batch
 
-            if self.cfg.dataset.input_multimodal:
-                inputs, inputs_m2 = input_set
-            else:
-                if self.cfg.dataset.use_geo_location:
-                    inputs, inputs_loc = input_set
-                else:
-                    inputs = input_set
-            
-            # Remove extra dimension from SameSizeDataLoader (batch_size=1)
-            if inputs.dim() == 5:  # (1, batch_size, C, H, W)
-                inputs = inputs.squeeze(0)  # (batch_size, C, H, W)
-            if self.cfg.dataset.input_multimodal:
-                if inputs_m2.dim() == 5:  # (1, batch_size, C, H, W)
-                    inputs_m2 = inputs_m2.squeeze(0)  # (batch_size, C, H, W)
-            if self.cfg.dataset.use_geo_location:
-                if inputs_loc.dim() == 3:
-                    inputs_loc = inputs_loc.squeeze(0)
+            if inputs_lr.dim() == 5:
+                inputs_lr = inputs_lr.squeeze(0)
+            if inputs_hr.dim() == 5:
+                inputs_hr = inputs_hr.squeeze(0)
+            if targets.dim() == 5:
+                targets = targets.squeeze(0)
 
-            if targets.dim() == 5:  # (1, batch_size, 1, H, W)
-                targets = targets.squeeze(0)  # (batch_size, 1, H, W)
-            
-            if self.cfg.dataset.input_multimodal:
-                inputs_m2 = inputs_m2.to(self.device)
-            if self.cfg.dataset.use_geo_location:
-                inputs_loc = inputs_loc.to(self.device)   
+            inputs_lr = inputs_lr.to(self.device)
+            inputs_hr = inputs_hr.to(self.device)
 
-            rgb = inputs[:, :3].to(self.device)      
+            rgb = inputs_hr[:, :3]  # HR image as primary RGB
             # GT depth
             depth_raw_ts = targets.squeeze() # [H, W]
             depth_raw = depth_raw_ts.numpy()
