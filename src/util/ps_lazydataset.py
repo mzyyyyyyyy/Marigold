@@ -155,10 +155,10 @@ class LazyPatchDataset(Dataset):
         gather all tile ids from the output directory,
         take the intersection of the two lists to form the tile_ids"""
         
-        all_input_files = glob.glob(f'{self.input_dir}/**/*{self.selected_percentile[0]}*.{self.file_type_input}') # for landsat
+        all_input_files = glob.glob(f'{self.input_dir}/*/*{self.selected_percentile[0]}*.{self.file_type_input}') # for landsat
         all_input_hr_files = glob.glob(f'{self.input_dir_hr}/*.{self.file_type_input}') # for planetscope
         all_output_files = glob.glob(f'{self.output_dir}/*.{self.file_type_output}') # for chm dataset, both landsat and planetscope
-        print(f"Found {len(all_input_files)} input files and {len(all_output_files)} output files")
+        print(f"Found {len(all_input_files)} LR input files, {len(all_input_hr_files)} HR input files, {len(all_output_files)} output files")
 
         tiles_input = [os.path.basename(file).split(str(self.year) + '_')[1].split('_')[0] for file in all_input_files] # for landsat
 
@@ -250,7 +250,7 @@ class LazyPatchDataset(Dataset):
 
         try:
 
-            input_path = glob.glob(f'{input_dir}/**/*{tile_id}*{selected_percentile[0]}*.{file_type}', recursive=True)[0] 
+            input_path = glob.glob(f'{input_dir}/*/*{tile_id}*{selected_percentile[0]}*.{file_type}')[0]
             output_path = glob.glob(f'{output_dir}/*{tile_id_output}*.tif')[0]
             input_path_hr = glob.glob(f'{input_dir_hr}/*{tile_id_output}*.{file_type}')[0]
 

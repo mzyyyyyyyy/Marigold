@@ -15,7 +15,7 @@ dataset:
   input_dir_hr: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
   output_dir: "/mnt/data/dataset/CHM_EUR_3m_area_test2_ls"
 
-  file_type_input: "tif"
+  file_type_input: "jp2"
   file_type_output: "tif"
   target_name: "canopy_height_"
   year: 2019
@@ -49,10 +49,10 @@ dataset:
 
   patch_sizes: [240, 480]     # output patch sizes (HR resolution)
 
-  num_patches_per_tile: 100000  # max sampling attempts per tile
+  num_patches_per_tile: 300000  # max sampling attempts per tile
 
-  target_range_edges: [0, 5, 10, 15, 20, 25, 30, 40]
-  num_patches_per_target_range: 200
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
 
   tile_emphasis: []
 
@@ -64,7 +64,7 @@ dataset:
   split_seed: 42
 
   workers: 6
-  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/save_20260608.pkl"
+  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/"
 
   correlation_cleaning: False  # spearman NDVI-CHM filter
   unit_scale_ratio: 1          # multiply target to get regular units

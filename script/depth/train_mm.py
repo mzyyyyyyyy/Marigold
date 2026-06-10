@@ -61,47 +61,15 @@ def _split_coords(all_coords, train_split, val_split, seed):
     )
 
 
-def _make_dataset(coords, mode, batch_size, cfg_data):
-    """Create a LazyPatchDataset from a pre-split coord list."""
-    patch_sizes = [(s, s) for s in cfg_data.patch_sizes]
-    config = {
-        'input_dir': cfg_data.input_dir,
-        'input_dir_hr': cfg_data.input_dir_hr,
-        'output_dir': cfg_data.output_dir,
-        'selected_bands': cfg_data.selected_bands,
-        'selected_bands_hr': cfg_data.selected_bands_hr,
-        'file_type_input': cfg_data.file_type_input,
-        'file_type_output': cfg_data.file_type_output,
-        'patch_sizes': patch_sizes,
-        'patch_coord_path': cfg_data.patch_coord_path,
-        'num_patches_per_tile': cfg_data.num_patches_per_tile,
-        'tile_emphasis': cfg_data.tile_emphasis,
-        'correlation_cleaning': cfg_data.correlation_cleaning,
-        'target_range_edges': cfg_data.target_range_edges,
-        'num_patches_per_target_range': cfg_data.num_patches_per_target_range,
-        'selected_percentile': cfg_data.selected_percentile,
-        'year': cfg_data.year,
-        'batch_size': batch_size,
-        'mode': mode,
-        'use_input_minmax': cfg_data.use_input_minmax,
-        'use_input_norm': cfg_data.use_input_norm,
-        'input_stats_file': cfg_data.input_stats_file,
-        'use_input_hr_minmax': cfg_data.use_input_hr_minmax,
-        'use_input_hr_norm': cfg_data.use_input_hr_norm,
-        'input_hr_stats_file': cfg_data.input_hr_stats_file,
-        'use_target_minmax': cfg_data.use_target_minmax,
-        'use_target_norm': cfg_data.use_target_norm,
-        'target_stats_file': cfg_data.target_stats_file,
-        'unit_scale_ratio': cfg_data.unit_scale_ratio,
-        'scale_input_to_neg1_1': cfg_data.get('scale_input_to_neg1_1', False),
-        'scale_input_hr_to_neg1_1': cfg_data.get('scale_input_hr_to_neg1_1', False),
-        'scale_target_to_neg1_1': cfg_data.get('scale_target_to_neg1_1', False),
-    }
-    dataset = LazyPatchDataset(config)
-    # Override with the pre-split coord subset
+def _make_dataset(base_dataset, coords, mode, batch_size):
+    """Reuse an existing LazyPatchDataset, replacing coords with a split subset."""
+    import copy
+    dataset = copy.copy(base_dataset)
+    dataset.batch_size = batch_size
+    dataset.mode = mode
     dataset.patch_coords = coords
     dataset.patches_by_size = {}
-    for patch_size in patch_sizes:
+    for patch_size in dataset.patch_sizes:
         dataset.patches_by_size[patch_size] = [
             p for p in coords
             if p['output_patch_height'] == patch_size[0] and p['output_patch_width'] == patch_size[1]
@@ -266,10 +234,43 @@ if "__main__" == __name__:
     # -------------------- Data (Multimodal) --------------------
     cfg_data = cfg.dataset
 
-    # Load all patch coordinates from the pkl file
+    # Load (or generate) patch coordinates via LazyPatchDataset:
+    # directory → generates and saves pkl; file → loads pkl.
     print(f"Loading patch coordinates from: {cfg_data.patch_coord_path}")
-    with open(cfg_data.patch_coord_path, "rb") as f:
-        all_coords = pickle.load(f)
+    base_dataset = LazyPatchDataset({
+        'input_dir': cfg_data.input_dir,
+        'input_dir_hr': cfg_data.input_dir_hr,
+        'output_dir': cfg_data.output_dir,
+        'selected_bands': cfg_data.selected_bands,
+        'selected_bands_hr': cfg_data.selected_bands_hr,
+        'file_type_input': cfg_data.file_type_input,
+        'file_type_output': cfg_data.file_type_output,
+        'patch_sizes': [(s, s) for s in cfg_data.patch_sizes],
+        'patch_coord_path': cfg_data.patch_coord_path,
+        'num_patches_per_tile': cfg_data.num_patches_per_tile,
+        'tile_emphasis': cfg_data.tile_emphasis,
+        'correlation_cleaning': cfg_data.correlation_cleaning,
+        'target_range_edges': cfg_data.target_range_edges,
+        'num_patches_per_target_range': cfg_data.num_patches_per_target_range,
+        'selected_percentile': cfg_data.selected_percentile,
+        'year': cfg_data.year,
+        'batch_size': 1,
+        'mode': 'train',
+        'use_input_minmax': cfg_data.use_input_minmax,
+        'use_input_norm': cfg_data.use_input_norm,
+        'input_stats_file': cfg_data.input_stats_file,
+        'use_input_hr_minmax': cfg_data.use_input_hr_minmax,
+        'use_input_hr_norm': cfg_data.use_input_hr_norm,
+        'input_hr_stats_file': cfg_data.input_hr_stats_file,
+        'use_target_minmax': cfg_data.use_target_minmax,
+        'use_target_norm': cfg_data.use_target_norm,
+        'target_stats_file': cfg_data.target_stats_file,
+        'unit_scale_ratio': cfg_data.unit_scale_ratio,
+        'scale_input_to_neg1_1': cfg_data.get('scale_input_to_neg1_1', False),
+        'scale_input_hr_to_neg1_1': cfg_data.get('scale_input_hr_to_neg1_1', False),
+        'scale_target_to_neg1_1': cfg_data.get('scale_target_to_neg1_1', False),
+    })
+    all_coords = base_dataset.patch_coords
     print(f"Total patches loaded: {len(all_coords)}")
 
     # Split coords into train / val / test
@@ -284,9 +285,9 @@ if "__main__" == __name__:
     print(f"Split sizes — train: {len(train_coords)}, val: {len(val_coords)}, test: {len(test_coords)}")
     print("Warning: target statistics (if used) are computed on the full coord set, not excluding test!")
 
-    train_dataset = _make_dataset(train_coords, mode='train', batch_size=eff_bs, cfg_data=cfg_data)
-    val_dataset   = _make_dataset(val_coords,   mode='val',   batch_size=1,      cfg_data=cfg_data)
-    test_dataset  = _make_dataset(test_coords,  mode='val',   batch_size=1,      cfg_data=cfg_data)
+    train_dataset = _make_dataset(base_dataset, train_coords, mode='train', batch_size=eff_bs)
+    val_dataset   = _make_dataset(base_dataset, val_coords,   mode='val',   batch_size=1)
+    test_dataset  = _make_dataset(base_dataset, test_coords,  mode='val',   batch_size=1)
 
     print(f"Train batches: {len(train_dataset)}")
     print(f"Val batches:   {len(val_dataset)}")
