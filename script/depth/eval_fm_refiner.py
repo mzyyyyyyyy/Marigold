@@ -50,6 +50,7 @@ def eval_full(
     target_stats: dict,
     n_landsat_bands: int,
     n_vis_samples: int = 5,
+    use_ps: bool = True,           # use real PS as ControlNet conditioning (upper-bound mode)
 ) -> tuple:
     """Run full evaluation, return (metrics, figure)."""
     fm_refiner.eval()
@@ -81,7 +82,10 @@ def eval_full(
             h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
             h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-            h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps)
+            h_fine = fm_refiner.refine(
+                landsat_hr, h_coarse, n_steps=n_steps,
+                ps_hr=inputs_hr if use_ps else None,
+            )
 
             all_preds.append(h_fine.cpu().flatten())
             all_gts.append(targets.cpu().flatten())
@@ -209,6 +213,7 @@ if __name__ == "__main__":
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         n_vis_samples=args.n_vis,
+        use_ps=True,
     )
 
     print("\n========== Full Val Results ==========")

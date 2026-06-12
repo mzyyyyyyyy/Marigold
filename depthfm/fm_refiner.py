@@ -178,13 +178,18 @@ class FMRefiner(nn.Module):
     @torch.no_grad()
     def refine(
         self,
-        landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr)
-        h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
+        landsat_lr: torch.Tensor,            # (B, C_ls, H_hr, W_hr)
+        h_coarse: torch.Tensor,              # (B, 1, H_hr, W_hr)
         n_steps: int = 1,
+        ps_hr: torch.Tensor = None,          # (B, C_ps, H_hr, W_hr) or None → null token
     ) -> torch.Tensor:
         """
         Refine coarse prediction via Euler integration.
-        Uses null PS token (inference-time, no PS available).
+
+        Args:
+            ps_hr: real PlanetScope data for upper-bound evaluation.
+                   If None (default), uses the learned null PS token
+                   (standard inference when PS is unavailable).
 
         Returns:
             h_fine: (B, 1, H_hr, W_hr) refined height map
@@ -196,13 +201,16 @@ class FMRefiner(nn.Module):
 
         z = self.encode(h_coarse)  # (B, 4, h, w)
 
-        # Use null PS (inference-time: PS not available)
-        # _null_ps may not be initialized if model was just built; provide a fallback
-        if self._null_ps is None:
-            raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
-        c_ps = self._null_ps.shape[1]
-        null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
-        control_input = torch.cat([landsat_lr, null_ps], dim=1)
+        # Choose PS conditioning: real PS or null token
+        if ps_hr is not None:
+            ps_cond = ps_hr.to(device, dtype)
+        else:
+            # Use null PS token (standard inference: PS not available)
+            if self._null_ps is None:
+                raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
+            ps_cond = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
+
+        control_input = torch.cat([landsat_lr, ps_cond], dim=1)
 
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 

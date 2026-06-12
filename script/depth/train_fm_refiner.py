@@ -158,12 +158,16 @@ def validate(
     val_offset: int = 0,           # rotating start index into val_loader
     n_vis_samples: int = 5,        # how many samples to visualize
     full: bool = False,            # if True, iterate entire val_loader
+    use_ps: bool = False,          # if True, use real PS as conditioning (upper-bound mode)
 ) -> tuple:
     """
     Returns (metrics_dict, wandb_figure_or_None).
 
     Subset mode: iterates val_subset_size batches starting from val_offset,
     wrapping around circularly.  full=True ignores offset and iterates all.
+
+    use_ps=True feeds real PlanetScope to ControlNet during inference,
+    serving as an upper bound to test whether the architecture can exploit PS.
     """
     fm_refiner.eval()
     all_preds, all_gts = [], []
@@ -200,7 +204,11 @@ def validate(
         h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-        h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps)
+        # Upper-bound mode: pass real PS; standard mode: null token (ps_hr=None)
+        h_fine = fm_refiner.refine(
+            landsat_hr, h_coarse, n_steps=n_steps,
+            ps_hr=inputs_hr if use_ps else None,
+        )
 
         all_preds.append(h_fine.cpu().flatten())
         all_gts.append(targets.cpu().flatten())
@@ -281,7 +289,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="FM Refiner Training")
-    parser.add_argument("--config", type=str, default="config/fm_refiner_v1.yaml")
+    parser.add_argument("--config", type=str, default="config/fm_refiner_v2.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -516,7 +524,7 @@ if __name__ == "__main__":
                 wandb.log({"train/loss": loss_val, "lr/unet": lr_unet, "lr/controlnet": lr_cn}, step=step)
                 tb_logger.log_dict({"train/loss": loss_val}, global_step=step)
 
-            # Validation (rotating 10% subset)
+            # Validation (rotating 10% subset, with real PS as conditioning)
             if step % cfg.trainer.validation_period == 0:
                 metrics, fig = validate(
                     fm_refiner, dav2_model, val_loader, device,
@@ -524,6 +532,7 @@ if __name__ == "__main__":
                     target_stats=target_stats,
                     n_landsat_bands=n_landsat_bands,
                     val_offset=val_offset,
+                    use_ps=True,
                 )
                 val_offset = (val_offset + val_subset_size) % len(val_loader)
 
@@ -560,12 +569,13 @@ if __name__ == "__main__":
     else:
         logging.warning("Best checkpoint not found, using final model weights for full validation")
 
-    logging.info("Running full validation on entire val set...")
+    logging.info("Running full validation on entire val set (with PS)...")
     final_metrics, final_fig = validate(
         fm_refiner, dav2_model, val_loader, device,
         n_steps=cfg.validation.n_steps,
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
+        use_ps=True,
         full=True,
     )
     logging.info(f"Final val metrics: {final_metrics}")
