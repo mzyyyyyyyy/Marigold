@@ -158,6 +158,7 @@ def validate(
     val_offset: int = 0,           # rotating start index into val_loader
     n_vis_samples: int = 5,        # how many samples to visualize
     full: bool = False,            # if True, iterate entire val_loader
+    method: str = "euler",         # integration method: "euler" or "heun"
 ) -> tuple:
     """
     Returns (metrics_dict, wandb_figure_or_None).
@@ -200,7 +201,7 @@ def validate(
         h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-        h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps)
+        h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method)
 
         all_preds.append(h_fine.cpu().flatten())
         all_gts.append(targets.cpu().flatten())
@@ -281,7 +282,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="FM Refiner Training")
-    parser.add_argument("--config", type=str, default="config/fm_refiner_v3.yaml")
+    parser.add_argument("--config", type=str, default="config/fm_refiner_v4.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -524,6 +525,7 @@ if __name__ == "__main__":
                     target_stats=target_stats,
                     n_landsat_bands=n_landsat_bands,
                     val_offset=val_offset,
+                    method=cfg.validation.get("method", "euler"),
                 )
                 val_offset = (val_offset + val_subset_size) % len(val_loader)
 
@@ -567,6 +569,7 @@ if __name__ == "__main__":
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         full=True,
+        method=cfg.validation.get("method", "euler"),
     )
     logging.info(f"Final val metrics: {final_metrics}")
     final_log = {f"val_final/{k}": v for k, v in final_metrics.items()}

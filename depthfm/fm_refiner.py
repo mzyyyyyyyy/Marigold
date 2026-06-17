@@ -175,16 +175,50 @@ class FMRefiner(nn.Module):
     # Inference
     # ------------------------------------------------------------------
 
+    def _vel(
+        self,
+        z: torch.Tensor,
+        t_val: float,
+        control_input: torch.Tensor,
+        text_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate velocity field v(z, t) via UNet + ControlNet."""
+        B = z.shape[0]
+        device = z.device
+        dtype = z.dtype
+        t_tensor = torch.full((B,), t_val, device=device, dtype=dtype)
+        t_int = (t_tensor * 999).long()
+        cn_out = self.controlnet(
+            sample=z,
+            timestep=t_int,
+            encoder_hidden_states=text_emb,
+            controlnet_cond=control_input,
+            return_dict=True,
+        )
+        unet_out = self.unet(
+            sample=z,
+            timestep=t_int,
+            encoder_hidden_states=text_emb,
+            down_block_additional_residuals=cn_out.down_block_res_samples,
+            mid_block_additional_residual=cn_out.mid_block_res_sample,
+            return_dict=True,
+        )
+        return unet_out.sample
+
     @torch.no_grad()
     def refine(
         self,
         landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr)
         h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
         n_steps: int = 1,
+        method: str = "euler",       # "euler" or "heun"
     ) -> torch.Tensor:
         """
-        Refine coarse prediction via Euler integration.
+        Refine coarse prediction via ODE integration.
         Uses null PS token (inference-time, no PS available).
+
+        method="euler": 1st-order Euler (original behaviour)
+        method="heun":  2nd-order Heun (trapezoidal corrector), costs 2× NFE per step
 
         Returns:
             h_fine: (B, 1, H_hr, W_hr) refined height map
@@ -210,26 +244,15 @@ class FMRefiner(nn.Module):
         ts = [i / n_steps for i in range(n_steps)]
 
         for t_val in ts:
-            t_tensor = torch.full((B,), t_val, device=device, dtype=dtype)
-            t_int = (t_tensor * 999).long()
-
-            cn_out = self.controlnet(
-                sample=z,
-                timestep=t_int,
-                encoder_hidden_states=text_emb,
-                controlnet_cond=control_input,
-                return_dict=True,
-            )
-            unet_out = self.unet(
-                sample=z,
-                timestep=t_int,
-                encoder_hidden_states=text_emb,
-                down_block_additional_residuals=cn_out.down_block_res_samples,
-                mid_block_additional_residual=cn_out.mid_block_res_sample,
-                return_dict=True,
-            )
-            v = unet_out.sample
-            z = z + dt * v
+            v1 = self._vel(z, t_val, control_input, text_emb)
+            if method == "heun":
+                # Heun (trapezoidal): predictor step then corrector with averaged slope
+                t_next = min(t_val + dt, 1.0)
+                z_pred = z + dt * v1
+                v2 = self._vel(z_pred, t_next, control_input, text_emb)
+                z = z + dt * 0.5 * (v1 + v2)
+            else:
+                z = z + dt * v1
 
         h_fine = self.decode(z)
         return h_fine
