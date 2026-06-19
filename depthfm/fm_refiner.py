@@ -95,10 +95,11 @@ class FMRefiner(nn.Module):
 
     def forward(
         self,
-        landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr) – already upsampled to HR
-        ps_hr: torch.Tensor,         # (B, C_ps, H_hr, W_hr)
-        h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr) – DAv2 output, already at HR
-        h_gt: torch.Tensor,          # (B, 1, H_hr, W_hr)
+        landsat_lr: torch.Tensor,       # (B, C_ls, H_hr, W_hr) – already upsampled to HR
+        ps_hr: torch.Tensor,             # (B, C_ps, H_hr, W_hr)
+        h_coarse: torch.Tensor,          # (B, 1, H_hr, W_hr) – DAv2 output, already at HR
+        h_gt: torch.Tensor,              # (B, 1, H_hr, W_hr)
+        ps_cond_override: Optional[torch.Tensor] = None,  # bypass internal dropout
     ) -> torch.Tensor:
         """
         Compute FM training loss.
@@ -130,14 +131,17 @@ class FMRefiner(nn.Module):
         v_target = z_gt - z_coarse             # (B, 4, h, w)
 
         # PlanetScope conditioning with dropout
-        ps_cond = ps_hr.clone()
-        if self.training:
-            drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
-            # null broadcasts to (1, C_ps, H, W)
-            null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
-            for i in range(B):
-                if drop_mask[i]:
-                    ps_cond[i] = null_spatial[0]
+        if ps_cond_override is not None:
+            # Caller handles all dropout/substitution externally
+            ps_cond = ps_cond_override
+        else:
+            ps_cond = ps_hr.clone()
+            if self.training:
+                drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
+                null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
+                for i in range(B):
+                    if drop_mask[i]:
+                        ps_cond[i] = null_spatial[0]
 
         # ControlNet conditioning: Landsat + PS concatenated
         control_input = torch.cat([landsat_lr, ps_cond], dim=1)  # (B, C_ls+C_ps, H, W)
@@ -256,6 +260,45 @@ class FMRefiner(nn.Module):
 
         h_fine = self.decode(z)
         return h_fine
+
+
+    @torch.no_grad()
+    def refine_with_ps(
+        self,
+        landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr)
+        ps_hr: torch.Tensor,         # (B, C_ps, H_hr, W_hr) – real or pseudo PS
+        h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
+        n_steps: int = 1,
+        method: str = "euler",
+    ) -> torch.Tensor:
+        """
+        Refine coarse prediction using a supplied PS (real or SR-generated pseudo-PS).
+
+        Identical to refine() but accepts an explicit PS tensor instead of using
+        the null PS token.  Useful at inference time when the SR module provides
+        a pseudo-PS substitute for the missing PlanetScope image.
+        """
+        B = h_coarse.shape[0]
+        device = h_coarse.device
+        dtype = h_coarse.dtype
+
+        z = self.encode(h_coarse)
+        control_input = torch.cat([landsat_lr, ps_hr.to(device, dtype)], dim=1)
+        text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
+
+        dt = 1.0 / n_steps
+        ts = [i / n_steps for i in range(n_steps)]
+        for t_val in ts:
+            v1 = self._vel(z, t_val, control_input, text_emb)
+            if method == "heun":
+                t_next = min(t_val + dt, 1.0)
+                z_pred = z + dt * v1
+                v2 = self._vel(z_pred, t_next, control_input, text_emb)
+                z = z + dt * 0.5 * (v1 + v2)
+            else:
+                z = z + dt * v1
+
+        return self.decode(z)
 
 
 # ------------------------------------------------------------------
