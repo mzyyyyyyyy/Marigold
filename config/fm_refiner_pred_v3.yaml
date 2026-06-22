@@ -1,0 +1,55 @@
+# Inference config for the Flow Matching CHM Refiner
+# Run: python script/depth/infer_fm_refiner.py --config config/fm_refiner_pred.yaml
+
+dataset:
+  # LR Landsat input tiles
+  input_dir: "/mnt/data/data/Landsat/eur_test2_map/2019"
+  output_dir: "/mnt/data/result/chm/EUR_fm_refiner_v3"
+
+  file_type_input: "jp2"
+  year: 2019
+
+  # Band selection (must match training config)
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  # LR input normalisation stats (same file used during training)
+  input_stats_file: "/mnt/data/dataset/CHM_EUR/LS_test2_statistics.json"
+
+  # Target normalisation stats (for h_coarse normalisation and output denormalisation)
+  target_stats_file: "/mnt/data/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+
+
+model:
+  # SD 2.1 pretrained weights (same path as training)
+  sd_pretrained_path: "/mnt/data/model/marigold/stable-diffusion-2"
+
+  # Fine-tuned FM Refiner checkpoint (.pth saved by train_fm_refiner.py)
+  fm_refiner_path: "/home/tree/Projects/Marigold/output/fm_refiner_v3/checkpoint/best.pth"
+
+  # DAv2 checkpoint
+  dav2_pretrained_path: "/mnt/data/model/CHM_EUR/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+
+  # Upsampling factor LR → HR (must match training)
+  out_in_scale_factor: 4
+
+  # Number of PS bands used during training (needed to build ControlNet)
+  n_ps_bands: 3
+
+  # PS dropout used during training (architecture parameter only, not used at inference)
+  ps_dropout_p: 0.3
+
+
+prediction:
+  # Size of the Landsat (LR) patch to read per iteration
+  patch_size_lr: 240      # HR output patch = 240 × 4 = 960 px
+
+  # Stride in LR pixels between patches
+  stride_lr: 120
+
+  # Flow matching integration steps (2 gives good quality / speed trade-off)
+  n_steps: 4
+
+  # ODE integration method: "euler" or "heun"
+  method: "euler"
