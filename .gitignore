@@ -8,6 +8,9 @@
 /wandb
 /venv
 /cache
+/chelsa_data
+/chelsa_data_w
+/cmip6_data
 
 **/.ipynb_checkpoints/
 .vscode/
