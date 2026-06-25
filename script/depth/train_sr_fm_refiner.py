@@ -477,7 +477,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v0.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v1.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -587,7 +587,7 @@ if __name__ == "__main__":
         sd_pretrained_path=cfg.model.sd_pretrained_path,
         n_landsat_bands=n_landsat_bands,
         n_ps_bands=n_ps_bands,
-        ps_dropout_p=cfg.trainer.ps_dropout_p,  # 0.0 – managed externally
+        ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
         device=str(device),
     ).to(device)
 

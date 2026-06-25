@@ -1,0 +1,43 @@
+# Diagnostic: frozen SR module generating pseudo-PS for ControlNet
+# Run: python script/depth/eval_pseudo_ps.py --config config/eval_pseudo_ps.yaml
+
+# ── FM Refiner (task network, fully frozen) ───────────────────────────────────
+fm_refiner:
+  # config.yaml saved inside the training output directory
+  config: "output/fm_refiner/config.yaml"
+  # checkpoint to evaluate (e.g. the p=0.3 run that gave baseline 0.8234)
+  ckpt:   "output/fm_refiner/checkpoint/best.pth"
+  # FM ODE integration steps at inference
+  n_steps: 2
+
+# ── SR module: SwinIR from SR4IR project (fully frozen) ──────────────────────
+sr_module:
+  # path to net_sr_latest.pth (bare state dict) OR checkpoint_*.pth (has 'net_sr' key)
+  ckpt:    "/home/tree/Projects/SR4IR/experiments/reg/base1_v2/models/net_sr_latest.pth"
+  # upscale factor: must match training (base1_v2.yaml scale: 4)
+  scale: 4
+  # SwinIR architecture — must exactly match base1_v2.yaml network_sr section
+  arch:
+    in_chans:        3
+    img_size:        48
+    window_size:     8
+    img_range:       1.0
+    depths:          [6, 6, 6, 6, 6, 6]
+    embed_dim:       180
+    num_heads:       [6, 6, 6, 6, 6, 6]
+    mlp_ratio:       2
+    upsampler:       "pixelshuffle"
+    resi_connection: "1conv"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output:
+  # where to save metrics .txt and visualisation .png
+  # null → same directory as fm_refiner.ckpt
+  save_dir: null
+  # number of samples in the 5-panel visualisation grid
+  n_vis: 20
+
+# ── Reference baselines (for printed comparison) ──────────────────────────────
+baselines:
+  - name: "p=0.3, LS-only, ControlNet OFF"
+    r2: 0.8234
