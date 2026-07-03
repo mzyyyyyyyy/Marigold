@@ -252,14 +252,12 @@ def validate(
 def save_checkpoint(
     fm_refiner, sr_module, optimizer_fm, optimizer_sr,
     lr_scheduler_fm, lr_scheduler_sr,
-    step, phase, steps_in_phase, out_dir, name="latest"
+    step, out_dir, name="latest"
 ):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.pth")
     torch.save({
         "step": step,
-        "phase": phase,
-        "steps_in_phase": steps_in_phase,
         "unet_state": fm_refiner.unet.state_dict(),
         "controlnet_state": fm_refiner.controlnet.state_dict(),
         "null_ps_state": fm_refiner._null_ps,
@@ -288,7 +286,7 @@ def load_checkpoint(
         lr_scheduler_fm.load_state_dict(ckpt["lr_scheduler_fm_state"])
     if lr_scheduler_sr and ckpt.get("lr_scheduler_sr_state"):
         lr_scheduler_sr.load_state_dict(ckpt["lr_scheduler_sr_state"])
-    return ckpt["step"], ckpt.get("phase", "sr"), ckpt.get("steps_in_phase", 0)
+    return ckpt["step"]
 
 
 # -------------------------------------------------------------------------
@@ -303,24 +301,6 @@ def _freeze(module: nn.Module):
 def _unfreeze(module: nn.Module):
     for p in module.parameters():
         p.requires_grad_(True)
-
-
-def _enter_sr_phase(fm_refiner: FMRefiner, sr_module: SRModule):
-    """Phase 1: train SR only."""
-    _freeze(fm_refiner.unet)
-    _freeze(fm_refiner.controlnet)
-    _unfreeze(sr_module)
-    fm_refiner.eval()
-    sr_module.train()
-
-
-def _enter_task_phase(fm_refiner: FMRefiner, sr_module: SRModule):
-    """Phase 2: train FM only."""
-    _unfreeze(fm_refiner.unet)
-    _unfreeze(fm_refiner.controlnet)
-    _freeze(sr_module)
-    fm_refiner.train()
-    sr_module.eval()
 
 
 # -------------------------------------------------------------------------
@@ -403,7 +383,8 @@ def _sr_step(
 
         l_tdp = F.l1_loss(feat_fake, feat_real.detach()) * tdp_weight
 
-    return {"l_pix": l_pix, "l_tdp": l_tdp, "l_total": l_pix + l_tdp}
+    return {"l_pix": l_pix, "l_tdp": l_tdp, "l_total": l_pix + l_tdp,
+            "pseudo_ps": pseudo_ps}
 
 
 # -------------------------------------------------------------------------
@@ -412,11 +393,10 @@ def _sr_step(
 
 def _task_step(
     fm_refiner: FMRefiner,
-    sr_module: SRModule,
-    landsat_hr: torch.Tensor,    # (B, C_ls, H_hr, W_hr)
     real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
     h_coarse: torch.Tensor,
     h_gt: torch.Tensor,
+    pseudo_ps_detached: torch.Tensor,  # (B, C_ps, H_hr, W_hr) — SR output already detached
     p_null_drop: float,
     p_pseudo_ps: float,
     device: torch.device,
@@ -426,7 +406,7 @@ def _task_step(
 
     PS source is sampled per-sample from three exclusive outcomes:
       p_null_drop  → null PS token
-      p_pseudo_ps  → SR pseudo-PS (frozen)
+      p_pseudo_ps  → SR pseudo-PS (passed in detached, no second SR forward)
       remainder    → real PS
     """
     B = real_ps.shape[0]
@@ -447,17 +427,11 @@ def _task_step(
         if null_mask[i]:
             ps_cond[i] = null_spatial[0]
 
-    # Pseudo-PS from frozen SR
+    # Pseudo-PS — reuse detached output from SR step (no extra forward pass)
     if pseudo_mask.any():
-        with torch.no_grad():
-            landsat_lr = F.interpolate(
-                landsat_hr, scale_factor=1.0 / sr_module.upscale,
-                mode="bilinear", align_corners=False,
-            )
-            pseudo_batch = sr_module(landsat_lr, target_size=(H_hr, W_hr))
         for i in range(B):
             if pseudo_mask[i]:
-                ps_cond[i] = pseudo_batch[i]
+                ps_cond[i] = pseudo_ps_detached[i]
 
     loss = fm_refiner(
         landsat_lr=landsat_hr,
@@ -637,31 +611,27 @@ if __name__ == "__main__":
 
     # ---- Resume ----
     start_step = 0
-    current_phase = cfg.alternate.start_phase   # 'sr' or 'task'
-    steps_in_phase = 0
     if args.resume_run is not None:
-        start_step, current_phase, steps_in_phase = load_checkpoint(
+        start_step = load_checkpoint(
             fm_refiner, sr_module, optimizer_fm, optimizer_sr,
             lr_scheduler_fm, lr_scheduler_sr, args.resume_run
         )
-        logging.info(f"Resumed from step {start_step}, phase={current_phase}, "
-                     f"steps_in_phase={steps_in_phase}")
+        logging.info(f"Resumed from step {start_step}")
 
-    # ---- Alternate config ----
-    alt = cfg.alternate
-    sr_phase_steps   = alt.sr_phase_steps
-    task_phase_steps = alt.task_phase_steps
-    p_null_drop      = float(alt.p_null_drop)
-    p_pseudo_ps      = float(alt.p_pseudo_ps)
-    warmup_sr_steps  = int(alt.warmup_sr_steps)
-    pixel_weight     = float(cfg.sr_loss.pixel_weight)
-    tdp_weight       = float(cfg.sr_loss.tdp_weight)
+    # ---- Training config ----
+    p_null_drop     = float(cfg.trainer.p_null_drop)
+    p_pseudo_ps     = float(cfg.trainer.p_pseudo_ps)
+    warmup_sr_steps = int(cfg.trainer.warmup_sr_steps)
+    pixel_weight    = float(cfg.sr_loss.pixel_weight)
+    tdp_weight      = float(cfg.sr_loss.tdp_weight)
 
-    # Initialise freeze states for starting phase
-    if current_phase == "sr":
-        _enter_sr_phase(fm_refiner, sr_module)
-    else:
-        _enter_task_phase(fm_refiner, sr_module)
+    # SR trains every batch; FM trains every batch with detached SR output.
+    # Both modules stay in train mode throughout.
+    _unfreeze(sr_module)
+    _unfreeze(fm_refiner.unet)
+    _unfreeze(fm_refiner.controlnet)
+    fm_refiner.train()
+    sr_module.train()
 
     # ---- Training loop ----
     t_end = t_start + timedelta(minutes=args.exit_after) if args.exit_after > 0 else None
@@ -671,13 +641,12 @@ if __name__ == "__main__":
     val_offset = 0
     val_subset_size = max(1, len(val_loader) // 10)
 
-    # Accum state per phase
-    accum_sr_step = 0
     loss_pix_accum = 0.0
     loss_tdp_accum = 0.0
     loss_fm_accum  = 0.0
+    _pix_check_buf = []
 
-    logging.info(f"Starting alternate training. Initial phase: {current_phase}")
+    logging.info("Starting joint SR + FM training (every batch updates both).")
     pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True)
 
     for epoch in range(cfg.max_epoch):
@@ -688,21 +657,9 @@ if __name__ == "__main__":
                 logging.info("Exit after time limit reached.")
                 save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
                                 lr_scheduler_fm, lr_scheduler_sr,
-                                step, current_phase, steps_in_phase, out_dir_ckpt, "latest")
+                                step, out_dir_ckpt, "latest")
                 pbar.close()
                 sys.exit(0)
-
-            # ---- Phase switching ----
-            phase_budget = sr_phase_steps if current_phase == "sr" else task_phase_steps
-            if steps_in_phase >= phase_budget:
-                current_phase = "task" if current_phase == "sr" else "sr"
-                steps_in_phase = 0
-                if current_phase == "sr":
-                    _enter_sr_phase(fm_refiner, sr_module)
-                    logging.info(f"[step {step}] → Phase 1 (SR)")
-                else:
-                    _enter_task_phase(fm_refiner, sr_module)
-                    logging.info(f"[step {step}] → Phase 2 (Task/FM)")
 
             # ---- Unpack batch ----
             inputs_lr, inputs_hr, targets = batch
@@ -718,79 +675,88 @@ if __name__ == "__main__":
             landsat    = inputs_lr[:, :n_landsat_bands]
             landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
-            # DAV2 coarse (always from original LS, always frozen)
+            # DAV2 coarse (always frozen)
             with torch.no_grad():
                 landsat_for_dav2 = (landsat + 1.0) / 2.0
                 h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
                 h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-            # ---- Phase 1: train SR ----
-            if current_phase == "sr":
-                use_tdp = (steps_in_phase >= warmup_sr_steps)
-                loss_dict = _sr_step(
-                    fm_refiner, sr_module,
-                    landsat, landsat_hr, inputs_hr, h_coarse,
-                    pixel_weight, tdp_weight, use_tdp, device,
-                )
-                loss = loss_dict["l_total"] / accumulation_steps
-                loss.backward()
+            # ================================================================
+            # Step 1: update SR  (FM frozen via no_grad on its forward pass)
+            # ================================================================
+            use_tdp = (step >= warmup_sr_steps)
+            _freeze(fm_refiner.unet)
+            _freeze(fm_refiner.controlnet)
 
-                loss_pix_accum += loss_dict["l_pix"].item()
-                loss_tdp_accum += loss_dict["l_tdp"].item()
-                accum_sr_step  += 1
+            loss_dict = _sr_step(
+                fm_refiner, sr_module,
+                landsat, landsat_hr, inputs_hr, h_coarse,
+                pixel_weight, tdp_weight, use_tdp, device,
+            )
+            optimizer_sr.zero_grad()
+            loss_dict["l_total"].backward()
 
-                if accum_sr_step % accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
-                    optimizer_sr.step()
-                    if lr_scheduler_sr is not None:
-                        lr_scheduler_sr.step()
-                    optimizer_sr.zero_grad()
+            torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
+            optimizer_sr.step()
 
-            # ---- Phase 2: train FM ----
-            else:
-                loss = _task_step(
-                    fm_refiner, sr_module,
-                    landsat_hr, inputs_hr, h_coarse, targets,
-                    p_null_drop, p_pseudo_ps, device,
-                )
-                loss = loss / accumulation_steps
-                loss.backward()
-                loss_fm_accum += loss.item() * accumulation_steps
+            # detach SR output before releasing the computation graph
+            pseudo_ps_detached = loss_dict["pseudo_ps"].detach().clone()
+            _l_pix_val = loss_dict["l_pix"].item()
+            loss_pix_accum += _l_pix_val
+            loss_tdp_accum += loss_dict["l_tdp"].item()
+            _pix_check_buf.append(_l_pix_val)
+            del loss_dict
+            torch.cuda.empty_cache()
 
-                if (step + 1) % accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        list(fm_refiner.unet.parameters()) +
-                        list(fm_refiner.controlnet.parameters()),
-                        max_norm=1.0,
-                    )
-                    optimizer_fm.step()
-                    if lr_scheduler_fm is not None:
-                        lr_scheduler_fm.step()
-                    optimizer_fm.zero_grad()
+            # ================================================================
+            # Step 2: update FM  (SR output detached, no second SR forward)
+            # ================================================================
+            _unfreeze(fm_refiner.unet)
+            _unfreeze(fm_refiner.controlnet)
+
+            loss_fm = _task_step(
+                fm_refiner,
+                inputs_hr, h_coarse, targets,
+                pseudo_ps_detached,
+                p_null_drop, p_pseudo_ps, device,
+            )
+            optimizer_fm.zero_grad()
+            loss_fm.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(fm_refiner.unet.parameters()) +
+                list(fm_refiner.controlnet.parameters()),
+                max_norm=1.0,
+            )
+            optimizer_fm.step()
+
+            loss_fm_accum += loss_fm.item()
+
+            if lr_scheduler_sr is not None:
+                lr_scheduler_sr.step()
+            if lr_scheduler_fm is not None:
+                lr_scheduler_fm.step()
 
             step += 1
-            steps_in_phase += 1
             pbar.update(1)
 
             # ---- Logging ----
             if step % cfg.trainer.log_period == 0:
+                log_n = cfg.trainer.log_period
                 lr_sr = optimizer_sr.param_groups[0]["lr"]
                 lr_fm = optimizer_fm.param_groups[0]["lr"]
-                log_n = cfg.trainer.log_period
                 log_dict = {
-                    "phase": 0 if current_phase == "sr" else 1,
                     "lr/sr": lr_sr, "lr/fm": lr_fm,
-                    "train/l_pix": loss_pix_accum / max(log_n, 1),
-                    "train/l_tdp": loss_tdp_accum / max(log_n, 1),
-                    "train/l_fm":  loss_fm_accum  / max(log_n, 1),
+                    "train/l_pix": loss_pix_accum / log_n,
+                    "train/l_tdp": loss_tdp_accum / log_n,
+                    "train/l_fm":  loss_fm_accum  / log_n,
                 }
                 logging.info(
-                    f"[step {step}] phase={current_phase} "
+                    f"[step {step}] "
                     f"l_pix={log_dict['train/l_pix']:.5f} "
                     f"l_tdp={log_dict['train/l_tdp']:.5f} "
                     f"l_fm={log_dict['train/l_fm']:.5f}"
                 )
-                pbar.set_postfix(phase=current_phase, r2=f"{best_r2:.4f}")
+                pbar.set_postfix(r2=f"{best_r2:.4f}")
                 wandb.log(log_dict, step=step)
                 tb_logger.log_dict(log_dict, global_step=step)
                 loss_pix_accum = loss_tdp_accum = loss_fm_accum = 0.0
@@ -818,23 +784,24 @@ if __name__ == "__main__":
 
                 if metrics["r2"] > best_r2:
                     best_r2 = metrics["r2"]
-                    pbar.set_postfix(phase=current_phase, r2=f"{best_r2:.4f}")
+                    pbar.set_postfix(r2=f"{best_r2:.4f}")
                     save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
                                     lr_scheduler_fm, lr_scheduler_sr,
-                                    step, current_phase, steps_in_phase, out_dir_ckpt, "best")
+                                    step, out_dir_ckpt, "best")
                     logging.info(f"New best R²={best_r2:.4f} at step {step}")
 
-                # Re-enter the correct phase (validate() sets eval mode)
-                if current_phase == "sr":
-                    _enter_sr_phase(fm_refiner, sr_module)
-                else:
-                    _enter_task_phase(fm_refiner, sr_module)
+                # restore train mode after validate()
+                fm_refiner.train()
+                sr_module.train()
+                _unfreeze(fm_refiner.unet)
+                _unfreeze(fm_refiner.controlnet)
+                _unfreeze(sr_module)
 
             # ---- Periodic checkpoint ----
             if step % cfg.trainer.save_period == 0:
                 save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
                                 lr_scheduler_fm, lr_scheduler_sr,
-                                step, current_phase, steps_in_phase, out_dir_ckpt, "latest")
+                                step, out_dir_ckpt, "latest")
 
         if step >= cfg.max_iter:
             break
@@ -867,5 +834,5 @@ if __name__ == "__main__":
 
     save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
                     lr_scheduler_fm, lr_scheduler_sr,
-                    step, current_phase, steps_in_phase, out_dir_ckpt, "final")
+                    step, out_dir_ckpt, "final")
     logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")

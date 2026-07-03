@@ -66,7 +66,7 @@ model:
 
   # SwinIR pretrained weights (DIV2K classical SR, 4× upscale).
   # Set to null to train SR from scratch.
-  sr_pretrained_path: "/mnt/data/model/sr/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
+  sr_pretrained_path: "/mnt/data/model/SR4IR/pretrained_models/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
   sr_pretrained_key: "params"   # key inside the .pth dict
 
 
@@ -88,27 +88,10 @@ sr_module:
 # SR training losses (Phase 1)
 sr_loss:
   pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
-  tdp_weight: 0.1     # L1 on ControlNet mid-block features (pseudo vs real)
+  tdp_weight: 0.0     # L1 on ControlNet mid-block features (pseudo vs real)
 
 
 # Alternate training schedule
-alternate:
-  # Gradient steps per phase before switching.
-  sr_phase_steps: 500    # Phase 1: train SR, freeze FM
-  task_phase_steps: 500  # Phase 2: train FM, freeze SR
-
-  # Phase-2 PS source probabilities (mutually exclusive):
-  #   p_null_drop  → replace PS with null token (existing modality dropout)
-  #   p_pseudo_ps  → replace PS with frozen-SR pseudo-PS
-  #   remainder    → use real PS
-  p_null_drop: 0.0
-  p_pseudo_ps: 0.3
-
-  # Which phase to start training in.
-  start_phase: sr
-
-  # Warmup steps in Phase 1 during which only pixel loss is used (no TDP loss).
-  warmup_sr_steps: 200
 
 
 # Optimizers
@@ -128,8 +111,8 @@ lr_scheduler:
 
 # Dataloader
 dataloader:
-  effective_batch_size: 8
-  max_train_batch_size: 2
+  effective_batch_size: 4
+  max_train_batch_size: 1
   seed: 2024
 
 
@@ -138,6 +121,16 @@ trainer:
   log_period: 10
   save_period: 1000
   validation_period: 1000
+
+  # PS source probabilities per batch (mutually exclusive):
+  #   p_null_drop → null PS token (modality dropout)
+  #   p_pseudo_ps → SR-generated pseudo-PS
+  #   remainder   → real PS
+  p_null_drop: 0.0
+  p_pseudo_ps: 0.3
+
+  # Steps before TDP loss is activated (pixel-only warmup)
+  warmup_sr_steps: 200
 
 
 # Validation / inference
