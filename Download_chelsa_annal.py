@@ -52,7 +52,7 @@ DOMAIN_ZHDK = "https://os.zhdk.cloud.switch.ch/chelsav2/GLOBAL/monthly"
 DOMAIN_UNIL = "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/monthly"
 
 URL_TYPE_A = {"tas", "pr"}        # zhdk，月_年，无年份子目录
-URL_TYPE_C = {"spei12", "spi12"}  # unil，月_年，有年份子目录
+URL_TYPE_C = {"spei12", "spi12", "hurs", "sfcWind", "tasmax", "tasmin"}  # unil，月_年，有年份子目录
 URL_TYPE_D = {"pet"}              # zhdk，月_年，有年份子目录
 # 其余（hurs, rsds, sfcWind, tasmax, tasmin）为 B 类：zhdk，年_月，无年份子目录
 
