@@ -35,19 +35,24 @@ class FMRefiner(nn.Module):
         self,
         vae: AutoencoderKL,
         unet: UNet2DConditionModel,
-        controlnet: ControlNetModel,
+        controlnet: Optional[ControlNetModel],
         empty_text_embed: torch.Tensor,
         ps_dropout_p: float = 0.3,
+        use_controlnet: bool = True,
     ):
         super().__init__()
         self.vae = vae
         self.unet = unet
         self.controlnet = controlnet
+        self.use_controlnet = use_controlnet
 
         # Fixed empty text embedding (not a parameter)
         self.register_buffer("empty_text_embed", empty_text_embed)
 
         self.ps_dropout_p = ps_dropout_p
+        # "landsat_ps": ControlNet takes cat([landsat, ps]) — default (v3/v4)
+        # "ps_only":    ControlNet takes PS only (3ch), no Landsat
+        self.controlnet_cond_mode = "landsat_ps"
         # Null PS token: (1, C_ps, 1, 1), broadcast over spatial dims.
         # C_ps is unknown at construction time – initialized lazily.
         self._null_ps: Optional[nn.Parameter] = None
@@ -109,10 +114,6 @@ class FMRefiner(nn.Module):
         B = h_gt.shape[0]
         device = h_gt.device
         dtype = h_gt.dtype
-        c_ps = ps_hr.shape[1]
-        H_hr, W_hr = ps_hr.shape[2], ps_hr.shape[3]
-
-        null_ps = self._get_null_ps(c_ps, device, dtype)  # (1, C_ps, 1, 1)
 
         # Encode to latent (no grad needed for targets)
         with torch.no_grad():
@@ -129,45 +130,55 @@ class FMRefiner(nn.Module):
         # Velocity target (constant, flow matching straight path)
         v_target = z_gt - z_coarse             # (B, 4, h, w)
 
-        # PlanetScope conditioning with dropout
-        ps_cond = ps_hr.clone()
-        if self.training:
-            drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
-            # null broadcasts to (1, C_ps, H, W)
-            null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
-            for i in range(B):
-                if drop_mask[i]:
-                    ps_cond[i] = null_spatial[0]
-
-        # ControlNet conditioning: Landsat + PS concatenated
-        control_input = torch.cat([landsat_lr, ps_cond], dim=1)  # (B, C_ls+C_ps, H, W)
-
         # Scale t to [0, 999] for UNet timestep embedding
         t_int = (t * 999).long()
 
         # Text conditioning (empty)
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 
-        # ControlNet forward
-        cn_out = self.controlnet(
-            sample=z_t,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            controlnet_cond=control_input,
-            return_dict=True,
-        )
+        if self.use_controlnet:
+            c_ps = ps_hr.shape[1]
+            H_hr, W_hr = ps_hr.shape[2], ps_hr.shape[3]
+            null_ps = self._get_null_ps(c_ps, device, dtype)  # (1, C_ps, 1, 1)
 
-        # UNet forward with ControlNet residuals
-        unet_out = self.unet(
-            sample=z_t,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            down_block_additional_residuals=cn_out.down_block_res_samples,
-            mid_block_additional_residual=cn_out.mid_block_res_sample,
-            return_dict=True,
-        )
+            # PlanetScope conditioning with dropout
+            ps_cond = ps_hr.clone()
+            if self.training:
+                drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
+                null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
+                for i in range(B):
+                    if drop_mask[i]:
+                        ps_cond[i] = null_spatial[0]
+
+            if self.controlnet_cond_mode == "ps_only":
+                control_input = ps_cond                                  # (B, C_ps, H, W)
+            else:
+                control_input = torch.cat([landsat_lr, ps_cond], dim=1) # (B, C_ls+C_ps, H, W)
+
+            cn_out = self.controlnet(
+                sample=z_t,
+                timestep=t_int,
+                encoder_hidden_states=text_emb,
+                controlnet_cond=control_input,
+                return_dict=True,
+            )
+            unet_out = self.unet(
+                sample=z_t,
+                timestep=t_int,
+                encoder_hidden_states=text_emb,
+                down_block_additional_residuals=cn_out.down_block_res_samples,
+                mid_block_additional_residual=cn_out.mid_block_res_sample,
+                return_dict=True,
+            )
+        else:
+            unet_out = self.unet(
+                sample=z_t,
+                timestep=t_int,
+                encoder_hidden_states=text_emb,
+                return_dict=True,
+            )
+
         v_pred = unet_out.sample                # (B, 4, h, w)
-
         loss = F.mse_loss(v_pred, v_target)
         return loss
 
@@ -179,30 +190,38 @@ class FMRefiner(nn.Module):
         self,
         z: torch.Tensor,
         t_val: float,
-        control_input: torch.Tensor,
+        control_input: Optional[torch.Tensor],
         text_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Evaluate velocity field v(z, t) via UNet + ControlNet."""
+        """Evaluate velocity field v(z, t) via UNet, optionally with ControlNet."""
         B = z.shape[0]
         device = z.device
         dtype = z.dtype
         t_tensor = torch.full((B,), t_val, device=device, dtype=dtype)
         t_int = (t_tensor * 999).long()
-        cn_out = self.controlnet(
-            sample=z,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            controlnet_cond=control_input,
-            return_dict=True,
-        )
-        unet_out = self.unet(
-            sample=z,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            down_block_additional_residuals=cn_out.down_block_res_samples,
-            mid_block_additional_residual=cn_out.mid_block_res_sample,
-            return_dict=True,
-        )
+        if self.use_controlnet and control_input is not None:
+            cn_out = self.controlnet(
+                sample=z,
+                timestep=t_int,
+                encoder_hidden_states=text_emb,
+                controlnet_cond=control_input,
+                return_dict=True,
+            )
+            unet_out = self.unet(
+                sample=z,
+                timestep=t_int,
+                encoder_hidden_states=text_emb,
+                down_block_additional_residuals=cn_out.down_block_res_samples,
+                mid_block_additional_residual=cn_out.mid_block_res_sample,
+                return_dict=True,
+            )
+        else:
+            unet_out = self.unet(
+                sample=z,
+                timestep=t_int,
+                encoder_hidden_states=text_emb,
+                return_dict=True,
+            )
         return unet_out.sample
 
     @torch.no_grad()
@@ -215,7 +234,9 @@ class FMRefiner(nn.Module):
     ) -> torch.Tensor:
         """
         Refine coarse prediction via ODE integration.
-        Uses null PS token (inference-time, no PS available).
+
+        When use_controlnet=True, uses null PS token at inference time.
+        When use_controlnet=False, runs UNet only.
 
         method="euler": 1st-order Euler (original behaviour)
         method="heun":  2nd-order Heun (trapezoidal corrector), costs 2× NFE per step
@@ -226,19 +247,22 @@ class FMRefiner(nn.Module):
         B = h_coarse.shape[0]
         device = h_coarse.device
         dtype = h_coarse.dtype
-        H_hr, W_hr = landsat_lr.shape[2], landsat_lr.shape[3]
 
         z = self.encode(h_coarse)  # (B, 4, h, w)
-
-        # Use null PS (inference-time: PS not available)
-        # _null_ps may not be initialized if model was just built; provide a fallback
-        if self._null_ps is None:
-            raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
-        c_ps = self._null_ps.shape[1]
-        null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
-        control_input = torch.cat([landsat_lr, null_ps], dim=1)
-
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
+
+        if self.use_controlnet:
+            H_hr, W_hr = landsat_lr.shape[2], landsat_lr.shape[3]
+            if self._null_ps is None:
+                raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
+            c_ps = self._null_ps.shape[1]
+            null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
+            if self.controlnet_cond_mode == "ps_only":
+                control_input = null_ps
+            else:
+                control_input = torch.cat([landsat_lr, null_ps], dim=1)
+        else:
+            control_input = None
 
         dt = 1.0 / n_steps
         ts = [i / n_steps for i in range(n_steps)]
@@ -246,7 +270,6 @@ class FMRefiner(nn.Module):
         for t_val in ts:
             v1 = self._vel(z, t_val, control_input, text_emb)
             if method == "heun":
-                # Heun (trapezoidal): predictor step then corrector with averaged slope
                 t_next = min(t_val + dt, 1.0)
                 z_pred = z + dt * v1
                 v2 = self._vel(z_pred, t_next, control_input, text_emb)
@@ -267,6 +290,8 @@ def build_fm_refiner(
     n_landsat_bands: int,
     n_ps_bands: int,
     ps_dropout_p: float = 0.3,
+    use_controlnet: bool = True,
+    controlnet_cond_mode: str = "landsat_ps",
     device: str = "cuda",
 ) -> FMRefiner:
     """
@@ -277,9 +302,9 @@ def build_fm_refiner(
         n_landsat_bands: number of Landsat input channels
         n_ps_bands: number of PlanetScope input channels
         ps_dropout_p: dropout probability for PS conditioning
+        use_controlnet: if False, ControlNet is not built and UNet runs unconditionally
         device: device string
     """
-    import os
     from transformers import CLIPTextModel, CLIPTokenizer
 
     # Load VAE
@@ -289,17 +314,20 @@ def build_fm_refiner(
 
     # Load UNet (standard 4-channel in)
     unet = UNet2DConditionModel.from_pretrained(sd_pretrained_path, subfolder="unet")
-    # Keep UNet at 4-channel input (z_t only, no RGB concatenation)
     unet.requires_grad_(True)
     unet.train()
 
-    # Build ControlNet from UNet encoder
-    controlnet = ControlNetModel.from_unet(unet)
-    # Replace ControlNet's conv_in to accept n_landsat_bands + n_ps_bands channels
-    n_cond_channels = n_landsat_bands + n_ps_bands
-    _adapt_controlnet_input(controlnet, n_cond_channels)
-    controlnet.requires_grad_(True)
-    controlnet.train()
+    if use_controlnet:
+        controlnet = ControlNetModel.from_unet(unet)
+        if controlnet_cond_mode == "ps_only":
+            n_cond_channels = n_ps_bands
+        else:
+            n_cond_channels = n_landsat_bands + n_ps_bands
+        _adapt_controlnet_input(controlnet, n_cond_channels)
+        controlnet.requires_grad_(True)
+        controlnet.train()
+    else:
+        controlnet = None
 
     # Empty text embedding
     tokenizer = CLIPTokenizer.from_pretrained(sd_pretrained_path, subfolder="tokenizer")
@@ -318,7 +346,9 @@ def build_fm_refiner(
         controlnet=controlnet,
         empty_text_embed=empty_text_embed,
         ps_dropout_p=ps_dropout_p,
+        use_controlnet=use_controlnet,
     )
+    model.controlnet_cond_mode = controlnet_cond_mode
     return model
 
 

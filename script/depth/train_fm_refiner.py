@@ -253,8 +253,9 @@ def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_di
     path = os.path.join(out_dir, f"{name}.pth")
     torch.save({
         "step": step,
+        "use_controlnet": fm_refiner.use_controlnet,
         "unet_state": fm_refiner.unet.state_dict(),
-        "controlnet_state": fm_refiner.controlnet.state_dict(),
+        "controlnet_state": fm_refiner.controlnet.state_dict() if fm_refiner.use_controlnet else None,
         "null_ps_state": fm_refiner._null_ps,
         "optimizer_state": optimizer.state_dict(),
         "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
@@ -265,7 +266,8 @@ def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_di
 def load_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, path):
     ckpt = torch.load(path, map_location="cpu")
     fm_refiner.unet.load_state_dict(ckpt["unet_state"])
-    fm_refiner.controlnet.load_state_dict(ckpt["controlnet_state"])
+    if fm_refiner.use_controlnet and ckpt.get("controlnet_state") is not None:
+        fm_refiner.controlnet.load_state_dict(ckpt["controlnet_state"])
     if ckpt.get("null_ps_state") is not None:
         fm_refiner._null_ps = ckpt["null_ps_state"]
     optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -282,7 +284,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="FM Refiner Training")
-    parser.add_argument("--config", type=str, default="config/fm_refiner_v4.yaml")
+    parser.add_argument("--config", type=str, default="config/fm_refiner_v3-1.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -394,11 +396,15 @@ if __name__ == "__main__":
     n_landsat_bands = len(cfg_data.selected_bands)
     n_ps_bands = len(cfg_data.selected_bands_hr)
 
+    use_controlnet = cfg.trainer.get("use_controlnet", True)
+    controlnet_cond_mode = cfg.trainer.get("controlnet_cond_mode", "landsat_ps")
     fm_refiner = build_fm_refiner(
         sd_pretrained_path=cfg.model.sd_pretrained_path,
         n_landsat_bands=n_landsat_bands,
         n_ps_bands=n_ps_bands,
-        ps_dropout_p=cfg.trainer.ps_dropout_p,
+        ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
+        use_controlnet=use_controlnet,
+        controlnet_cond_mode=controlnet_cond_mode,
         device=str(device),
     )
     fm_refiner = fm_refiner.to(device)
@@ -415,10 +421,9 @@ if __name__ == "__main__":
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
 
     # ---- Optimizer ----
-    param_groups = [
-        {"params": fm_refiner.unet.parameters(), "lr": cfg.optimizer.lr_unet},
-        {"params": fm_refiner.controlnet.parameters(), "lr": cfg.optimizer.lr_controlnet},
-    ]
+    param_groups = [{"params": fm_refiner.unet.parameters(), "lr": cfg.optimizer.lr_unet}]
+    if use_controlnet:
+        param_groups.append({"params": fm_refiner.controlnet.parameters(), "lr": cfg.optimizer.lr_controlnet})
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.optimizer.weight_decay)
 
     lr_scheduler = None
@@ -495,10 +500,10 @@ if __name__ == "__main__":
             loss.backward()
 
             if (step + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(fm_refiner.unet.parameters()) + list(fm_refiner.controlnet.parameters()),
-                    max_norm=1.0,
-                )
+                all_params = list(fm_refiner.unet.parameters())
+                if use_controlnet:
+                    all_params += list(fm_refiner.controlnet.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 optimizer.step()
                 if lr_scheduler is not None:
                     lr_scheduler.step()
@@ -511,10 +516,15 @@ if __name__ == "__main__":
             if step % cfg.trainer.log_period == 0:
                 loss_val = loss.item() * accumulation_steps
                 lr_unet = optimizer.param_groups[0]["lr"]
-                lr_cn = optimizer.param_groups[1]["lr"]
                 pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
-                logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e} lr_cn={lr_cn:.2e}")
-                wandb.log({"train/loss": loss_val, "lr/unet": lr_unet, "lr/controlnet": lr_cn}, step=step)
+                log_dict = {"train/loss": loss_val, "lr/unet": lr_unet}
+                if use_controlnet:
+                    lr_cn = optimizer.param_groups[1]["lr"]
+                    log_dict["lr/controlnet"] = lr_cn
+                    logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e} lr_cn={lr_cn:.2e}")
+                else:
+                    logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e}")
+                wandb.log(log_dict, step=step)
                 tb_logger.log_dict({"train/loss": loss_val}, global_step=step)
 
             # Validation (rotating 10% subset)

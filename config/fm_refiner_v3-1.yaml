@@ -1,0 +1,124 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: fm_refiner_v3-1
+
+# Dataset config – mirrors ps_mrg_mm_v0.yaml; update paths as needed.
+dataset:
+  # LR input (Landsat)
+  input_dir: "/mnt/data/data/Landsat/eur_test2/2019"
+  # HR input (PlanetScope)
+  input_dir_hr: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/mnt/data/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  # LR input band selection (Landsat – 3 bands selected → DAv2 gets 3-ch input)
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  # HR input band selection (PlanetScope: blue, green, red, nir)
+  selected_bands_hr: [2, 1, 0]
+
+  # LR input normalization
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/mnt/data/dataset/CHM_EUR/LS_test2_statistics.json"
+
+  # HR input normalization
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/mnt/data/dataset/CHM_EUR/PS_test2_statistics.json"
+
+  # Target normalization
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/mnt/data/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+
+  # Final range scaling
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/save_20260609.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths (relative to base_ckpt_dir)
+model:
+  # SD 2.1 checkpoint directory (with unet/, vae/, tokenizer/, text_encoder/ subdirs)
+  sd_pretrained_path: "/mnt/data/model/marigold/stable-diffusion-2"
+  # Fine-tuned DAv2 checkpoint (.pth saved with model_state_dict)
+  dav2_pretrained_path: "/mnt/data/model/CHM_EUR/ls_da_model_r2.pth"
+  # HuggingFace backbone ID used when DAv2 was originally trained
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  # out_in_scale_factor used during DAv2 training (4 = 2 upsample stages)
+  dav2_out_in_scale_factor: 4
+
+
+# Optimizer
+optimizer:
+  lr_unet: 1.0e-05
+  lr_controlnet: 1.0e-04
+  weight_decay: 1.0e-02
+
+
+# LR scheduler (cosine annealing)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader
+dataloader:
+  effective_batch_size: 8
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  use_controlnet: True
+  controlnet_cond_mode: "ps_only"  # ControlNet takes PS only (3ch), no Landsat
+  ps_dropout_p: 0.5               
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+
+# Validation / inference
+validation:
+  n_steps: 1              # Euler integration steps (1–4); 1 is fastest
+
+
+# Training budget
+max_epoch: 1000
+max_iter: 50000
+
+
+# Eval metrics logged during validation
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse
