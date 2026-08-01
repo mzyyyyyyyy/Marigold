@@ -137,23 +137,26 @@ class FMRefiner(nn.Module):
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 
         if self.use_controlnet:
-            c_ps = ps_hr.shape[1]
-            H_hr, W_hr = ps_hr.shape[2], ps_hr.shape[3]
-            null_ps = self._get_null_ps(c_ps, device, dtype)  # (1, C_ps, 1, 1)
-
-            # PlanetScope conditioning with dropout
-            ps_cond = ps_hr.clone()
-            if self.training:
-                drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
-                null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
-                for i in range(B):
-                    if drop_mask[i]:
-                        ps_cond[i] = null_spatial[0]
-
-            if self.controlnet_cond_mode == "ps_only":
-                control_input = ps_cond                                  # (B, C_ps, H, W)
+            if self.controlnet_cond_mode == "landsat_only":
+                control_input = landsat_lr                               # (B, C_ls, H, W)
             else:
-                control_input = torch.cat([landsat_lr, ps_cond], dim=1) # (B, C_ls+C_ps, H, W)
+                c_ps = ps_hr.shape[1]
+                H_hr, W_hr = ps_hr.shape[2], ps_hr.shape[3]
+                null_ps = self._get_null_ps(c_ps, device, dtype)  # (1, C_ps, 1, 1)
+
+                # PlanetScope conditioning with dropout
+                ps_cond = ps_hr.clone()
+                if self.training:
+                    drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
+                    null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
+                    for i in range(B):
+                        if drop_mask[i]:
+                            ps_cond[i] = null_spatial[0]
+
+                if self.controlnet_cond_mode == "ps_only":
+                    control_input = ps_cond                                  # (B, C_ps, H, W)
+                else:
+                    control_input = torch.cat([landsat_lr, ps_cond], dim=1) # (B, C_ls+C_ps, H, W)
 
             cn_out = self.controlnet(
                 sample=z_t,
@@ -252,15 +255,18 @@ class FMRefiner(nn.Module):
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 
         if self.use_controlnet:
-            H_hr, W_hr = landsat_lr.shape[2], landsat_lr.shape[3]
-            if self._null_ps is None:
-                raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
-            c_ps = self._null_ps.shape[1]
-            null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
-            if self.controlnet_cond_mode == "ps_only":
-                control_input = null_ps
+            if self.controlnet_cond_mode == "landsat_only":
+                control_input = landsat_lr
             else:
-                control_input = torch.cat([landsat_lr, null_ps], dim=1)
+                H_hr, W_hr = landsat_lr.shape[2], landsat_lr.shape[3]
+                if self._null_ps is None:
+                    raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
+                c_ps = self._null_ps.shape[1]
+                null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
+                if self.controlnet_cond_mode == "ps_only":
+                    control_input = null_ps
+                else:
+                    control_input = torch.cat([landsat_lr, null_ps], dim=1)
         else:
             control_input = None
 
@@ -319,7 +325,9 @@ def build_fm_refiner(
 
     if use_controlnet:
         controlnet = ControlNetModel.from_unet(unet)
-        if controlnet_cond_mode == "ps_only":
+        if controlnet_cond_mode == "landsat_only":
+            n_cond_channels = n_landsat_bands
+        elif controlnet_cond_mode == "ps_only":
             n_cond_channels = n_ps_bands
         else:
             n_cond_channels = n_landsat_bands + n_ps_bands
