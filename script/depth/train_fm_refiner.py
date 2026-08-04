@@ -5,11 +5,14 @@ Pipeline:
   Landsat → DAv2(frozen) → H_coarse (HR)
   [H_coarse, H_gt] → VAE → [z_coarse, z_gt]
   z_t = (1-t)*z_coarse + t*z_gt
-  v_pred = UNet(z_t, t) + ControlNet(Landsat_HR, PS_or_null)
+  v_pred = UNet(z_t, t) [+ ControlNet(PS_or_null) if ps_dropout_p < 1]
   loss = MSE(v_pred, z_gt - z_coarse)
 
+  Landsat is NOT used as a condition (it is already encoded in z_coarse).
+  ControlNet conditions on PS only. Set ps_dropout_p=1.0 to disable ControlNet entirely.
+
 Usage:
-  python script/depth/train_fm_refiner.py --config config/fm_refiner.yaml
+  python script/depth/train_fm_refiner.py --config config/fm_refiner_v5.yaml
 """
 
 import copy
@@ -195,21 +198,21 @@ def validate(
         H_hr, W_hr = targets.shape[2], targets.shape[3]
 
         landsat = inputs_lr[:, :n_landsat_bands]
-        landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
         landsat_for_dav2 = (landsat + 1.0) / 2.0
         h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-        h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method)
+        h_fine = fm_refiner.refine(h_coarse, n_steps=n_steps, method=method)
 
         all_preds.append(h_fine.cpu().flatten())
         all_gts.append(targets.cpu().flatten())
 
         # Collect vis samples from the first image of this batch
         if len(vis_samples) < n_vis_samples:
+            landsat_vis = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
             vis_samples.append({
-                "landsat": _to_vis_rgb(landsat_hr[0]),
+                "landsat": _to_vis_rgb(landsat_vis[0]),
                 "ps":      _to_vis_rgb(inputs_hr[0]),
                 "coarse":  _to_vis_depth(h_coarse[0]),
                 "fine":    _to_vis_depth(h_fine[0]),
@@ -282,7 +285,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="FM Refiner Training")
-    parser.add_argument("--config", type=str, default="config/fm_refiner_v4.yaml")
+    parser.add_argument("--config", type=str, default="config/fm_refiner_v9.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -396,9 +399,11 @@ if __name__ == "__main__":
 
     fm_refiner = build_fm_refiner(
         sd_pretrained_path=cfg.model.sd_pretrained_path,
-        n_landsat_bands=n_landsat_bands,
         n_ps_bands=n_ps_bands,
         ps_dropout_p=cfg.trainer.ps_dropout_p,
+        bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
+        concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
+        refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
         device=str(device),
     )
     fm_refiner = fm_refiner.to(device)
@@ -415,10 +420,15 @@ if __name__ == "__main__":
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
 
     # ---- Optimizer ----
+    # ps_dropout_p=1.0 means ControlNet is never used; only train UNet in that case
+    use_controlnet = cfg.trainer.ps_dropout_p < 1.0
     param_groups = [
         {"params": fm_refiner.unet.parameters(), "lr": cfg.optimizer.lr_unet},
-        {"params": fm_refiner.controlnet.parameters(), "lr": cfg.optimizer.lr_controlnet},
     ]
+    if use_controlnet:
+        param_groups.append(
+            {"params": fm_refiner.controlnet.parameters(), "lr": cfg.optimizer.lr_controlnet}
+        )
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.optimizer.weight_decay)
 
     lr_scheduler = None
@@ -473,23 +483,19 @@ if __name__ == "__main__":
 
             H_hr, W_hr = targets.shape[2], targets.shape[3]
 
-            # Landsat to HR resolution for ControlNet
             landsat = inputs_lr[:, :n_landsat_bands]
-            landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
-            # DAv2 coarse prediction (no grad, DAv2 frozen)
-            # DAv2 expects [0,1] input; dataloader gives [-1,1] → convert back
+            # DAv2 coarse prediction (frozen, no grad)
             with torch.no_grad():
                 landsat_for_dav2 = (landsat + 1.0) / 2.0
                 h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
                 h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-            # FM loss
+            # FM loss — PS-only conditioning (no Landsat); ps_dropout_p=1.0 → no ControlNet
             loss = fm_refiner(
-                landsat_lr=landsat_hr,  # ControlNet sees HR-resolution Landsat
-                ps_hr=inputs_hr,
                 h_coarse=h_coarse,
                 h_gt=targets,
+                ps_hr=inputs_hr if use_controlnet else None,
             )
             loss = loss / accumulation_steps
             loss.backward()
@@ -511,10 +517,14 @@ if __name__ == "__main__":
             if step % cfg.trainer.log_period == 0:
                 loss_val = loss.item() * accumulation_steps
                 lr_unet = optimizer.param_groups[0]["lr"]
-                lr_cn = optimizer.param_groups[1]["lr"]
+                lr_cn = optimizer.param_groups[1]["lr"] if use_controlnet else 0.0
                 pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
-                logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e} lr_cn={lr_cn:.2e}")
-                wandb.log({"train/loss": loss_val, "lr/unet": lr_unet, "lr/controlnet": lr_cn}, step=step)
+                logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e}" +
+                             (f" lr_cn={lr_cn:.2e}" if use_controlnet else ""))
+                log_dict = {"train/loss": loss_val, "lr/unet": lr_unet}
+                if use_controlnet:
+                    log_dict["lr/controlnet"] = lr_cn
+                wandb.log(log_dict, step=step)
                 tb_logger.log_dict({"train/loss": loss_val}, global_step=step)
 
             # Validation (rotating 10% subset)

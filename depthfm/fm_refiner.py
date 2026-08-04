@@ -38,6 +38,9 @@ class FMRefiner(nn.Module):
         controlnet: ControlNetModel,
         empty_text_embed: torch.Tensor,
         ps_dropout_p: float = 0.3,
+        bridge_sigma: float = 0.0,
+        concat_z_coarse: bool = False,
+        refine_threshold: float = 0.0,
     ):
         super().__init__()
         self.vae = vae
@@ -48,6 +51,11 @@ class FMRefiner(nn.Module):
         self.register_buffer("empty_text_embed", empty_text_embed)
 
         self.ps_dropout_p = ps_dropout_p
+        self.bridge_sigma = bridge_sigma
+        self.concat_z_coarse = concat_z_coarse
+        # Pixel-space threshold for selective refinement during training.
+        # 0.0 = disabled (all pixels refined normally).
+        self.refine_threshold = refine_threshold
         # Null PS token: (1, C_ps, 1, 1), broadcast over spatial dims.
         # C_ps is unknown at construction time – initialized lazily.
         self._null_ps: Optional[nn.Parameter] = None
@@ -95,14 +103,18 @@ class FMRefiner(nn.Module):
 
     def forward(
         self,
-        landsat_lr: torch.Tensor,       # (B, C_ls, H_hr, W_hr) – already upsampled to HR
-        ps_hr: torch.Tensor,             # (B, C_ps, H_hr, W_hr)
-        h_coarse: torch.Tensor,          # (B, 1, H_hr, W_hr) – DAv2 output, already at HR
-        h_gt: torch.Tensor,              # (B, 1, H_hr, W_hr)
-        ps_cond_override: Optional[torch.Tensor] = None,  # bypass internal dropout
+        h_coarse: torch.Tensor,                          # (B, 1, H_hr, W_hr)
+        h_gt: torch.Tensor,                              # (B, 1, H_hr, W_hr)
+        ps_hr: Optional[torch.Tensor] = None,            # (B, C_ps, H_hr, W_hr) or None
+        ps_cond_override: Optional[torch.Tensor] = None, # bypass internal dropout
+        # legacy arg kept for call-site compatibility; ignored
+        landsat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute FM training loss.
+
+        When ps_hr is None (and ps_cond_override is None), runs UNet-only (no ControlNet).
+        When ps_hr is provided, ControlNet uses PS-only conditioning (no Landsat).
 
         Returns:
             Scalar MSE loss between predicted and target velocity.
@@ -110,70 +122,89 @@ class FMRefiner(nn.Module):
         B = h_gt.shape[0]
         device = h_gt.device
         dtype = h_gt.dtype
-        c_ps = ps_hr.shape[1]
-        H_hr, W_hr = ps_hr.shape[2], ps_hr.shape[3]
 
-        null_ps = self._get_null_ps(c_ps, device, dtype)  # (1, C_ps, 1, 1)
-
-        # Encode to latent (no grad needed for targets)
+        # Encode to latent
         with torch.no_grad():
-            z_coarse = self.encode(h_coarse)   # (B, 4, h, w)
-            z_gt = self.encode(h_gt)           # (B, 4, h, w)
+            z_coarse = self.encode(h_coarse)
+            z_gt     = self.encode(h_gt)
 
-        # Sample t ~ Uniform(0, 1)
-        t = torch.rand(B, device=device, dtype=dtype)  # (B,)
-
-        # Linear interpolation in latent space
+        t  = torch.rand(B, device=device, dtype=dtype)
         t4 = t.view(B, 1, 1, 1)
-        z_t = (1.0 - t4) * z_coarse + t4 * z_gt
 
-        # Velocity target (constant, flow matching straight path)
-        v_target = z_gt - z_coarse             # (B, 4, h, w)
-
-        # PlanetScope conditioning with dropout
-        if ps_cond_override is not None:
-            # Caller handles all dropout/substitution externally
-            ps_cond = ps_cond_override
+        # Selective refinement mask: pixels where |h_gt - h_coarse| > threshold
+        # are trained normally; others are forced to keep coarse (v_target=0).
+        # Mask is computed in pixel space then downsampled to latent resolution (÷8).
+        if self.refine_threshold > 0.0:
+            with torch.no_grad():
+                mask_pixel = ((h_gt - h_coarse).abs() > self.refine_threshold).float()
+                # Downsample to latent spatial resolution
+                lat_h, lat_w = z_coarse.shape[2], z_coarse.shape[3]
+                mask_lat = F.interpolate(mask_pixel, size=(lat_h, lat_w), mode="nearest")
+                mask_lat = mask_lat.expand_as(z_coarse)
         else:
+            mask_lat = None
+
+        # Bridge Matching: add noise proportional to sqrt(t*(1-t)) at midpoint.
+        if self.bridge_sigma > 0.0:
+            eps = torch.randn_like(z_coarse)
+            noise_scale = self.bridge_sigma * torch.sqrt(t4 * (1.0 - t4))
+            z_t = (1.0 - t4) * z_coarse + t4 * z_gt + noise_scale * eps
+        else:
+            z_t = (1.0 - t4) * z_coarse + t4 * z_gt
+
+        # Selective refinement: for easy pixels (mask=0), fix z_t = z_coarse and v_target = 0.
+        # Both input and target must be consistent: model sees z_coarse and learns to stay there.
+        if mask_lat is not None:
+            z_t      = z_t * mask_lat + z_coarse * (1.0 - mask_lat)
+            v_target = (z_gt - z_coarse) * mask_lat
+        else:
+            v_target = z_gt - z_coarse
+
+        text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
+        t_int    = (t * 999).long()
+
+        unet_sample = torch.cat([z_t, z_coarse], dim=1) if self.concat_z_coarse else z_t
+
+        # Build control_input (PS only) or None
+        if ps_cond_override is not None:
+            control_input = ps_cond_override
+        elif ps_hr is not None:
+            H_hr, W_hr = ps_hr.shape[2], ps_hr.shape[3]
+            c_ps    = ps_hr.shape[1]
+            null_ps = self._get_null_ps(c_ps, device, dtype)
             ps_cond = ps_hr.clone()
             if self.training:
-                drop_mask = torch.rand(B, device=device) < self.ps_dropout_p
+                drop_mask    = torch.rand(B, device=device) < self.ps_dropout_p
                 null_spatial = null_ps.expand(1, -1, H_hr, W_hr)
                 for i in range(B):
                     if drop_mask[i]:
                         ps_cond[i] = null_spatial[0]
+            control_input = ps_cond
+        else:
+            control_input = None
 
-        # ControlNet conditioning: Landsat + PS concatenated
-        control_input = torch.cat([landsat_lr, ps_cond], dim=1)  # (B, C_ls+C_ps, H, W)
+        if control_input is not None:
+            cn_out = self.controlnet(
+                sample=unet_sample, timestep=t_int,
+                encoder_hidden_states=text_emb,
+                controlnet_cond=control_input, return_dict=True,
+            )
+            unet_out = self.unet(
+                sample=unet_sample, timestep=t_int,
+                encoder_hidden_states=text_emb,
+                down_block_additional_residuals=cn_out.down_block_res_samples,
+                mid_block_additional_residual=cn_out.mid_block_res_sample,
+                return_dict=True,
+            )
+        else:
+            unet_out = self.unet(
+                sample=unet_sample, timestep=t_int,
+                encoder_hidden_states=text_emb,
+                return_dict=True,
+            )
 
-        # Scale t to [0, 999] for UNet timestep embedding
-        t_int = (t * 999).long()
-
-        # Text conditioning (empty)
-        text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
-
-        # ControlNet forward
-        cn_out = self.controlnet(
-            sample=z_t,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            controlnet_cond=control_input,
-            return_dict=True,
-        )
-
-        # UNet forward with ControlNet residuals
-        unet_out = self.unet(
-            sample=z_t,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            down_block_additional_residuals=cn_out.down_block_res_samples,
-            mid_block_additional_residual=cn_out.mid_block_res_sample,
-            return_dict=True,
-        )
-        v_pred = unet_out.sample                # (B, 4, h, w)
-
-        loss = F.mse_loss(v_pred, v_target)
-        return loss
+        v_pred = unet_out.sample
+        return F.mse_loss(v_pred, v_target)
 
     # ------------------------------------------------------------------
     # Inference
@@ -182,135 +213,128 @@ class FMRefiner(nn.Module):
     def _vel(
         self,
         z: torch.Tensor,
+        z_coarse: torch.Tensor,
         t_val: float,
-        control_input: torch.Tensor,
+        control_input: Optional[torch.Tensor],
         text_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Evaluate velocity field v(z, t) via UNet + ControlNet."""
+        """Evaluate velocity field v(z, t). Uses ControlNet iff control_input is not None."""
         B = z.shape[0]
         device = z.device
         dtype = z.dtype
-        t_tensor = torch.full((B,), t_val, device=device, dtype=dtype)
-        t_int = (t_tensor * 999).long()
-        cn_out = self.controlnet(
-            sample=z,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            controlnet_cond=control_input,
-            return_dict=True,
-        )
-        unet_out = self.unet(
-            sample=z,
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            down_block_additional_residuals=cn_out.down_block_res_samples,
-            mid_block_additional_residual=cn_out.mid_block_res_sample,
-            return_dict=True,
-        )
+        t_int = (torch.full((B,), t_val, device=device, dtype=dtype) * 999).long()
+        unet_sample = torch.cat([z, z_coarse], dim=1) if self.concat_z_coarse else z
+        if control_input is not None:
+            cn_out = self.controlnet(
+                sample=unet_sample, timestep=t_int,
+                encoder_hidden_states=text_emb,
+                controlnet_cond=control_input, return_dict=True,
+            )
+            unet_out = self.unet(
+                sample=unet_sample, timestep=t_int,
+                encoder_hidden_states=text_emb,
+                down_block_additional_residuals=cn_out.down_block_res_samples,
+                mid_block_additional_residual=cn_out.mid_block_res_sample,
+                return_dict=True,
+            )
+        else:
+            unet_out = self.unet(
+                sample=unet_sample, timestep=t_int,
+                encoder_hidden_states=text_emb,
+                return_dict=True,
+            )
         return unet_out.sample
 
     @torch.no_grad()
     def refine(
         self,
-        landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr)
         h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
         n_steps: int = 1,
-        method: str = "euler",       # "euler" or "heun"
+        method: str = "euler",
+        ps_hr: Optional[torch.Tensor] = None,  # (B, C_ps, H_hr, W_hr) or None
+        # legacy arg; ignored
+        landsat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Refine coarse prediction via ODE integration.
-        Uses null PS token (inference-time, no PS available).
 
-        method="euler": 1st-order Euler (original behaviour)
-        method="heun":  2nd-order Heun (trapezoidal corrector), costs 2× NFE per step
-
-        Returns:
-            h_fine: (B, 1, H_hr, W_hr) refined height map
+        ps_hr=None  → UNet-only, no ControlNet (unconditional).
+        ps_hr given → ControlNet conditioned on PS only.
         """
-        B = h_coarse.shape[0]
+        B      = h_coarse.shape[0]
         device = h_coarse.device
-        dtype = h_coarse.dtype
-        H_hr, W_hr = landsat_lr.shape[2], landsat_lr.shape[3]
+        dtype  = h_coarse.dtype
 
-        z = self.encode(h_coarse)  # (B, 4, h, w)
+        z_coarse_lat = self.encode(h_coarse)
+        z            = z_coarse_lat.clone()
+        text_emb     = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 
-        # Use null PS (inference-time: PS not available)
-        # _null_ps may not be initialized if model was just built; provide a fallback
-        if self._null_ps is None:
-            raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
-        c_ps = self._null_ps.shape[1]
-        null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
-        control_input = torch.cat([landsat_lr, null_ps], dim=1)
-
-        text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
+        if ps_hr is not None:
+            control_input = ps_hr.to(device, dtype)
+        elif self._null_ps is not None:
+            H_hr, W_hr    = h_coarse.shape[2], h_coarse.shape[3]
+            control_input = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
+        else:
+            control_input = None
 
         dt = 1.0 / n_steps
-        ts = [i / n_steps for i in range(n_steps)]
-
-        for t_val in ts:
-            v1 = self._vel(z, t_val, control_input, text_emb)
+        for i in range(n_steps):
+            t_val      = i / n_steps
+            is_last    = (i == n_steps - 1)
+            v1 = self._vel(z, z_coarse_lat, t_val, control_input, text_emb)
             if method == "heun":
-                # Heun (trapezoidal): predictor step then corrector with averaged slope
                 t_next = min(t_val + dt, 1.0)
-                z_pred = z + dt * v1
-                v2 = self._vel(z_pred, t_next, control_input, text_emb)
-                z = z + dt * 0.5 * (v1 + v2)
+                v2 = self._vel(z + dt * v1, z_coarse_lat, t_next, control_input, text_emb)
+                z  = z + dt * 0.5 * (v1 + v2)
             else:
                 z = z + dt * v1
+            # SDE noise injection (skip on last step to avoid noise at t=1)
+            if self.bridge_sigma > 0.0 and not is_last:
+                z = z + self.bridge_sigma * (dt ** 0.5) * torch.randn_like(z)
 
-        h_fine = self.decode(z)
-        return h_fine
-
+        return self.decode(z)
 
     @torch.no_grad()
     def refine_with_ps(
         self,
-        landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr)
-        ps_hr: torch.Tensor,         # (B, C_ps, H_hr, W_hr) – real or pseudo PS
+        ps_hr: torch.Tensor,         # (B, C_ps, H_hr, W_hr)
         h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
         n_steps: int = 1,
         method: str = "euler",
+        # legacy arg; ignored
+        landsat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Refine coarse prediction using a supplied PS (real or SR-generated pseudo-PS).
-
-        Identical to refine() but accepts an explicit PS tensor instead of using
-        the null PS token.  Useful at inference time when the SR module provides
-        a pseudo-PS substitute for the missing PlanetScope image.
-        """
-        B = h_coarse.shape[0]
-        device = h_coarse.device
-        dtype = h_coarse.dtype
-
-        z = self.encode(h_coarse)
-        control_input = torch.cat([landsat_lr, ps_hr.to(device, dtype)], dim=1)
-        text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
-
-        dt = 1.0 / n_steps
-        ts = [i / n_steps for i in range(n_steps)]
-        for t_val in ts:
-            v1 = self._vel(z, t_val, control_input, text_emb)
-            if method == "heun":
-                t_next = min(t_val + dt, 1.0)
-                z_pred = z + dt * v1
-                v2 = self._vel(z_pred, t_next, control_input, text_emb)
-                z = z + dt * 0.5 * (v1 + v2)
-            else:
-                z = z + dt * v1
-
-        return self.decode(z)
+        """Refine using PS-only ControlNet conditioning."""
+        return self.refine(h_coarse, n_steps=n_steps, method=method, ps_hr=ps_hr)
 
 
 # ------------------------------------------------------------------
 # Factory helpers
 # ------------------------------------------------------------------
 
+def _adapt_unet_input(unet: UNet2DConditionModel, in_channels: int = 8):
+    """Expand UNet conv_in from 4 to in_channels. New channels are zero-initialized."""
+    old = unet.conv_in
+    new = nn.Conv2d(in_channels, old.out_channels, old.kernel_size, padding=old.padding)
+    with torch.no_grad():
+        new.weight[:, :old.in_channels] = old.weight
+        new.weight[:, old.in_channels:] = 0.0
+        if old.bias is not None:
+            new.bias.copy_(old.bias)
+    unet.conv_in = new
+    unet.config.in_channels = in_channels
+
+
 def build_fm_refiner(
     sd_pretrained_path: str,
-    n_landsat_bands: int,
     n_ps_bands: int,
     ps_dropout_p: float = 0.3,
+    bridge_sigma: float = 0.0,
+    concat_z_coarse: bool = False,
+    refine_threshold: float = 0.0,
     device: str = "cuda",
+    # legacy arg; kept for call-site compatibility, ignored
+    n_landsat_bands: int = 0,
 ) -> FMRefiner:
     """
     Build FMRefiner from a SD2.1 pretrained checkpoint directory.
@@ -330,17 +354,15 @@ def build_fm_refiner(
     vae.requires_grad_(False)
     vae.eval()
 
-    # Load UNet (standard 4-channel in)
     unet = UNet2DConditionModel.from_pretrained(sd_pretrained_path, subfolder="unet")
-    # Keep UNet at 4-channel input (z_t only, no RGB concatenation)
+    if concat_z_coarse:
+        _adapt_unet_input(unet, in_channels=8)
     unet.requires_grad_(True)
     unet.train()
 
-    # Build ControlNet from UNet encoder
+    # Build ControlNet from UNet encoder (conditioned on PS only)
     controlnet = ControlNetModel.from_unet(unet)
-    # Replace ControlNet's conv_in to accept n_landsat_bands + n_ps_bands channels
-    n_cond_channels = n_landsat_bands + n_ps_bands
-    _adapt_controlnet_input(controlnet, n_cond_channels)
+    _adapt_controlnet_input(controlnet, n_ps_bands)
     controlnet.requires_grad_(True)
     controlnet.train()
 
@@ -361,6 +383,9 @@ def build_fm_refiner(
         controlnet=controlnet,
         empty_text_embed=empty_text_embed,
         ps_dropout_p=ps_dropout_p,
+        bridge_sigma=bridge_sigma,
+        concat_z_coarse=concat_z_coarse,
+        refine_threshold=refine_threshold,
     )
     return model
 

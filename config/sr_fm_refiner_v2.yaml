@@ -88,8 +88,8 @@ sr_module:
 # SR training losses (Phase 1)
 sr_loss:
   pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
-  tdp_weight: 0.0     # L1 on ControlNet mid-block features (pseudo vs real)
-  tdp_hook: "controlnet.mid_block"   # "controlnet.mid_block" or "unet.up_blocks.N" (N=0..3)
+  tdp_weight: 0.3     # L1 on ControlNet mid-block features (pseudo vs real)
+
 
 # Alternate training schedule
 

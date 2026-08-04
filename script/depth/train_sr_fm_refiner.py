@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
+from depthfm.chmv2 import load_chmv2, run_chmv2
 from depthfm.sr_module import SRModule, build_sr_module
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
@@ -118,17 +119,17 @@ def _to_vis_depth(tensor: torch.Tensor) -> np.ndarray:
 
 def _make_vis_figure(samples: list) -> plt.Figure:
     n = len(samples)
-    col_titles = ["Landsat (RGB)", "pseudo-PS (RGB)", "DAv2 Coarse", "FM Refined", "GT"]
-    fig, axes = plt.subplots(n, 5, figsize=(20, 4 * n))
+    col_titles = ["Landsat (RGB)", "pseudo-PS (RGB)", "Real PS (RGB)", "DAv2 Coarse", "FM Refined", "GT"]
+    fig, axes = plt.subplots(n, 6, figsize=(24, 4 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
     for row, s in enumerate(samples):
         for col, (key, title) in enumerate(zip(
-            ["landsat", "pseudo_ps", "coarse", "fine", "gt"], col_titles
+            ["landsat", "pseudo_ps", "real_ps", "coarse", "fine", "gt"], col_titles
         )):
             ax = axes[row, col]
             data = s[key]
-            if key in ("landsat", "pseudo_ps"):
+            if key in ("landsat", "pseudo_ps", "real_ps"):
                 ax.imshow(data)
             else:
                 im = ax.imshow(data, cmap="plasma", vmin=-1.0, vmax=1.0)
@@ -165,7 +166,7 @@ def _load_target_stats(stats_file: str, year: int) -> dict:
 def validate(
     fm_refiner: FMRefiner,
     sr_module: SRModule,
-    dav2_model,
+    coarse_model,
     val_loader: DataLoader,
     device: torch.device,
     n_steps: int,
@@ -176,6 +177,11 @@ def validate(
     full: bool = False,
     method: str = "euler",
     use_sr_pseudo_ps: bool = True,
+    use_real_ps: bool = False,
+    coarse_model_type: str = "dav2",
+    chmv2_mean: list = None,
+    chmv2_std: list = None,
+    n_avg: int = 1,
 ) -> tuple:
     fm_refiner.eval()
     sr_module.eval()
@@ -201,35 +207,49 @@ def validate(
             targets = targets.squeeze(0)
 
         inputs_lr = inputs_lr.to(device)
+        inputs_hr = inputs_hr.to(device)
         targets = targets.to(device)
 
         H_hr, W_hr = targets.shape[2], targets.shape[3]
         landsat = inputs_lr[:, :n_landsat_bands]
         landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
-        landsat_for_dav2 = (landsat + 1.0) / 2.0
-        h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+        if coarse_model_type == "chmv2":
+            h_coarse = run_chmv2(coarse_model, landsat, (H_hr, W_hr), chmv2_mean, chmv2_std)
+        else:
+            landsat_for_dav2 = (landsat + 1.0) / 2.0
+            h_coarse = run_dav2(coarse_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-        if use_sr_pseudo_ps:
-            pseudo_ps = sr_module(landsat, target_size=(H_hr, W_hr))
-            h_fine = fm_refiner.refine_with_ps(
-                landsat_hr, pseudo_ps, h_coarse, n_steps=n_steps, method=method
-            )
+        if use_real_ps:
+            ps_input = inputs_hr
+            ps_vis = inputs_hr[0]
+        elif use_sr_pseudo_ps:
+            ps_input = sr_module(landsat, target_size=(H_hr, W_hr))
+            ps_vis = ps_input[0]
         else:
-            h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method)
+            ps_input = None
+            ps_vis = landsat_hr[0]
+
+        def _run_refine():
+            if ps_input is not None:
+                return fm_refiner.refine_with_ps(ps_input, h_coarse, n_steps=n_steps, method=method)
+            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method)
+
+        if n_avg > 1:
+            h_fine = torch.stack([_run_refine() for _ in range(n_avg)]).mean(dim=0)
+        else:
+            h_fine = _run_refine()
 
         all_preds.append(h_fine.cpu().flatten())
         all_gts.append(targets.cpu().flatten())
 
         if len(vis_samples) < n_vis_samples:
-            pseudo_ps_vis = (
-                sr_module(landsat, target_size=(H_hr, W_hr))[0]
-                if use_sr_pseudo_ps else landsat_hr[0]
-            )
+            pseudo_ps_vis = ps_vis
             vis_samples.append({
                 "landsat":   _to_vis_rgb(landsat_hr[0]),
                 "pseudo_ps": _to_vis_rgb(pseudo_ps_vis),
+                "real_ps":   _to_vis_rgb(inputs_hr[0]),
                 "coarse":    _to_vis_depth(h_coarse[0]),
                 "fine":      _to_vis_depth(h_fine[0]),
                 "gt":        _to_vis_depth(targets[0]),
@@ -317,6 +337,7 @@ def _sr_step(
     pixel_weight: float,
     tdp_weight: float,
     use_tdp: bool,               # False during warmup
+    tdp_hook: str,               # e.g. "controlnet.cond_embedding" / "controlnet.mid_block" / "unet.up_blocks.2"
     device: torch.device,
 ) -> dict:
     """
@@ -326,7 +347,13 @@ def _sr_step(
       pseudo_ps ← SR ← landsat
 
     Gradient path (TDP loss):
-      ControlNet mid-block feature(pseudo_ps) ← ControlNet ← pseudo_ps ← SR ← landsat
+      feature at tdp_hook(pseudo_ps) ← pseudo_ps ← SR ← landsat
+
+    tdp_hook options:
+      "controlnet.cond_embedding" – directly call controlnet_cond_embedding (no z_t context,
+                                    cleanest option: features depend only on PS input)
+      "controlnet.mid_block"      – hook ControlNet mid_block (requires full CN forward with z_coarse)
+      "unet.up_blocks.N"          – hook UNet up_blocks[N], runs ControlNet + UNet forward
     """
     B = landsat.shape[0]
     H_hr, W_hr = real_ps.shape[2], real_ps.shape[3]
@@ -339,47 +366,73 @@ def _sr_step(
 
     l_tdp = torch.tensor(0.0, device=device)
     if use_tdp and tdp_weight > 0:
-        # TDP loss via forward hook on ControlNet mid_block.
-        # Runs ControlNet twice (pseudo vs real PS) to obtain feature maps at the same
-        # timestep, then applies L1. DAV2 coarse latent is used as the 'sample' arg.
-        with torch.no_grad():
-            z_coarse = fm_refiner.encode(h_coarse)
+        if tdp_hook == "controlnet.cond_embedding":
+            # Directly call controlnet_cond_embedding — no z_t context, no full CN forward.
+            # Grad flows: l_tdp → cond_embedding(pseudo_ps) → pseudo_ps → SR
+            feat_fake = fm_refiner.controlnet.controlnet_cond_embedding(pseudo_ps)
+            with torch.no_grad():
+                feat_real = fm_refiner.controlnet.controlnet_cond_embedding(real_ps)
+        else:
+            # Original hook-based path (controlnet.mid_block or unet.up_blocks.N)
+            with torch.no_grad():
+                z_coarse = fm_refiner.encode(h_coarse)
 
-        text_emb = fm_refiner.empty_text_embed.to(device).expand(B, -1, -1)
-        t_val = torch.full((B,), 0.5, device=device)
-        t_int = (t_val * 999).long()
+            text_emb = fm_refiner.empty_text_embed.to(device).expand(B, -1, -1)
+            t_val = torch.full((B,), 0.5, device=device)
+            t_int = (t_val * 999).long()
 
-        feats: dict = {}
+            use_unet = tdp_hook.startswith("unet.")
+            if use_unet:
+                up_idx = int(tdp_hook.split(".")[-1])
+                hook_module = fm_refiner.unet.up_blocks[up_idx]
+            else:
+                hook_module = fm_refiner.controlnet.mid_block
 
-        def _hook(m, inp, out):
-            feats["out"] = out
+            feats: dict = {}
 
-        hook = fm_refiner.controlnet.mid_block.register_forward_hook(_hook)
+            def _hook(m, _inp, out):
+                feats["out"] = out
 
-        # Forward with pseudo-PS (grad flows here)
-        cn_fake_input = torch.cat([landsat_hr, pseudo_ps], dim=1)
-        fm_refiner.controlnet(
-            sample=z_coarse.detach(),
-            timestep=t_int,
-            encoder_hidden_states=text_emb,
-            controlnet_cond=cn_fake_input,
-            return_dict=True,
-        )
-        feat_fake = feats["out"]
+            hook = hook_module.register_forward_hook(_hook)
 
-        # Forward with real PS (no grad – reference only)
-        with torch.no_grad():
-            cn_real_input = torch.cat([landsat_hr, real_ps], dim=1)
-            fm_refiner.controlnet(
+            cn_fake_out = fm_refiner.controlnet(
                 sample=z_coarse.detach(),
                 timestep=t_int,
                 encoder_hidden_states=text_emb,
-                controlnet_cond=cn_real_input,
+                controlnet_cond=pseudo_ps,
                 return_dict=True,
             )
-            feat_real = feats["out"]
+            if use_unet:
+                fm_refiner.unet(
+                    sample=z_coarse.detach(),
+                    timestep=t_int,
+                    encoder_hidden_states=text_emb,
+                    down_block_additional_residuals=cn_fake_out.down_block_res_samples,
+                    mid_block_additional_residual=cn_fake_out.mid_block_res_sample,
+                    return_dict=True,
+                )
+            feat_fake = feats["out"]
 
-        hook.remove()
+            with torch.no_grad():
+                cn_real_out = fm_refiner.controlnet(
+                    sample=z_coarse.detach(),
+                    timestep=t_int,
+                    encoder_hidden_states=text_emb,
+                    controlnet_cond=real_ps,
+                    return_dict=True,
+                )
+                if use_unet:
+                    fm_refiner.unet(
+                        sample=z_coarse.detach(),
+                        timestep=t_int,
+                        encoder_hidden_states=text_emb,
+                        down_block_additional_residuals=cn_real_out.down_block_res_samples,
+                        mid_block_additional_residual=cn_real_out.mid_block_res_sample,
+                        return_dict=True,
+                    )
+                feat_real = feats["out"]
+
+            hook.remove()
 
         l_tdp = F.l1_loss(feat_fake, feat_real.detach()) * tdp_weight
 
@@ -451,7 +504,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v1.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v10.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -562,14 +615,25 @@ if __name__ == "__main__":
         n_landsat_bands=n_landsat_bands,
         n_ps_bands=n_ps_bands,
         ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
+        bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
+        concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
+        refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
         device=str(device),
     ).to(device)
 
-    dav2_model = load_dav2(
-        dav2_path=cfg.model.dav2_pretrained_path,
-        backbone=cfg.model.dav2_backbone,
-        out_in_scale_factor=cfg.model.dav2_out_in_scale_factor,
-    ).to(device)
+    coarse_model_type = cfg.model.get("coarse_model", "dav2")
+    _chmv2_mean = _chmv2_std = None
+    if coarse_model_type == "chmv2":
+        coarse_model = load_chmv2(cfg.model.chmv2_model_id).to(device)
+        input_stats = json.load(open(cfg_data.input_stats_file))
+        _chmv2_mean = input_stats[str(cfg_data.year)]["mean"]
+        _chmv2_std  = input_stats[str(cfg_data.year)]["std"]
+    else:
+        coarse_model = load_dav2(
+            dav2_path=cfg.model.dav2_pretrained_path,
+            backbone=cfg.model.dav2_backbone,
+            out_in_scale_factor=cfg.model.dav2_out_in_scale_factor,
+        ).to(device)
 
     sr_module = build_sr_module(OmegaConf.to_container(cfg.sr_module, resolve=True)).to(device)
 
@@ -624,6 +688,7 @@ if __name__ == "__main__":
     warmup_sr_steps = int(cfg.trainer.warmup_sr_steps)
     pixel_weight    = float(cfg.sr_loss.pixel_weight)
     tdp_weight      = float(cfg.sr_loss.tdp_weight)
+    tdp_hook        = str(cfg.sr_loss.get("tdp_hook", "unet.up_blocks.2"))
 
     # SR trains every batch; FM trains every batch with detached SR output.
     # Both modules stay in train mode throughout.
@@ -675,38 +740,45 @@ if __name__ == "__main__":
             landsat    = inputs_lr[:, :n_landsat_bands]
             landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
-            # DAV2 coarse (always frozen)
+            # Coarse depth (always frozen)
             with torch.no_grad():
-                landsat_for_dav2 = (landsat + 1.0) / 2.0
-                h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+                if coarse_model_type == "chmv2":
+                    h_coarse = run_chmv2(coarse_model, landsat, (H_hr, W_hr), _chmv2_mean, _chmv2_std)
+                else:
+                    landsat_for_dav2 = (landsat + 1.0) / 2.0
+                    h_coarse = run_dav2(coarse_model, landsat_for_dav2, target_size=(H_hr, W_hr))
                 h_coarse = _normalize_coarse(h_coarse, target_stats)
 
             # ================================================================
             # Step 1: update SR  (FM frozen via no_grad on its forward pass)
             # ================================================================
-            use_tdp = (step >= warmup_sr_steps)
-            _freeze(fm_refiner.unet)
-            _freeze(fm_refiner.controlnet)
+            skip_sr_training = cfg.trainer.get("skip_sr_training", False)
+            if not skip_sr_training:
+                use_tdp = (step >= warmup_sr_steps)
+                _freeze(fm_refiner.unet)
+                _freeze(fm_refiner.controlnet)
 
-            loss_dict = _sr_step(
-                fm_refiner, sr_module,
-                landsat, landsat_hr, inputs_hr, h_coarse,
-                pixel_weight, tdp_weight, use_tdp, device,
-            )
-            optimizer_sr.zero_grad()
-            loss_dict["l_total"].backward()
+                loss_dict = _sr_step(
+                    fm_refiner, sr_module,
+                    landsat, landsat_hr, inputs_hr, h_coarse,
+                    pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
+                )
+                optimizer_sr.zero_grad()
+                loss_dict["l_total"].backward()
 
-            torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
-            optimizer_sr.step()
+                torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
+                optimizer_sr.step()
 
-            # detach SR output before releasing the computation graph
-            pseudo_ps_detached = loss_dict["pseudo_ps"].detach().clone()
-            _l_pix_val = loss_dict["l_pix"].item()
-            loss_pix_accum += _l_pix_val
-            loss_tdp_accum += loss_dict["l_tdp"].item()
-            _pix_check_buf.append(_l_pix_val)
-            del loss_dict
-            torch.cuda.empty_cache()
+                # detach SR output before releasing the computation graph
+                pseudo_ps_detached = loss_dict["pseudo_ps"].detach().clone()
+                _l_pix_val = loss_dict["l_pix"].item()
+                loss_pix_accum += _l_pix_val
+                loss_tdp_accum += loss_dict["l_tdp"].item()
+                _pix_check_buf.append(_l_pix_val)
+                del loss_dict
+                torch.cuda.empty_cache()
+            else:
+                pseudo_ps_detached = None
 
             # ================================================================
             # Step 2: update FM  (SR output detached, no second SR forward)
@@ -764,13 +836,18 @@ if __name__ == "__main__":
             # ---- Validation ----
             if step % cfg.trainer.validation_period == 0:
                 metrics, fig = validate(
-                    fm_refiner, sr_module, dav2_model, val_loader, device,
+                    fm_refiner, sr_module, coarse_model, val_loader, device,
                     n_steps=cfg.validation.n_steps,
                     target_stats=target_stats,
                     n_landsat_bands=n_landsat_bands,
                     val_offset=val_offset,
                     method=cfg.validation.get("method", "euler"),
                     use_sr_pseudo_ps=cfg.validation.get("use_sr_pseudo_ps", True),
+                    use_real_ps=cfg.validation.get("use_real_ps", False),
+                    coarse_model_type=coarse_model_type,
+                    chmv2_mean=_chmv2_mean if coarse_model_type == "chmv2" else None,
+                    chmv2_std=_chmv2_std if coarse_model_type == "chmv2" else None,
+                    n_avg=cfg.validation.get("n_avg", 1),
                 )
                 val_offset = (val_offset + val_subset_size) % len(val_loader)
 
@@ -817,13 +894,18 @@ if __name__ == "__main__":
 
     logging.info("Running full validation on entire val set...")
     final_metrics, final_fig = validate(
-        fm_refiner, sr_module, dav2_model, val_loader, device,
+        fm_refiner, sr_module, coarse_model, val_loader, device,
         n_steps=cfg.validation.n_steps,
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         full=True,
         method=cfg.validation.get("method", "euler"),
         use_sr_pseudo_ps=cfg.validation.get("use_sr_pseudo_ps", True),
+        use_real_ps=cfg.validation.get("use_real_ps", False),
+        coarse_model_type=coarse_model_type,
+        chmv2_mean=_chmv2_mean if coarse_model_type == "chmv2" else None,
+        chmv2_std=_chmv2_std if coarse_model_type == "chmv2" else None,
+        n_avg=cfg.validation.get("n_avg", 1),
     )
     logging.info(f"Final val metrics: {final_metrics}")
     flog = {f"val_final/{k}": v for k, v in final_metrics.items()}

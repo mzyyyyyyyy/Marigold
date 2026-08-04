@@ -3,7 +3,7 @@ base_config:
 
 wandb:
   project: marigold
-  name: sr_fm_refiner_v1
+  name: sr_fm_refiner_v9
 
 # Dataset config – same as fm_refiner_v4.yaml
 dataset:
@@ -88,8 +88,9 @@ sr_module:
 # SR training losses (Phase 1)
 sr_loss:
   pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
-  tdp_weight: 0.0     # L1 on ControlNet mid-block features (pseudo vs real)
+  tdp_weight: 0.1     # L1 on ControlNet mid-block features (pseudo vs real)
   tdp_hook: "controlnet.mid_block"   # "controlnet.mid_block" or "unet.up_blocks.N" (N=0..3)
+
 
 # Alternate training schedule
 
@@ -127,7 +128,10 @@ trainer:
   #   p_pseudo_ps → SR-generated pseudo-PS
   #   remainder   → real PS
   p_null_drop: 0.0
-  p_pseudo_ps: 0.3
+  p_pseudo_ps: 0.0   # always use real PS during training
+  skip_sr_training: True   # SR module not needed; skip Phase 1 entirely
+
+  bridge_sigma: 0.5
 
   # Steps before TDP loss is activated (pixel-only warmup)
   warmup_sr_steps: 200
@@ -135,11 +139,11 @@ trainer:
 
 # Validation / inference
 validation:
-  n_steps: 1
+  n_steps: 4
   method: euler
-  # True  → validation uses SR pseudo-PS via refine_with_ps()
-  # False → validation uses null PS via refine() (baseline comparison)
-  use_sr_pseudo_ps: True
+  use_sr_pseudo_ps: False
+  n_avg: 5
+  use_real_ps: True   # use real PS during validation (upper-bound experiment)
 
 
 # Training budget

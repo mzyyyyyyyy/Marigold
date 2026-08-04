@@ -3,9 +3,9 @@ base_config:
 
 wandb:
   project: marigold
-  name: sr_fm_refiner_v1
+  name: fm_refiner_v5
 
-# Dataset config – same as fm_refiner_v4.yaml
+# Dataset config
 dataset:
   input_dir: "/mnt/data/data/Landsat/eur_test2/2019"
   input_dir_hr: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
@@ -64,87 +64,45 @@ model:
   dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
   dav2_out_in_scale_factor: 4
 
-  # SwinIR pretrained weights (DIV2K classical SR, 4× upscale).
-  # Set to null to train SR from scratch.
-  sr_pretrained_path: "/mnt/data/model/SR4IR/pretrained_models/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
-  sr_pretrained_key: "params"   # key inside the .pth dict
 
-
-# SR module architecture – mirrors SR4IR options/reg/base1_v2.yaml network_sr block
-sr_module:
-  in_chans: 3
-  out_chans: 3
-  upscale: 4
-  img_size: 48
-  window_size: 8
-  depths: [6, 6, 6, 6, 6, 6]
-  embed_dim: 180
-  num_heads: [6, 6, 6, 6, 6, 6]
-  mlp_ratio: 2.0
-  upsampler: pixelshuffle
-  resi_connection: 1conv
-
-
-# SR training losses (Phase 1)
-sr_loss:
-  pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
-  tdp_weight: 0.0     # L1 on ControlNet mid-block features (pseudo vs real)
-  tdp_hook: "controlnet.mid_block"   # "controlnet.mid_block" or "unet.up_blocks.N" (N=0..3)
-
-# Alternate training schedule
-
-
-# Optimizers
+# Optimizer
 optimizer:
   lr_unet: 1.0e-05
-  lr_controlnet: 1.0e-04
+  lr_controlnet: 1.0e-04  # unused when ps_dropout_p=1.0
   weight_decay: 1.0e-02
 
-  lr_sr: 2.0e-04
-  weight_decay_sr: 0.0
 
-
-# LR scheduler (cosine annealing, shared T_max = max_iter)
+# LR scheduler
 lr_scheduler:
   eta_min: 1.0e-07
 
 
 # Dataloader
 dataloader:
-  effective_batch_size: 4
-  max_train_batch_size: 1
+  effective_batch_size: 8
+  max_train_batch_size: 2
   seed: 2024
 
 
 # Trainer
 trainer:
+  # ps_dropout_p=1.0: no ControlNet, pure UNet-only FM (z_coarse → z_gt)
+  # Landsat is already encoded in z_coarse; no redundant conditioning needed.
+  ps_dropout_p: 1.0
   log_period: 10
   save_period: 1000
   validation_period: 1000
-
-  # PS source probabilities per batch (mutually exclusive):
-  #   p_null_drop → null PS token (modality dropout)
-  #   p_pseudo_ps → SR-generated pseudo-PS
-  #   remainder   → real PS
-  p_null_drop: 0.0
-  p_pseudo_ps: 0.3
-
-  # Steps before TDP loss is activated (pixel-only warmup)
-  warmup_sr_steps: 200
 
 
 # Validation / inference
 validation:
   n_steps: 1
   method: euler
-  # True  → validation uses SR pseudo-PS via refine_with_ps()
-  # False → validation uses null PS via refine() (baseline comparison)
-  use_sr_pseudo_ps: True
 
 
 # Training budget
 max_epoch: 1000
-max_iter: 100000
+max_iter: 50000
 
 
 eval:
