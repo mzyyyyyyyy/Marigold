@@ -185,6 +185,7 @@ def validate(
 ) -> tuple:
     fm_refiner.eval()
     sr_module.eval()
+    torch.manual_seed(42)
     all_preds, all_gts = [], []
     vis_samples = []
 
@@ -504,7 +505,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v10.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v2-1.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
