@@ -266,12 +266,28 @@ def process_scenario(var, scenario, output_dir,
             future_annual, lon, lat = read_cmip6_annual_mean(var, year, scenario)
             future_annual, _        = cmip6_array_top_down(future_annual, lat)
 
-            delta          = future_annual - cmip6_baseline
-            delta_highres  = resample_to_chelsa_grid(
-                delta, cmip6_transform, "EPSG:4326",
-                dst_shape, dst_transform, dst_crs,
-            )
-            future_highres = chelsa_baseline + delta_highres
+            if var == "pr":
+                # pr: CMIP6 单位为 kg/m²/s，CHELSA 单位为 mm/year，两者量纲不同。
+                # 用乘法 delta（比值法）消除单位依赖，同时避免产生负降水。
+                ratio = future_annual / np.where(cmip6_baseline == 0, np.nan, cmip6_baseline)
+                signal_highres = resample_to_chelsa_grid(
+                    ratio, cmip6_transform, "EPSG:4326",
+                    dst_shape, dst_transform, dst_crs,
+                )
+                future_highres = chelsa_baseline * signal_highres
+                future_highres = np.maximum(future_highres, 0)
+            else:
+                # 其余变量加法 delta，CMIP6 与 CHELSA 单位相同：
+                #   tas/tasmax/tasmin : K差 = °C差，兼容
+                #   hurs  : % (CMIP6) vs % (CHELSA after ×0.01)
+                #   rsds  : W/m²
+                #   sfcWind: m/s
+                delta         = future_annual - cmip6_baseline
+                delta_highres = resample_to_chelsa_grid(
+                    delta, cmip6_transform, "EPSG:4326",
+                    dst_shape, dst_transform, dst_crs,
+                )
+                future_highres = chelsa_baseline + delta_highres
             save_tif(out_path, future_highres, chelsa_meta)
             success += 1
 
