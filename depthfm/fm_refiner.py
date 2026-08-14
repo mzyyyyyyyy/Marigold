@@ -40,6 +40,7 @@ class FMRefiner(nn.Module):
         ps_dropout_p: float = 0.3,
         bridge_sigma: float = 0.0,
         concat_z_coarse: bool = False,
+        concat_landsat_cond: bool = False,
         refine_threshold: float = 0.0,
     ):
         super().__init__()
@@ -53,6 +54,10 @@ class FMRefiner(nn.Module):
         self.ps_dropout_p = ps_dropout_p
         self.bridge_sigma = bridge_sigma
         self.concat_z_coarse = concat_z_coarse
+        # Older checkpoints (pre sr_fm_refiner_v5) trained ControlNet on
+        # concat(landsat_hr, ps) conditioning instead of ps-only. Set this
+        # to load/run those checkpoints.
+        self.concat_landsat_cond = concat_landsat_cond
         # Pixel-space threshold for selective refinement during training.
         # 0.0 = disabled (all pixels refined normally).
         self.refine_threshold = refine_threshold
@@ -107,14 +112,16 @@ class FMRefiner(nn.Module):
         h_gt: torch.Tensor,                              # (B, 1, H_hr, W_hr)
         ps_hr: Optional[torch.Tensor] = None,            # (B, C_ps, H_hr, W_hr) or None
         ps_cond_override: Optional[torch.Tensor] = None, # bypass internal dropout
-        # legacy arg kept for call-site compatibility; ignored
+        # Landsat at HR resolution (B, C_ls, H_hr, W_hr). Only used when
+        # self.concat_landsat_cond is True (legacy checkpoints); ignored otherwise.
         landsat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute FM training loss.
 
         When ps_hr is None (and ps_cond_override is None), runs UNet-only (no ControlNet).
-        When ps_hr is provided, ControlNet uses PS-only conditioning (no Landsat).
+        When ps_hr is provided, ControlNet conditioning is PS-only, or
+        concat(landsat_hr, PS) if self.concat_landsat_cond is True.
 
         Returns:
             Scalar MSE loss between predicted and target velocity.
@@ -182,6 +189,10 @@ class FMRefiner(nn.Module):
             control_input = ps_cond
         else:
             control_input = None
+
+        if control_input is not None and self.concat_landsat_cond:
+            assert landsat_lr is not None, "concat_landsat_cond=True requires landsat_lr"
+            control_input = torch.cat([landsat_lr, control_input], dim=1)
 
         if control_input is not None:
             cn_out = self.controlnet(
@@ -252,14 +263,16 @@ class FMRefiner(nn.Module):
         n_steps: int = 1,
         method: str = "euler",
         ps_hr: Optional[torch.Tensor] = None,  # (B, C_ps, H_hr, W_hr) or None
-        # legacy arg; ignored
+        # Landsat at HR resolution (B, C_ls, H_hr, W_hr). Required when
+        # self.concat_landsat_cond is True (legacy checkpoints); ignored otherwise.
         landsat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Refine coarse prediction via ODE integration.
 
         ps_hr=None  → UNet-only, no ControlNet (unconditional).
-        ps_hr given → ControlNet conditioned on PS only.
+        ps_hr given → ControlNet conditioned on PS only, or concat(landsat_hr, PS)
+                      if self.concat_landsat_cond is True.
         """
         B      = h_coarse.shape[0]
         device = h_coarse.device
@@ -276,6 +289,10 @@ class FMRefiner(nn.Module):
             control_input = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
         else:
             control_input = None
+
+        if control_input is not None and self.concat_landsat_cond:
+            assert landsat_lr is not None, "concat_landsat_cond=True requires landsat_lr"
+            control_input = torch.cat([landsat_lr.to(device, dtype), control_input], dim=1)
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
@@ -301,11 +318,14 @@ class FMRefiner(nn.Module):
         h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
         n_steps: int = 1,
         method: str = "euler",
-        # legacy arg; ignored
+        # Landsat at HR resolution (B, C_ls, H_hr, W_hr). Required when
+        # self.concat_landsat_cond is True (legacy checkpoints); ignored otherwise.
         landsat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Refine using PS-only ControlNet conditioning."""
-        return self.refine(h_coarse, n_steps=n_steps, method=method, ps_hr=ps_hr)
+        """Refine using ControlNet conditioned on PS, or concat(landsat_hr, PS)
+        if self.concat_landsat_cond is True."""
+        return self.refine(h_coarse, n_steps=n_steps, method=method, ps_hr=ps_hr,
+                            landsat_lr=landsat_lr)
 
 
 # ------------------------------------------------------------------
@@ -331,9 +351,12 @@ def build_fm_refiner(
     ps_dropout_p: float = 0.3,
     bridge_sigma: float = 0.0,
     concat_z_coarse: bool = False,
+    concat_landsat_cond: bool = False,
     refine_threshold: float = 0.0,
     device: str = "cuda",
-    # legacy arg; kept for call-site compatibility, ignored
+    # Number of Landsat input channels. Only needed when concat_landsat_cond
+    # is True (legacy checkpoints trained on concat(landsat_hr, ps) ControlNet
+    # conditioning); ignored otherwise.
     n_landsat_bands: int = 0,
 ) -> FMRefiner:
     """
@@ -341,9 +364,13 @@ def build_fm_refiner(
 
     Args:
         sd_pretrained_path: path to SD2.1 checkpoint (with unet/, vae/ subdirs)
-        n_landsat_bands: number of Landsat input channels
+        n_landsat_bands: number of Landsat input channels (see concat_landsat_cond)
         n_ps_bands: number of PlanetScope input channels
         ps_dropout_p: dropout probability for PS conditioning
+        concat_landsat_cond: if True, ControlNet is conditioned on
+            concat(landsat_hr, ps) (n_landsat_bands + n_ps_bands channels) —
+            matches checkpoints trained before sr_fm_refiner_v5. If False
+            (default), ControlNet is conditioned on ps only (n_ps_bands channels).
         device: device string
     """
     import os
@@ -360,9 +387,11 @@ def build_fm_refiner(
     unet.requires_grad_(True)
     unet.train()
 
-    # Build ControlNet from UNet encoder (conditioned on PS only)
+    # Build ControlNet from UNet encoder (conditioned on PS only, or
+    # concat(landsat_hr, PS) for legacy checkpoints).
     controlnet = ControlNetModel.from_unet(unet)
-    _adapt_controlnet_input(controlnet, n_ps_bands)
+    n_cond_channels = (n_landsat_bands + n_ps_bands) if concat_landsat_cond else n_ps_bands
+    _adapt_controlnet_input(controlnet, n_cond_channels)
     controlnet.requires_grad_(True)
     controlnet.train()
 
@@ -385,6 +414,7 @@ def build_fm_refiner(
         ps_dropout_p=ps_dropout_p,
         bridge_sigma=bridge_sigma,
         concat_z_coarse=concat_z_coarse,
+        concat_landsat_cond=concat_landsat_cond,
         refine_threshold=refine_threshold,
     )
     return model

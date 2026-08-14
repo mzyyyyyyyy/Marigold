@@ -1,13 +1,13 @@
-# Large-scale inference config for sr_fm_refiner_v5 on Landsat EUR test tiles
-# Data mirrors ls_mrg_pred.yaml; model mirrors sr_fm_refiner_v5.yaml
+# Large-scale inference config for sr_fm_refiner_v2 on Landsat EUR test tiles
+# Data mirrors sr_fm_refiner_v5_infer_ls.yaml (same 2 tiles); model mirrors sr_fm_refiner_v2.yaml
 
 data:
   input_dir: "/flash/project_465002934/data/Landsat/eur_test2_map/2019"
   year: 2019
-  output_dir: "/flash/project_465002934/result/sr_fm_refiner_v5"
+  output_dir: "/flash/project_465002934/result/sr_fm_refiner_v2"
   output_suffix: "chm"
   file_type: "jp2"
-  selected_bands: [0, 1, 2]          # RGB only (sr_fm_refiner_v5 uses 3-band input)
+  selected_bands: [0, 1, 2]          # RGB only (sr_fm_refiner_v2 uses 3-band input)
   selected_percentile: ["p50"]
   selected_resolution: ""
   exclude_list: ["original_data", "lowres", "30m"]
@@ -23,9 +23,9 @@ data:
   stride: 16             # stride in LR pixels (= 64 px in output space)
 
 model:
-  # sr_fm_refiner_v5 checkpoint
-  ckpt_path: "/flash/project_465002934/model/sr_fm_refiner_v5/checkpoint/best.pth"
-  config_path: "/flash/project_465002934/model/sr_fm_refiner_v5/config.yaml"
+  # sr_fm_refiner_v2 checkpoint
+  ckpt_path: "/flash/project_465002934/model/sr_fm_refiner_v2/checkpoint/best.pth"
+  config_path: "/flash/project_465002934/model/sr_fm_refiner_v2/config.yaml"
 
   # DAv2 weights (same as training)
   dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
@@ -35,10 +35,15 @@ model:
   # Target stats for coarse normalisation
   target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
 
-  n_average: 5           # stochastic averaging runs
-  bridge_sigma: 0.5      # must match training; drives stochasticity
+  n_average: 1            # bridge_sigma=0 -> deterministic, no point averaging stochastic runs
+  bridge_sigma: 0.0        # sr_fm_refiner_v2/config.yaml has no trainer.bridge_sigma key,
+                            # which means training used the code default (0.0) -- verify if unsure
   n_steps: 4
   method: "euler"
+
+  # v2 checkpoint predates sr_fm_refiner_v5: ControlNet was trained on
+  # concat(landsat_hr, pseudo_ps) conditioning (6 ch), not ps-only (3 ch).
+  concat_landsat_cond: true
 
 prediction:
   batch_size: 1          # one LR patch at a time (model is memory-heavy)
