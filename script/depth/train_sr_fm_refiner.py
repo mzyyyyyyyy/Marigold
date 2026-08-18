@@ -234,8 +234,9 @@ def validate(
 
         def _run_refine():
             if ps_input is not None:
-                return fm_refiner.refine_with_ps(ps_input, h_coarse, n_steps=n_steps, method=method)
-            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method)
+                return fm_refiner.refine_with_ps(ps_input, h_coarse, n_steps=n_steps, method=method,
+                                                  landsat_hr=landsat_hr)
+            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method, landsat_hr=landsat_hr)
 
         if n_avg > 1:
             h_fine = torch.stack([_run_refine() for _ in range(n_avg)]).mean(dim=0)
@@ -365,14 +366,17 @@ def _sr_step(
     # Pixel loss: L1(pseudo_ps, real_ps)
     l_pix = F.l1_loss(pseudo_ps, real_ps.detach()) * pixel_weight
 
+    cond_fake = fm_refiner._maybe_concat_landsat(pseudo_ps, landsat_hr)
+    cond_real = fm_refiner._maybe_concat_landsat(real_ps, landsat_hr)
+
     l_tdp = torch.tensor(0.0, device=device)
     if use_tdp and tdp_weight > 0:
         if tdp_hook == "controlnet.cond_embedding":
             # Directly call controlnet_cond_embedding — no z_t context, no full CN forward.
             # Grad flows: l_tdp → cond_embedding(pseudo_ps) → pseudo_ps → SR
-            feat_fake = fm_refiner.controlnet.controlnet_cond_embedding(pseudo_ps)
+            feat_fake = fm_refiner.controlnet.controlnet_cond_embedding(cond_fake)
             with torch.no_grad():
-                feat_real = fm_refiner.controlnet.controlnet_cond_embedding(real_ps)
+                feat_real = fm_refiner.controlnet.controlnet_cond_embedding(cond_real)
         else:
             # Original hook-based path (controlnet.mid_block or unet.up_blocks.N)
             with torch.no_grad():
@@ -400,7 +404,7 @@ def _sr_step(
                 sample=z_coarse.detach(),
                 timestep=t_int,
                 encoder_hidden_states=text_emb,
-                controlnet_cond=pseudo_ps,
+                controlnet_cond=cond_fake,
                 return_dict=True,
             )
             if use_unet:
@@ -419,7 +423,7 @@ def _sr_step(
                     sample=z_coarse.detach(),
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
-                    controlnet_cond=real_ps,
+                    controlnet_cond=cond_real,
                     return_dict=True,
                 )
                 if use_unet:
@@ -448,6 +452,7 @@ def _sr_step(
 def _task_step(
     fm_refiner: FMRefiner,
     real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
+    landsat_hr: torch.Tensor,    # (B, C_ls, H_hr, W_hr)
     h_coarse: torch.Tensor,
     h_gt: torch.Tensor,
     pseudo_ps_detached: torch.Tensor,  # (B, C_ps, H_hr, W_hr) — SR output already detached
@@ -488,7 +493,7 @@ def _task_step(
                 ps_cond[i] = pseudo_ps_detached[i]
 
     loss = fm_refiner(
-        landsat_lr=landsat_hr,
+        landsat_hr=landsat_hr,
         ps_hr=real_ps,
         h_coarse=h_coarse,
         h_gt=h_gt,
@@ -505,7 +510,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v2-1.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v2-2.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -619,6 +624,7 @@ if __name__ == "__main__":
         bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
         concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
         refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
+        concat_landsat_hr=cfg.trainer.get("concat_landsat_hr", False),
         device=str(device),
     ).to(device)
 
@@ -789,7 +795,7 @@ if __name__ == "__main__":
 
             loss_fm = _task_step(
                 fm_refiner,
-                inputs_hr, h_coarse, targets,
+                inputs_hr, landsat_hr, h_coarse, targets,
                 pseudo_ps_detached,
                 p_null_drop, p_pseudo_ps, device,
             )
