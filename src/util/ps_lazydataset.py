@@ -1,14 +1,18 @@
+import collections
 import glob
 import json
 import os
 import pickle
 import random
+import sys
+import time
 import multiprocessing
 import concurrent.futures
 import re
 from pathlib import Path
 import numpy as np
 import rasterio
+import rasterio.errors
 from rasterio.windows import Window
 from skimage.transform import resize
 from scipy.stats import spearmanr
@@ -20,7 +24,44 @@ from albumentations.pytorch import ToTensorV2
 
 
 
-_rasterio_cache = {}
+# Bounded LRU, not a plain dict: with num_workers=6 and 630+ training steps
+# touching many distinct source rasters over time, an unbounded cache means
+# every worker process ends up holding every source file it has ever opened
+# open forever (each with its own GDAL block cache on top) — suspected
+# root cause of the host-RAM OOMs that consistently killed runs around
+# step 630 (see 2026-08-18 investigation: per-rank RSS measured via psutil
+# stayed flat/modest, but sacct MaxRSS for the whole cgroup — main process +
+# its 6 DataLoader workers — hit 90-100+GB, meaning the growth was in the
+# uninstrumented worker processes, not the main one). Capping the number of
+# concurrently open datasets per process bounds this regardless of how many
+# distinct files get touched over an arbitrarily long run.
+_RASTERIO_CACHE_MAX = 8
+_rasterio_cache: "collections.OrderedDict[str, rasterio.io.DatasetReader]" = collections.OrderedDict()
+
+
+def _log_err(msg: str) -> None:
+    """Write straight to stderr, tagged with this process's SLURM rank.
+
+    Deliberately bypasses the `logging` module: config_logging() (in
+    train_sr_fm_refiner.py) only attaches handlers on rank0, so
+    logging.warning/error would land in logging.log + train_<job>.out on
+    rank0 but silently fall back to Python's unformatted, rank-less
+    last-resort stderr handler on every other rank. Writing directly to
+    stderr, always, from every rank, guarantees these all land in the one
+    place SLURM already collects every rank's stderr — train_<job>.err —
+    with a consistent, rank-tagged format regardless of which rank hits it.
+    """
+    rank = os.environ.get("SLURM_PROCID", "?")
+    print(f"[ps_lazydataset][rank {rank}] {msg}", file=sys.stderr, flush=True)
+
+
+def _tile_id_to_padded(tile_id: str, width: int = 5) -> str:
+    """'6,55' -> '00006_00055' — the zero-padded underscore convention used by
+    PlanetScope HR / CHM output filenames (vs. the comma-separated 'R,C' used
+    by Landsat filenames)."""
+    row, col = tile_id.split(',')
+    return f"{int(row):0{width}d}_{int(col):0{width}d}"
+
 
 class MinMaxScale(A.ImageOnlyTransform):
     def __init__(self, min_vals, max_vals, always_apply=True, p=1.0):
@@ -383,9 +424,8 @@ class LazyPatchDataset(Dataset):
         """
 
         if ignore_percentile:
-            src = LazyPatchDataset._open_rasterio(filepath)
             window = Window(x, y, width, height)
-            image = src.read(window=window)
+            image = LazyPatchDataset._read_window_with_retry(filepath, window)
 
             # Select only the specified bands
             max_band_idx = max(select_bands)
@@ -406,9 +446,8 @@ class LazyPatchDataset(Dataset):
     def _load_output_patch(filepath: str, y: int, x: int, height: int, width: int) -> np.ndarray:
         """Load a patch from output image"""
         if filepath.endswith('.tif'):
-            src = LazyPatchDataset._open_rasterio(filepath)
             window = Window(x, y, width, height)
-            image = src.read(window=window)
+            image = LazyPatchDataset._read_window_with_retry(filepath, window)
             if len(image.shape) == 3:
                 image = image[0]
 
@@ -424,10 +463,68 @@ class LazyPatchDataset(Dataset):
 
     @staticmethod
     def _open_rasterio(filepath: str):
-        """Return a cached rasterio dataset for this worker process."""
-        if filepath not in _rasterio_cache:
-            _rasterio_cache[filepath] = rasterio.open(filepath)
-        return _rasterio_cache[filepath]    
+        """Return a cached rasterio dataset for this worker process.
+
+        Bounded LRU (max _RASTERIO_CACHE_MAX open datasets): touching this
+        file again just marks it as most-recently-used; opening a new file
+        beyond the cap closes whichever cached dataset was least recently
+        used, so a long run touching many distinct source files can't leave
+        every one of them open (and cached in GDAL's per-dataset block
+        cache) forever.
+        """
+        if filepath in _rasterio_cache:
+            _rasterio_cache.move_to_end(filepath)
+            return _rasterio_cache[filepath]
+        if len(_rasterio_cache) >= _RASTERIO_CACHE_MAX:
+            _, evicted = _rasterio_cache.popitem(last=False)
+            try:
+                evicted.close()
+            except Exception:
+                pass
+        src = rasterio.open(filepath)
+        _rasterio_cache[filepath] = src
+        return src
+
+    @staticmethod
+    def _read_window_with_retry(filepath: str, window: Window, max_retries: int = 3,
+                                 backoff_seconds: float = 0.5) -> np.ndarray:
+        """Read a window, retrying on RasterioIOError.
+
+        Verified (see 2026-08-17 investigation) that the source files behind
+        these errors are NOT corrupted — a full sequential single-process
+        read of every band/block succeeds cleanly. The failures only show up
+        under heavy DDP training load, where the deterministic sampling
+        order sends many ranks'/workers' DataLoader reads at the same large
+        source file in a short burst, spiking per-file concurrent-read
+        pressure and occasionally producing a transient torn/short read.
+        Retrying (with a fresh dataset handle, in case the cached handle
+        itself — not just the read — is what's wedged) rides out that
+        transient spike instead of killing the whole 64-GPU job over it.
+        """
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                src = LazyPatchDataset._open_rasterio(filepath)
+                return src.read(window=window)
+            except rasterio.errors.RasterioIOError as e:
+                last_err = e
+                _log_err(
+                    f"Transient read failure on {filepath} "
+                    f"(window={window}), attempt {attempt + 1}/{max_retries}: {e}"
+                )
+                stale = _rasterio_cache.pop(filepath, None)
+                if stale is not None:
+                    try:
+                        stale.close()
+                    except Exception:
+                        pass
+                if attempt < max_retries - 1:
+                    time.sleep(backoff_seconds * (attempt + 1))
+        _log_err(
+            f"Giving up on {filepath} (window={window}) after "
+            f"{max_retries} retries: {last_err}"
+        )
+        raise last_err
 
     def _check_coord_path_match_config_path(self):
         """If coord file is given, double check whether the contained input, input_hr, and output file path match with those given in the
@@ -474,10 +571,12 @@ class LazyPatchDataset(Dataset):
             print(f"random entry's input_hr path is {random_entry.get('input_path_hr')}")
             print(f"config input_hr dir is {self.input_dir_hr}")
             print('*' * 10 + 'Rewriting coord path input_hr dirs to config paths')
-            pattern = re.compile(r'(\d+,\d+)')
+            # PlanetScope HR filenames encode the tile as zero-padded
+            # "RRRRR_CCCCC" (e.g. tile_id "6,55" -> "00006_00055"), not the
+            # comma-separated "R,C" used by Landsat filenames — so derive the
+            # search pattern from tile_id instead of regexing the filename.
             for element in tqdm(self.patch_coords):
-                filename = os.path.basename(element['input_path_hr'])
-                coordinate = pattern.search(filename).group(1)
+                coordinate = _tile_id_to_padded(element['tile_id'])
                 search_pattern = os.path.join(self.input_dir_hr, f"*{coordinate}*.{self.file_type_input}")
                 found_file = glob.glob(search_pattern)[0]
                 assert os.path.exists(found_file)
@@ -487,17 +586,37 @@ class LazyPatchDataset(Dataset):
             print(f"random entry's output path is {random_entry.get('output_path')}")
             print(f"config output dir is {self.output_dir}")
             print('*' * 10 + 'Rewriting coord path output dirs to config paths')
-            pattern = re.compile(r'(\d+,\d+)')
+            # Same zero-padded "RRRRR_CCCCC" convention as the HR files above.
             for element in tqdm(self.patch_coords):
-                filename = os.path.basename(element['output_path'])
-                coordinate = pattern.search(filename).group(1)
+                coordinate = _tile_id_to_padded(element['tile_id'])
                 search_pattern = os.path.join(self.output_dir, f"*{coordinate}*.{self.file_type_output}")
                 found_file = glob.glob(search_pattern)[0]
                 assert os.path.exists(found_file)
                 element['output_path'] = found_file
 
+        # Persist the corrected paths to a *new* pkl (never overwrite the
+        # original — it may still be the one other in-flight configs/jobs
+        # load): this glob-per-patch rewrite is expensive (one glob.glob()
+        # per patch, per mismatched field), and every process that
+        # constructs this dataset against the same stale pkl would otherwise
+        # redo it independently. In a multi-rank DDP run that means dozens
+        # of processes hammering the same shared filesystem with redundant
+        # glob storms at once. Pointing patch_coord_path at the rewritten
+        # pkl makes the check above pass immediately next time, on every
+        # rank, with no glob calls at all. Written atomically (temp file +
+        # rename) so a run killed mid-write can't corrupt a cache file other
+        # processes may be reading concurrently.
+        base, ext = os.path.splitext(self.patch_coord_path)
+        resolved_path = f"{base}_resolved{ext}"
+        print('*' * 10 + f'Saving corrected paths to {resolved_path} '
+              f'(original {self.patch_coord_path} left untouched — '
+              f'point patch_coord_path at the new file to reuse this fix)')
+        tmp_path = f"{resolved_path}.tmp{os.getpid()}"
+        with open(tmp_path, "wb") as f:
+            pickle.dump(self.patch_coords, f)
+        os.replace(tmp_path, resolved_path)
         # ipdb.set_trace()
-        
+
     def _check_coord_scale_match_data_scale(self):
         # check whether input/output spatial scale match, otherwise update scale!
         random_entry = random.choice(self.patch_coords)
@@ -615,30 +734,57 @@ class LazyPatchDataset(Dataset):
         
         for patch_data in batch_patches:
 
-            input_patch_lr = LazyPatchDataset._load_multiband_patch(
-                patch_data['input_path'],
-                patch_data['input_crop_y'],
-                patch_data['input_crop_x'],
-                patch_data['input_patch_height'],
-                patch_data['input_patch_width'],
-                self.selected_bands
-            )
-            output_patch = LazyPatchDataset._load_output_patch(
-                patch_data['output_path'],
-                patch_data['output_crop_y'],
-                patch_data['output_crop_x'],
-                patch_data['output_patch_height'],
-                patch_data['output_patch_width']
-            )
-            input_patch_hr = LazyPatchDataset._load_multiband_patch(
-                patch_data['input_path_hr'],
-                patch_data['input_crop_y_hr'],
-                patch_data['input_crop_x_hr'],
-                patch_data['input_patch_height_hr'],
-                patch_data['input_patch_width_hr'],
-                self.selected_bands_hr,
-                ignore_percentile=True
-            )
+            # Last-resort safety net on top of _read_window_with_retry's
+            # internal retries: if a patch's read still fails after those
+            # retries are exhausted (sustained, not transient, read
+            # pressure on its source file), don't let it kill this whole
+            # 64-GPU job — swap in a different random patch of the same
+            # size and keep going. Bounded so a systemic problem (e.g. a
+            # genuinely missing/corrupt file) still surfaces as an error
+            # instead of looping forever.
+            max_substitutions = 5
+            for substitution in range(max_substitutions + 1):
+                try:
+                    input_patch_lr = LazyPatchDataset._load_multiband_patch(
+                        patch_data['input_path'],
+                        patch_data['input_crop_y'],
+                        patch_data['input_crop_x'],
+                        patch_data['input_patch_height'],
+                        patch_data['input_patch_width'],
+                        self.selected_bands
+                    )
+                    output_patch = LazyPatchDataset._load_output_patch(
+                        patch_data['output_path'],
+                        patch_data['output_crop_y'],
+                        patch_data['output_crop_x'],
+                        patch_data['output_patch_height'],
+                        patch_data['output_patch_width']
+                    )
+                    input_patch_hr = LazyPatchDataset._load_multiband_patch(
+                        patch_data['input_path_hr'],
+                        patch_data['input_crop_y_hr'],
+                        patch_data['input_crop_x_hr'],
+                        patch_data['input_patch_height_hr'],
+                        patch_data['input_patch_width_hr'],
+                        self.selected_bands_hr,
+                        ignore_percentile=True
+                    )
+                    break
+                except rasterio.errors.RasterioIOError as e:
+                    if substitution == max_substitutions:
+                        _log_err(
+                            f"{max_substitutions} substitute patches in a "
+                            f"row also failed to read; giving up on batch idx={idx}: {e}"
+                        )
+                        raise
+                    _log_err(
+                        f"Patch unreadable after retries "
+                        f"(input_path={patch_data['input_path']}, "
+                        f"input_path_hr={patch_data['input_path_hr']}, "
+                        f"output_path={patch_data['output_path']}); "
+                        f"substituting a different patch ({substitution + 1}/{max_substitutions}): {e}"
+                    )
+                    patch_data = random.choice(patches)
 
             input_transformed = self.transform_input(image=input_patch_lr.astype(np.float32))
             input_patch_lr = input_transformed['image']

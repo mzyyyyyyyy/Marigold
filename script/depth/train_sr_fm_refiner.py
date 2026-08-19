@@ -15,8 +15,16 @@ Phase 2 (train FM, freeze SR):
 
 Key constraint: DAV2 always receives original LS; SR output never enters DAV2.
 
-Usage:
+Usage (single GPU):
   python script/depth/train_sr_fm_refiner.py --config config/sr_fm_refiner_v0.yaml
+
+Usage (multi-GPU, standard DDP, e.g. 8 GPUs via srun -n8):
+  Reads SLURM_PROCID / SLURM_NTASKS / SLURM_LOCALID from the environment
+  automatically (mirroring infer_sr_fm_refiner.py), no extra flags needed —
+  see script/depth/train_sr_fm_refiner.sh. unet/controlnet/sr_module are
+  DDP-wrapped; data is sharded via DistributedSampler; validation runs
+  sharded across all ranks (parallel inference) and is gathered to rank0,
+  which alone handles logging/wandb/checkpointing.
 """
 
 import copy
@@ -33,12 +41,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from datetime import datetime, timedelta
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
@@ -167,7 +178,7 @@ def validate(
     fm_refiner: FMRefiner,
     sr_module: SRModule,
     coarse_model,
-    val_loader: DataLoader,
+    val_dataset,
     device: torch.device,
     n_steps: int,
     target_stats: dict,
@@ -182,22 +193,49 @@ def validate(
     chmv2_mean: list = None,
     chmv2_std: list = None,
     n_avg: int = 1,
+    global_rank: int = 0,
+    world_size: int = 1,
+    is_distributed: bool = False,
+    num_workers: int = 0,
 ) -> tuple:
+    """
+    Runs validation in parallel across all ranks: every rank forwards its own
+    shard of a deterministic index window through its local raw (non-DDP)
+    modules — no gradients, so no DDP participation is needed — and
+    per-sample predictions are gathered to rank0, which computes the
+    aggregate metrics. Non-rank0 callers get back (None, None).
+    """
+    # Always run validation through the raw (non-DDP) modules: DDP's forward
+    # hooks assume every rank calls it in lockstep for gradient sync, which
+    # doesn't apply here (no backward pass, independent per-rank shards).
+    orig_unet, orig_controlnet = fm_refiner.unet, fm_refiner.controlnet
+    fm_refiner.unet, fm_refiner.controlnet = _raw(orig_unet), _raw(orig_controlnet)
+    sr_module = _raw(sr_module)
+
     fm_refiner.eval()
     sr_module.eval()
     all_preds, all_gts = [], []
     vis_samples = []
 
-    val_list = list(val_loader)
-    n_total = len(val_list)
+    # Every rank computes the identical (deterministic) index window, then
+    # takes a disjoint shard of it — this keeps ranks in sync without
+    # needing to broadcast anything, and without duplicating/missing
+    # samples. Indices are resolved to actual data via a small on-demand
+    # DataLoader over just this shard's Subset, so only the handful of
+    # samples this rank actually needs get read off disk — not the full
+    # val_dataset (which materializing a val_loader up front would force
+    # on every one of the 64 ranks, every validation call).
+    n_total = len(val_dataset)
     if full:
-        batches = val_list
+        indices = list(range(n_total))
     else:
         subset_size = max(1, n_total // 10)
         indices = [(val_offset + i) % n_total for i in range(subset_size)]
-        batches = [val_list[i] for i in indices]
+    local_indices = indices[global_rank::world_size] if is_distributed else indices
+    local_loader = DataLoader(Subset(val_dataset, local_indices), batch_size=1,
+                               shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    for batch in tqdm(batches, desc="Validation", leave=False):
+    for batch in tqdm(local_loader, desc="Validation", leave=False, disable=(global_rank != 0)):
         inputs_lr, inputs_hr, targets = batch
         if inputs_lr.dim() == 5:
             inputs_lr = inputs_lr.squeeze(0)
@@ -233,8 +271,9 @@ def validate(
 
         def _run_refine():
             if ps_input is not None:
-                return fm_refiner.refine_with_ps(ps_input, h_coarse, n_steps=n_steps, method=method)
-            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method)
+                return fm_refiner.refine_with_ps(ps_input, h_coarse, n_steps=n_steps, method=method,
+                                                  landsat_lr=landsat_hr)
+            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method, landsat_lr=landsat_hr)
 
         if n_avg > 1:
             h_fine = torch.stack([_run_refine() for _ in range(n_avg)]).mean(dim=0)
@@ -255,13 +294,36 @@ def validate(
                 "gt":        _to_vis_depth(targets[0]),
             })
 
-    pred_cat = torch.cat(all_preds, dim=0)
-    gt_cat = torch.cat(all_gts, dim=0)
-    metrics = compute_metrics(pred_cat, gt_cat)
-    fig = _make_vis_figure(vis_samples) if vis_samples else None
+    pred_local = torch.cat(all_preds, dim=0) if all_preds else torch.empty(0)
+    gt_local   = torch.cat(all_gts, dim=0)   if all_gts   else torch.empty(0)
 
     fm_refiner.train()
     sr_module.train()
+    # Restore the (possibly DDP-wrapped) modules used for training.
+    fm_refiner.unet, fm_refiner.controlnet = orig_unet, orig_controlnet
+
+    if is_distributed:
+        # NCCL doesn't implement the point-to-point gather primitive, so use
+        # all_gather_object (backed by all_gather, which NCCL does support)
+        # even though only rank0 ends up using the result — every rank must
+        # still pre-allocate the output list and call this collectively.
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, (pred_local, gt_local, vis_samples))
+        if global_rank != 0:
+            return None, None
+        pred_cat = torch.cat([g[0] for g in gathered if g[0].numel() > 0], dim=0)
+        gt_cat   = torch.cat([g[1] for g in gathered if g[1].numel() > 0], dim=0)
+        vis_samples = []
+        for g in gathered:
+            vis_samples.extend(g[2])
+            if len(vis_samples) >= n_vis_samples:
+                break
+        vis_samples = vis_samples[:n_vis_samples]
+    else:
+        pred_cat, gt_cat = pred_local, gt_local
+
+    metrics = compute_metrics(pred_cat, gt_cat)
+    fig = _make_vis_figure(vis_samples) if vis_samples else None
     return metrics, fig
 
 
@@ -278,10 +340,10 @@ def save_checkpoint(
     path = os.path.join(out_dir, f"{name}.pth")
     torch.save({
         "step": step,
-        "unet_state": fm_refiner.unet.state_dict(),
-        "controlnet_state": fm_refiner.controlnet.state_dict(),
+        "unet_state": _raw(fm_refiner.unet).state_dict(),
+        "controlnet_state": _raw(fm_refiner.controlnet).state_dict(),
         "null_ps_state": fm_refiner._null_ps,
-        "sr_state": sr_module.state_dict(),
+        "sr_state": _raw(sr_module).state_dict(),
         "optimizer_fm_state": optimizer_fm.state_dict(),
         "optimizer_sr_state": optimizer_sr.state_dict(),
         "lr_scheduler_fm_state": lr_scheduler_fm.state_dict() if lr_scheduler_fm else None,
@@ -295,11 +357,11 @@ def load_checkpoint(
     lr_scheduler_fm, lr_scheduler_sr, path
 ):
     ckpt = torch.load(path, map_location="cpu")
-    fm_refiner.unet.load_state_dict(ckpt["unet_state"])
-    fm_refiner.controlnet.load_state_dict(ckpt["controlnet_state"])
+    _raw(fm_refiner.unet).load_state_dict(ckpt["unet_state"])
+    _raw(fm_refiner.controlnet).load_state_dict(ckpt["controlnet_state"])
     if ckpt.get("null_ps_state") is not None:
         fm_refiner._null_ps = ckpt["null_ps_state"]
-    sr_module.load_state_dict(ckpt["sr_state"])
+    _raw(sr_module).load_state_dict(ckpt["sr_state"])
     optimizer_fm.load_state_dict(ckpt["optimizer_fm_state"])
     optimizer_sr.load_state_dict(ckpt["optimizer_sr_state"])
     if lr_scheduler_fm and ckpt.get("lr_scheduler_fm_state"):
@@ -323,6 +385,13 @@ def _unfreeze(module: nn.Module):
         p.requires_grad_(True)
 
 
+def _raw(module: nn.Module) -> nn.Module:
+    """Unwrap a DDP-wrapped module to the underlying module (shares the same
+    parameter tensors), so state_dict() keys stay unprefixed regardless of
+    whether distributed training is active."""
+    return module.module if isinstance(module, DDP) else module
+
+
 # -------------------------------------------------------------------------
 # Phase-1 training step
 # -------------------------------------------------------------------------
@@ -339,6 +408,7 @@ def _sr_step(
     use_tdp: bool,               # False during warmup
     tdp_hook: str,               # e.g. "controlnet.cond_embedding" / "controlnet.mid_block" / "unet.up_blocks.2"
     device: torch.device,
+    concat_landsat_cond: bool = False,
 ) -> dict:
     """
     Compute SR Phase-1 loss and return a dict with loss tensors.
@@ -354,9 +424,16 @@ def _sr_step(
                                     cleanest option: features depend only on PS input)
       "controlnet.mid_block"      – hook ControlNet mid_block (requires full CN forward with z_coarse)
       "unet.up_blocks.N"          – hook UNet up_blocks[N], runs ControlNet + UNet forward
+
+    Note: always operates on the raw (non-DDP-wrapped) unet/controlnet, since
+    these are frozen during the SR step (no gradient sync required) — this
+    also lets the SR step run every iteration without tripping DDP's
+    freeze/unfreeze bookkeeping (see _raw()).
     """
     B = landsat.shape[0]
     H_hr, W_hr = real_ps.shape[2], real_ps.shape[3]
+    controlnet = _raw(fm_refiner.controlnet)
+    unet = _raw(fm_refiner.unet)
 
     # SR forward (trainable)
     pseudo_ps = sr_module(landsat, target_size=(H_hr, W_hr))  # (B, C_ps, H_hr, W_hr)
@@ -366,12 +443,19 @@ def _sr_step(
 
     l_tdp = torch.tensor(0.0, device=device)
     if use_tdp and tdp_weight > 0:
+        if concat_landsat_cond:
+            cond_fake = torch.cat([landsat_hr, pseudo_ps], dim=1)
+            cond_real = torch.cat([landsat_hr, real_ps], dim=1)
+        else:
+            cond_fake = pseudo_ps
+            cond_real = real_ps
+
         if tdp_hook == "controlnet.cond_embedding":
             # Directly call controlnet_cond_embedding — no z_t context, no full CN forward.
             # Grad flows: l_tdp → cond_embedding(pseudo_ps) → pseudo_ps → SR
-            feat_fake = fm_refiner.controlnet.controlnet_cond_embedding(pseudo_ps)
+            feat_fake = controlnet.controlnet_cond_embedding(cond_fake)
             with torch.no_grad():
-                feat_real = fm_refiner.controlnet.controlnet_cond_embedding(real_ps)
+                feat_real = controlnet.controlnet_cond_embedding(cond_real)
         else:
             # Original hook-based path (controlnet.mid_block or unet.up_blocks.N)
             with torch.no_grad():
@@ -384,9 +468,9 @@ def _sr_step(
             use_unet = tdp_hook.startswith("unet.")
             if use_unet:
                 up_idx = int(tdp_hook.split(".")[-1])
-                hook_module = fm_refiner.unet.up_blocks[up_idx]
+                hook_module = unet.up_blocks[up_idx]
             else:
-                hook_module = fm_refiner.controlnet.mid_block
+                hook_module = controlnet.mid_block
 
             feats: dict = {}
 
@@ -395,15 +479,15 @@ def _sr_step(
 
             hook = hook_module.register_forward_hook(_hook)
 
-            cn_fake_out = fm_refiner.controlnet(
+            cn_fake_out = controlnet(
                 sample=z_coarse.detach(),
                 timestep=t_int,
                 encoder_hidden_states=text_emb,
-                controlnet_cond=pseudo_ps,
+                controlnet_cond=cond_fake,
                 return_dict=True,
             )
             if use_unet:
-                fm_refiner.unet(
+                unet(
                     sample=z_coarse.detach(),
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
@@ -414,15 +498,15 @@ def _sr_step(
             feat_fake = feats["out"]
 
             with torch.no_grad():
-                cn_real_out = fm_refiner.controlnet(
+                cn_real_out = controlnet(
                     sample=z_coarse.detach(),
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
-                    controlnet_cond=real_ps,
+                    controlnet_cond=cond_real,
                     return_dict=True,
                 )
                 if use_unet:
-                    fm_refiner.unet(
+                    unet(
                         sample=z_coarse.detach(),
                         timestep=t_int,
                         encoder_hidden_states=text_emb,
@@ -513,6 +597,77 @@ if __name__ == "__main__":
     parser.add_argument("--add_datetime_prefix", action="store_true")
     args = parser.parse_args()
 
+    # ---- Distributed setup (mirrors infer_sr_fm_refiner.py's SLURM env reading) ----
+    # global_rank/world_size come from SLURM_PROCID/SLURM_NTASKS (srun sets one
+    # task per GPU); local_rank (SLURM_LOCALID) selects the GPU on this node.
+    global_rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", 0)))
+    world_size  = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", 1)))
+    local_rank  = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", 0)))
+    is_distributed  = world_size > 1
+    is_main_process = global_rank == 0
+
+    # Every rank builds its own full copy of LazyPatchDataset (needed for its
+    # DataLoader), whose __init__ is chatty (print() + several tqdm bars over
+    # every patch). Left unguarded, world_size copies of that output interleave
+    # into one stderr/stdout stream. Since the dataset construction is
+    # identical on every rank, only rank0's copy of the output is useful —
+    # silence print() and disable tqdm rendering everywhere else.
+    if not is_main_process:
+        sys.stdout = open(os.devnull, "w")
+        import functools
+        import src.util.ps_lazydataset as _pld
+        _pld.tqdm = functools.partial(_pld.tqdm, disable=True)
+
+    if is_distributed:
+        # MASTER_ADDR should be set by the launch script for multi-node runs
+        # (e.g. the first node's hostname); defaults to localhost for a
+        # single-node, multi-GPU srun/torchrun launch.
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        backend = "nccl" if (torch.cuda.is_available() and not args.no_cuda) else "gloo"
+        dist.init_process_group(
+            backend=backend, rank=global_rank, world_size=world_size,
+            timeout=timedelta(minutes=5),
+        )
+
+    # ---- Device ----
+    if torch.cuda.is_available() and not args.no_cuda:
+        n_visible = torch.cuda.device_count()
+        device_index = local_rank % n_visible if n_visible > 0 else 0
+        torch.cuda.set_device(device_index)
+        device = torch.device(f"cuda:{device_index}")
+        gpu_name = torch.cuda.get_device_name(device_index)
+    else:
+        n_visible = 0
+        device = torch.device("cpu")
+        gpu_name = "cpu"
+    # print (not logging.info — no handler is configured yet at this point,
+    # and Python's logging silently drops INFO records without one) to
+    # sys.stderr (not stdout — non-rank0 stdout is redirected to devnull
+    # above) so every rank's GPU binding is visible for sanity-checking that
+    # DDP is actually spread across distinct physical GPUs.
+    print(
+        f"[rank {global_rank}/{world_size}] SLURM_LOCALID={local_rank} "
+        f"visible_gpus={n_visible} -> using {device} ({gpu_name})",
+        file=sys.stderr, flush=True,
+    )
+
+    def _barrier():
+        # Passing device_ids avoids NCCL's "devices used by this process are
+        # currently unknown" warning on every barrier() call.
+        dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
+
+    if is_distributed:
+        # Warm up every rank-pair connection on a trivial call before DDP's
+        # construction broadcast (the first real bulk transfer, ~300MB x
+        # ~15 back-to-back) gets to it. At 64 ranks that broadcast has
+        # intermittently lost its completion signal on one rank (LUMI
+        # Slingshot fabric, not a code bug — see
+        # script/depth/train_sr_fm_refiner.sh); doing so on this cheap
+        # barrier first, while nothing else is competing for the fabric,
+        # is a common mitigation for that class of connection-setup race.
+        _barrier()
+
     # ---- Config ----
     if args.resume_run is not None:
         out_dir_run = os.path.dirname(os.path.dirname(args.resume_run))
@@ -520,40 +675,71 @@ if __name__ == "__main__":
         job_name = os.path.basename(out_dir_run)
     else:
         cfg = recursive_load_config(args.config)
+
+        # DDP data-parallel semantics: each of the world_size ranks
+        # contributes one micro-batch to the SAME gradient update, so one
+        # "step" now consumes world_size× the data a single-GPU step would.
+        # Scale step-counted hyperparameters down by world_size so this run
+        # processes the same total amount of data (and takes comparable
+        # wall-clock time) as the single-GPU config the numbers were tuned
+        # for, instead of silently training on world_size× more data.
+        # Applied once, here, on a fresh run — a resumed run reloads the
+        # already-scaled config.yaml saved by the run being resumed.
+        ddp_scale = world_size if is_distributed else 1
+        if ddp_scale > 1:
+            cfg.max_iter = max(1, cfg.max_iter // ddp_scale)
+            cfg.trainer.warmup_sr_steps = max(1, cfg.trainer.warmup_sr_steps // ddp_scale)
+            cfg.trainer.validation_period = max(1, cfg.trainer.validation_period // ddp_scale)
+            cfg.trainer.save_period = max(1, cfg.trainer.save_period // ddp_scale)
+            cfg.trainer.log_period = max(1, cfg.trainer.log_period // ddp_scale)
+
         pure_job_name = os.path.basename(args.config).split(".")[0]
         job_name = (
             f"{t_start.strftime('%y_%m_%d-%H_%M_%S')}-{pure_job_name}"
             if args.add_datetime_prefix else pure_job_name
         )
         out_dir_run = os.path.join(args.output_dir or "./output", job_name)
-        os.makedirs(out_dir_run, exist_ok=False)
+        if is_main_process:
+            os.makedirs(out_dir_run, exist_ok=False)
 
     out_dir_ckpt = os.path.join(out_dir_run, "checkpoint")
-    os.makedirs(out_dir_ckpt, exist_ok=True)
 
-    # ---- Logging ----
-    config_logging(cfg.logging, out_dir=out_dir_run)
-    if args.resume_run is None:
-        with open(os.path.join(out_dir_run, "config.yaml"), "w") as f:
-            OmegaConf.save(cfg, f)
+    # ---- Logging / wandb (rank0 only: avoids racing directory creation and
+    # duplicate wandb runs/log files across ranks) ----
+    if is_main_process:
+        os.makedirs(out_dir_ckpt, exist_ok=True)
+        config_logging(cfg.logging, out_dir=out_dir_run)
+        if args.resume_run is None:
+            with open(os.path.join(out_dir_run, "config.yaml"), "w") as f:
+                OmegaConf.save(cfg, f)
+            if ddp_scale > 1:
+                logging.info(
+                    f"[DDP] world_size={ddp_scale}: scaled max_iter/warmup_sr_steps/"
+                    f"validation_period/save_period/log_period down by 1/{ddp_scale} "
+                    f"(now {cfg.max_iter}/{cfg.trainer.warmup_sr_steps}/"
+                    f"{cfg.trainer.validation_period}/{cfg.trainer.save_period}/"
+                    f"{cfg.trainer.log_period}) so this run covers the same total "
+                    f"data (and wall-clock time) as the single-GPU config."
+                )
 
-    if not args.no_wandb:
-        wandb_cfg = {
-            "config": dict(cfg),
-            "name": job_name,
-            "mode": "online",
-            "dir": out_dir_run,
-            **{k: v for k, v in cfg.wandb.items() if k != "name"},
-        }
-        init_wandb(enable=True, **wandb_cfg)
+        if not args.no_wandb:
+            wandb_cfg = {
+                "config": dict(cfg),
+                "name": job_name,
+                "mode": "online",
+                "dir": out_dir_run,
+                **{k: v for k, v in cfg.wandb.items() if k != "name"},
+            }
+            init_wandb(enable=True, **wandb_cfg)
+        else:
+            init_wandb(enable=False)
+
+        tb_logger.set_dir(os.path.join(out_dir_run, "tensorboard"))
     else:
-        init_wandb(enable=False)
+        logging.basicConfig(level=logging.INFO)
 
-    tb_logger.set_dir(os.path.join(out_dir_run, "tensorboard"))
-
-    # ---- Device ----
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    logging.info(f"device = {device}")
+    if is_distributed:
+        _barrier()
 
     # ---- Data ----
     cfg_data = cfg.dataset
@@ -601,14 +787,27 @@ if __name__ == "__main__":
     train_dataset = _make_dataset(base_dataset, train_coords, 'train', cfg.dataloader.max_train_batch_size)
     val_dataset   = _make_dataset(base_dataset, val_coords,   'val',   1)
 
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True,
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank,
+                           shuffle=True, seed=cfg.dataloader.seed)
+        if is_distributed else None
+    )
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=(train_sampler is None),
+                              sampler=train_sampler,
                               num_workers=cfg_data.workers, pin_memory=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=1, shuffle=False,
-                              num_workers=cfg_data.workers, pin_memory=True)
+    # validate() builds its own small on-demand DataLoader per call, over a
+    # Subset of just the sample indices it actually needs (see validate()) —
+    # so no val_loader is built here. Materializing a full DataLoader over
+    # val_dataset up front is fine on 1 rank, but at 64 ranks each validation
+    # call would otherwise force all 64 processes to eagerly read+transform
+    # the *entire* val set from shared Lustre storage before subsetting down
+    # to the handful of samples actually used — a 64-way concurrent I/O
+    # storm that stalled training for many minutes when this ran unmodified.
 
     # ---- Models ----
     n_landsat_bands = len(cfg_data.selected_bands)
     n_ps_bands      = len(cfg_data.selected_bands_hr)
+    concat_landsat_cond = bool(cfg.trainer.get("concat_landsat_cond", False))
 
     fm_refiner = build_fm_refiner(
         sd_pretrained_path=cfg.model.sd_pretrained_path,
@@ -617,6 +816,7 @@ if __name__ == "__main__":
         ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
         bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
         concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
+        concat_landsat_cond=concat_landsat_cond,
         refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
         device=str(device),
     ).to(device)
@@ -637,29 +837,54 @@ if __name__ == "__main__":
 
     sr_module = build_sr_module(OmegaConf.to_container(cfg.sr_module, resolve=True)).to(device)
 
-    # Load SwinIR pretrained weights if provided
+    # Load SwinIR pretrained weights if provided.
+    # Only rank 0 reads the checkpoint from disk — DDP(sr_module_raw, ...)
+    # below broadcasts rank 0's parameters to every other rank as part of its
+    # normal construction, so having all `world_size` ranks independently
+    # read this (large, shared-Lustre) file is both redundant and, at high
+    # rank counts, slow enough to blow NCCL's 5-minute collective timeout
+    # while DDP is being constructed (observed at 64 ranks / 8 nodes).
     sr_pretrained_path = cfg.model.get("sr_pretrained_path", None)
     if sr_pretrained_path and os.path.exists(sr_pretrained_path):
-        ckpt_sr = torch.load(sr_pretrained_path, map_location="cpu")
-        key = cfg.model.get("sr_pretrained_key", None)
-        state = ckpt_sr[key] if key and key in ckpt_sr else ckpt_sr
-        missing, unexpected = sr_module.swinir.load_state_dict(state, strict=False)
-        logging.info(f"SwinIR pretrained loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-    else:
+        if is_main_process:
+            ckpt_sr = torch.load(sr_pretrained_path, map_location="cpu")
+            key = cfg.model.get("sr_pretrained_key", None)
+            state = ckpt_sr[key] if key and key in ckpt_sr else ckpt_sr
+            missing, unexpected = sr_module.swinir.load_state_dict(state, strict=False)
+            logging.info(f"SwinIR pretrained loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+    elif is_main_process:
         logging.info("No SwinIR pretrained weights found; training from scratch.")
 
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
 
+    # ---- DDP wrapping ----
+    # Only unet/controlnet/sr_module are wrapped (not the whole FMRefiner):
+    # the SR step freezes unet/controlnet and calls a few of their submodules
+    # directly for the TDP loss (see _sr_step / _raw()), which must bypass DDP
+    # since DDP's gradient-sync hooks assume requires_grad stays static after
+    # construction — incompatible with this per-iteration freeze/unfreeze.
+    # unet_raw/controlnet_raw/sr_module_raw keep referring to the underlying
+    # modules (same parameter tensors) for that path, for validation, and for
+    # checkpointing (via _raw()).
+    unet_raw       = fm_refiner.unet
+    controlnet_raw = fm_refiner.controlnet
+    sr_module_raw  = sr_module
+    if is_distributed:
+        ddp_ids = [device.index] if device.type == "cuda" else None
+        fm_refiner.unet       = DDP(unet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+        fm_refiner.controlnet = DDP(controlnet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+        sr_module              = DDP(sr_module_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+
     # ---- Optimizers ----
     optimizer_fm = torch.optim.AdamW(
         [
-            {"params": fm_refiner.unet.parameters(),       "lr": cfg.optimizer.lr_unet},
-            {"params": fm_refiner.controlnet.parameters(), "lr": cfg.optimizer.lr_controlnet},
+            {"params": unet_raw.parameters(),       "lr": cfg.optimizer.lr_unet},
+            {"params": controlnet_raw.parameters(), "lr": cfg.optimizer.lr_controlnet},
         ],
         weight_decay=cfg.optimizer.weight_decay,
     )
     optimizer_sr = torch.optim.AdamW(
-        sr_module.parameters(),
+        sr_module_raw.parameters(),
         lr=cfg.optimizer.lr_sr,
         weight_decay=cfg.optimizer.weight_decay_sr,
     )
@@ -680,7 +905,8 @@ if __name__ == "__main__":
             fm_refiner, sr_module, optimizer_fm, optimizer_sr,
             lr_scheduler_fm, lr_scheduler_sr, args.resume_run
         )
-        logging.info(f"Resumed from step {start_step}")
+        if is_main_process:
+            logging.info(f"Resumed from step {start_step}")
 
     # ---- Training config ----
     p_null_drop     = float(cfg.trainer.p_null_drop)
@@ -704,25 +930,33 @@ if __name__ == "__main__":
     step = start_step
     best_r2 = -1e8
     val_offset = 0
-    val_subset_size = max(1, len(val_loader) // 10)
+    val_subset_size = max(1, len(val_dataset) // 10)
 
     loss_pix_accum = 0.0
     loss_tdp_accum = 0.0
     loss_fm_accum  = 0.0
     _pix_check_buf = []
 
-    logging.info("Starting joint SR + FM training (every batch updates both).")
-    pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True)
+    if is_main_process:
+        logging.info("Starting joint SR + FM training (every batch updates both).")
+    pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True,
+                disable=not is_main_process)
 
     for epoch in range(cfg.max_epoch):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         for batch in train_loader:
             if step >= cfg.max_iter:
                 break
             if t_end is not None and datetime.now() >= t_end:
-                logging.info("Exit after time limit reached.")
-                save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
-                                lr_scheduler_fm, lr_scheduler_sr,
-                                step, out_dir_ckpt, "latest")
+                if is_main_process:
+                    logging.info("Exit after time limit reached.")
+                    save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
+                                    lr_scheduler_fm, lr_scheduler_sr,
+                                    step, out_dir_ckpt, "latest")
+                if is_distributed:
+                    _barrier()
+                    dist.destroy_process_group()
                 pbar.close()
                 sys.exit(0)
 
@@ -762,11 +996,12 @@ if __name__ == "__main__":
                     fm_refiner, sr_module,
                     landsat, landsat_hr, inputs_hr, h_coarse,
                     pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
+                    concat_landsat_cond=concat_landsat_cond,
                 )
                 optimizer_sr.zero_grad()
                 loss_dict["l_total"].backward()
 
-                torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(sr_module_raw.parameters(), max_norm=1.0)
                 optimizer_sr.step()
 
                 # detach SR output before releasing the computation graph
@@ -795,8 +1030,8 @@ if __name__ == "__main__":
             optimizer_fm.zero_grad()
             loss_fm.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(fm_refiner.unet.parameters()) +
-                list(fm_refiner.controlnet.parameters()),
+                list(unet_raw.parameters()) +
+                list(controlnet_raw.parameters()),
                 max_norm=1.0,
             )
             optimizer_fm.step()
@@ -811,8 +1046,8 @@ if __name__ == "__main__":
             step += 1
             pbar.update(1)
 
-            # ---- Logging ----
-            if step % cfg.trainer.log_period == 0:
+            # ---- Logging (rank0 only) ----
+            if is_main_process and step % cfg.trainer.log_period == 0:
                 log_n = cfg.trainer.log_period
                 lr_sr = optimizer_sr.param_groups[0]["lr"]
                 lr_fm = optimizer_fm.param_groups[0]["lr"]
@@ -832,11 +1067,16 @@ if __name__ == "__main__":
                 wandb.log(log_dict, step=step)
                 tb_logger.log_dict(log_dict, global_step=step)
                 loss_pix_accum = loss_tdp_accum = loss_fm_accum = 0.0
+            elif step % cfg.trainer.log_period == 0:
+                loss_pix_accum = loss_tdp_accum = loss_fm_accum = 0.0
 
             # ---- Validation ----
+            # Every rank participates (sharded, parallel inference — see
+            # validate()'s docstring); only rank0 gets real metrics back and
+            # acts on them (logging / checkpointing).
             if step % cfg.trainer.validation_period == 0:
                 metrics, fig = validate(
-                    fm_refiner, sr_module, coarse_model, val_loader, device,
+                    fm_refiner, sr_module, coarse_model, val_dataset, device,
                     n_steps=cfg.validation.n_steps,
                     target_stats=target_stats,
                     n_landsat_bands=n_landsat_bands,
@@ -848,34 +1088,46 @@ if __name__ == "__main__":
                     chmv2_mean=_chmv2_mean if coarse_model_type == "chmv2" else None,
                     chmv2_std=_chmv2_std if coarse_model_type == "chmv2" else None,
                     n_avg=cfg.validation.get("n_avg", 1),
+                    global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
+                    # num_workers left at the validate() default (0): each
+                    # rank only loads ~n_total/10/world_size samples here, too
+                    # few to be worth the worker-process spin-up cost.
                 )
-                val_offset = (val_offset + val_subset_size) % len(val_loader)
+                # Deterministic given val_offset/val_subset_size/len(val_dataset),
+                # which are identical on every rank — safe to update everywhere.
+                val_offset = (val_offset + val_subset_size) % len(val_dataset)
 
-                logging.info(f"[step {step}] val: {metrics}")
-                vlog = {f"val/{k}": v for k, v in metrics.items()}
-                if fig is not None:
-                    vlog["val/samples"] = wandb.Image(fig)
-                    plt.close(fig)
-                wandb.log(vlog, step=step)
-                tb_logger.log_dict({f"val/{k}": v for k, v in metrics.items()}, global_step=step)
+                if is_main_process:
+                    logging.info(f"[step {step}] val: {metrics}")
+                    vlog = {f"val/{k}": v for k, v in metrics.items()}
+                    if fig is not None:
+                        vlog["val/samples"] = wandb.Image(fig)
+                        plt.close(fig)
+                    wandb.log(vlog, step=step)
+                    tb_logger.log_dict({f"val/{k}": v for k, v in metrics.items()}, global_step=step)
 
-                if metrics["r2"] > best_r2:
-                    best_r2 = metrics["r2"]
-                    pbar.set_postfix(r2=f"{best_r2:.4f}")
-                    save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
-                                    lr_scheduler_fm, lr_scheduler_sr,
-                                    step, out_dir_ckpt, "best")
-                    logging.info(f"New best R²={best_r2:.4f} at step {step}")
+                    if metrics["r2"] > best_r2:
+                        best_r2 = metrics["r2"]
+                        pbar.set_postfix(r2=f"{best_r2:.4f}")
+                        save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
+                                        lr_scheduler_fm, lr_scheduler_sr,
+                                        step, out_dir_ckpt, "best")
+                        logging.info(f"New best R²={best_r2:.4f} at step {step}")
 
-                # restore train mode after validate()
+                # restore train mode after validate() on every rank
                 fm_refiner.train()
                 sr_module.train()
                 _unfreeze(fm_refiner.unet)
                 _unfreeze(fm_refiner.controlnet)
                 _unfreeze(sr_module)
 
-            # ---- Periodic checkpoint ----
-            if step % cfg.trainer.save_period == 0:
+                if is_distributed:
+                    # rank0's checkpoint write above must finish before other
+                    # ranks resume training and possibly overwrite "latest".
+                    _barrier()
+
+            # ---- Periodic checkpoint (rank0 only) ----
+            if is_main_process and step % cfg.trainer.save_period == 0:
                 save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
                                 lr_scheduler_fm, lr_scheduler_sr,
                                 step, out_dir_ckpt, "latest")
@@ -886,15 +1138,20 @@ if __name__ == "__main__":
     pbar.close()
 
     # ---- Final full validation ----
+    # Every rank must load the same best checkpoint (not just rank0) since
+    # the sharded validate() call below combines predictions across ranks —
+    # mixing a stale-weight rank into that would corrupt the aggregate metric.
     best_ckpt = os.path.join(out_dir_ckpt, "best.pth")
     if os.path.exists(best_ckpt):
         load_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
                         lr_scheduler_fm, lr_scheduler_sr, best_ckpt)
-        logging.info(f"Loaded best checkpoint for final validation")
+        if is_main_process:
+            logging.info(f"Loaded best checkpoint for final validation")
 
-    logging.info("Running full validation on entire val set...")
+    if is_main_process:
+        logging.info("Running full validation on entire val set...")
     final_metrics, final_fig = validate(
-        fm_refiner, sr_module, coarse_model, val_loader, device,
+        fm_refiner, sr_module, coarse_model, val_dataset, device,
         n_steps=cfg.validation.n_steps,
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
@@ -906,15 +1163,24 @@ if __name__ == "__main__":
         chmv2_mean=_chmv2_mean if coarse_model_type == "chmv2" else None,
         chmv2_std=_chmv2_std if coarse_model_type == "chmv2" else None,
         n_avg=cfg.validation.get("n_avg", 1),
+        global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
+        num_workers=cfg_data.workers,  # full=True shards the whole val set,
+        # worth the worker-process cost here (unlike the periodic call above).
     )
-    logging.info(f"Final val metrics: {final_metrics}")
-    flog = {f"val_final/{k}": v for k, v in final_metrics.items()}
-    if final_fig is not None:
-        flog["val_final/samples"] = wandb.Image(final_fig)
-        plt.close(final_fig)
-    wandb.log(flog, step=step)
 
-    save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
-                    lr_scheduler_fm, lr_scheduler_sr,
-                    step, out_dir_ckpt, "final")
-    logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
+    if is_main_process:
+        logging.info(f"Final val metrics: {final_metrics}")
+        flog = {f"val_final/{k}": v for k, v in final_metrics.items()}
+        if final_fig is not None:
+            flog["val_final/samples"] = wandb.Image(final_fig)
+            plt.close(final_fig)
+        wandb.log(flog, step=step)
+
+        save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
+                        lr_scheduler_fm, lr_scheduler_sr,
+                        step, out_dir_ckpt, "final")
+        logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
+
+    if is_distributed:
+        _barrier()
+        dist.destroy_process_group()
