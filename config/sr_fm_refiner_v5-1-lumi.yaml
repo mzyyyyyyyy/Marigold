@@ -1,0 +1,203 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: sr_fm_refiner_v5-1-lumi
+
+# Dataset config – same as fm_refiner_v4.yaml
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+  # SwinIR pretrained weights (DIV2K classical SR, 4× upscale).
+  # Set to null to train SR from scratch.
+  sr_pretrained_path: "/flash/project_465002934/model/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
+  sr_pretrained_key: "params"   # key inside the .pth dict
+
+
+# SR module architecture – mirrors SR4IR options/reg/base1_v2.yaml network_sr block
+sr_module:
+  in_chans: 3
+  out_chans: 3
+  upscale: 4
+  img_size: 48
+  window_size: 8
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2.0
+  upsampler: pixelshuffle
+  resi_connection: 1conv
+
+
+# SR training losses (Phase 1)
+sr_loss:
+  pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
+  tdp_weight: 0.3     # L1 on ControlNet cond_embedding features (pseudo vs real)
+  tdp_hook: "controlnet.cond_embedding"  # z_t-independent: aligns cond_embedding features only (matches sr_fm_refiner_v10)
+
+
+# Alternate training schedule
+
+
+# Optimizers
+#
+# This config trains at real batch 64 (max_train_batch_size=1 x 64 ranks —
+# see dataloader: below), versus the single-GPU v5-1 config's real batch of
+# 4 (max_train_batch_size=1 x 4 local accumulation steps, x1 rank). A 16x
+# larger batch with unscaled LR and proportionally fewer optimizer steps
+# (max_iter is auto-divided by world_size at runtime — see
+# train_sr_fm_refiner.py's ddp_scale block) undertrains relative to the
+# single-GPU run: investigation on 2026-08-18 found the plain v5-1 config
+# run unchanged on 64 GPUs (real batch 64, LR unchanged) finished at
+# R²=0.7535, versus 0.7812 for the single-GPU run at real batch 4 —
+# consistent with the classic "larger batch, same LR, fewer optimizer steps
+# ⇒ undertrained" effect (Goyal et al., "Accurate, Large Minibatch SGD").
+# LRs below are scaled by sqrt(64/4)=sqrt(16)=4 (not the full
+# linear-scaling-rule 16x) — AdamW's per-parameter adaptive scaling makes
+# it less batch-sensitive than plain SGD, and these are small fine-tuning
+# LRs on a pretrained UNet+ControlNet+SwinIR-SR stack where a full 16x jump
+# risks destabilizing training. There's no LR warmup in this script
+# (CosineAnnealingLR starts straight from the base LR at step 0) — if
+# training looks unstable in the first handful of steps, that's the first
+# thing to add, not just tuning these numbers further.
+optimizer:
+  lr_unet: 4.0e-05        # 1.0e-05 x4
+  lr_controlnet: 4.0e-04  # 1.0e-04 x4
+  weight_decay: 1.0e-02
+
+  lr_sr: 8.0e-04           # 2.0e-04 x4
+  weight_decay_sr: 0.0
+
+
+# LR scheduler (cosine annealing, shared T_max = max_iter)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader
+dataloader:
+  # No effective_batch_size here on purpose (unlike v5-1): that field only
+  # exists to simulate a larger batch via *local* gradient accumulation on
+  # a single GPU, which this config doesn't need — DDP's cross-rank
+  # gradient averaging already provides a real multiplier of exactly
+  # world_size (64, fixed by --nodes/--ntasks-per-node in
+  # train_sr_fm_refiner.sh, not a yaml setting) for free. So on this
+  # config max_train_batch_size is the *only* batch-size knob:
+  #
+  #     real batch per optimizer step = max_train_batch_size x 64
+  #
+  # max_train_batch_size=1 x 64 ranks = 64 real batch (train_sr_fm_refiner.py
+  # logs this exact line at startup so you can sanity-check it against
+  # whatever you set here). The optimizer LRs below are tuned for this
+  # real batch of 64 specifically — see the comment above optimizer:.
+  max_train_batch_size: 1
+  seed: 2024
+
+
+# Trainer
+trainer:
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # PS source probabilities per batch (mutually exclusive):
+  #   p_null_drop → null PS token (modality dropout)
+  #   p_pseudo_ps → SR-generated pseudo-PS
+  #   remainder   → real PS
+  p_null_drop: 0.0
+  p_pseudo_ps: 0.3
+
+  bridge_sigma: 0.5
+
+  # Steps before TDP loss is activated (pixel-only warmup). Unrelated to LR
+  # warmup (there isn't any) — this just delays the ControlNet feature loss
+  # term. Scaled down by world_size at runtime same as v5-1 (see
+  # train_sr_fm_refiner.py's ddp_scale block), so left as-is here.
+  warmup_sr_steps: 200
+
+  # ControlNet conditioning = concat(landsat_hr, ps) (6 channels) instead of
+  # ps-only (3 channels) — mirrors sr_fm_refiner_v2's design.
+  concat_landsat_cond: True
+
+
+# Validation / inference
+validation:
+  n_steps: 4
+  method: euler
+  # True  → validation uses SR pseudo-PS via refine_with_ps()
+  # False → validation uses null PS via refine() (baseline comparison)
+  use_sr_pseudo_ps: True
+  n_avg: 5
+
+
+# Training budget
+# max_iter is scaled down by world_size at runtime when distributed (see
+# train_sr_fm_refiner.py's ddp_scale block) so 64 GPUs cover the same total
+# data/wall-clock as the single-GPU v5-1 run — left as 100000 here, same as
+# v5-1, on purpose; this file only changes batch/LR, not that scaling
+# strategy.
+max_epoch: 1000
+max_iter: 100000
+
+
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

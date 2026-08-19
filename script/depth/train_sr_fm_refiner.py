@@ -27,6 +27,7 @@ Usage (multi-GPU, standard DDP, e.g. 8 GPUs via srun -n8):
   which alone handles logging/wandb/checkpointing.
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -392,6 +393,29 @@ def _raw(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
 
 
+@contextlib.contextmanager
+def _maybe_no_sync(modules, skip_sync: bool):
+    """Suppress DDP's gradient all-reduce on non-final micro-batches of a
+    gradient-accumulation window.
+
+    DDP triggers an all-reduce on every .backward() call by default, which
+    would average+sync gradients after each individual micro-batch instead
+    of once per real optimizer step — wasteful (accumulation_steps-1 extra
+    rounds of communication per step) and, if zero_grad() isn't also called
+    each time, redundant on top of the local accumulation. `.no_sync()`
+    defers the all-reduce to the next backward() outside this context, so
+    gradients accumulate locally across the window and get averaged across
+    ranks exactly once, on the final micro-batch.
+    """
+    if not skip_sync:
+        yield
+        return
+    with contextlib.ExitStack() as stack:
+        for m in modules:
+            stack.enter_context(m.no_sync())
+        yield
+
+
 # -------------------------------------------------------------------------
 # Phase-1 training step
 # -------------------------------------------------------------------------
@@ -676,22 +700,30 @@ if __name__ == "__main__":
     else:
         cfg = recursive_load_config(args.config)
 
-        # DDP data-parallel semantics: each of the world_size ranks
-        # contributes one micro-batch to the SAME gradient update, so one
-        # "step" now consumes world_size× the data a single-GPU step would.
-        # Scale step-counted hyperparameters down by world_size so this run
-        # processes the same total amount of data (and takes comparable
-        # wall-clock time) as the single-GPU config the numbers were tuned
-        # for, instead of silently training on world_size× more data.
-        # Applied once, here, on a fresh run — a resumed run reloads the
-        # already-scaled config.yaml saved by the run being resumed.
-        ddp_scale = world_size if is_distributed else 1
-        if ddp_scale > 1:
-            cfg.max_iter = max(1, cfg.max_iter // ddp_scale)
-            cfg.trainer.warmup_sr_steps = max(1, cfg.trainer.warmup_sr_steps // ddp_scale)
-            cfg.trainer.validation_period = max(1, cfg.trainer.validation_period // ddp_scale)
-            cfg.trainer.save_period = max(1, cfg.trainer.save_period // ddp_scale)
-            cfg.trainer.log_period = max(1, cfg.trainer.log_period // ddp_scale)
+        # A "step" consumes max_train_batch_size * accumulation_steps *
+        # world_size samples: accumulation_steps from this config's own
+        # local gradient accumulation (see dataloader.effective_batch_size),
+        # times world_size again from DDP averaging gradients across ranks
+        # on top of that. Both multiply total data-per-step independently
+        # of each other, so both must be divided out — not just world_size
+        # — to keep max_iter (and the other step-counted knobs below)
+        # anchored to "how many steps at max_train_batch_size", which is
+        # what these numbers were originally tuned against (2026-08-18:
+        # confirmed against the single-GPU baseline that predates the
+        # gradient-accumulation fix, i.e. accumulation_steps was always 1
+        # then regardless of effective_batch_size — so that's the correct
+        # zero point to scale from). Applied once, here, on a fresh run — a
+        # resumed run reloads the already-scaled config.yaml saved by the
+        # run being resumed.
+        _eff_bs = cfg.dataloader.get("effective_batch_size", cfg.dataloader.max_train_batch_size)
+        _accum_steps = max(1, _eff_bs // cfg.dataloader.max_train_batch_size)
+        total_scale = _accum_steps * (world_size if is_distributed else 1)
+        if total_scale > 1:
+            cfg.max_iter = max(1, cfg.max_iter // total_scale)
+            cfg.trainer.warmup_sr_steps = max(1, cfg.trainer.warmup_sr_steps // total_scale)
+            cfg.trainer.validation_period = max(1, cfg.trainer.validation_period // total_scale)
+            cfg.trainer.save_period = max(1, cfg.trainer.save_period // total_scale)
+            cfg.trainer.log_period = max(1, cfg.trainer.log_period // total_scale)
 
         pure_job_name = os.path.basename(args.config).split(".")[0]
         job_name = (
@@ -712,14 +744,16 @@ if __name__ == "__main__":
         if args.resume_run is None:
             with open(os.path.join(out_dir_run, "config.yaml"), "w") as f:
                 OmegaConf.save(cfg, f)
-            if ddp_scale > 1:
+            if total_scale > 1:
                 logging.info(
-                    f"[DDP] world_size={ddp_scale}: scaled max_iter/warmup_sr_steps/"
-                    f"validation_period/save_period/log_period down by 1/{ddp_scale} "
-                    f"(now {cfg.max_iter}/{cfg.trainer.warmup_sr_steps}/"
-                    f"{cfg.trainer.validation_period}/{cfg.trainer.save_period}/"
-                    f"{cfg.trainer.log_period}) so this run covers the same total "
-                    f"data (and wall-clock time) as the single-GPU config."
+                    f"[scale] accumulation_steps={_accum_steps} x world_size="
+                    f"{world_size if is_distributed else 1} = {total_scale}: scaled "
+                    f"max_iter/warmup_sr_steps/validation_period/save_period/log_period "
+                    f"down by 1/{total_scale} (now {cfg.max_iter}/"
+                    f"{cfg.trainer.warmup_sr_steps}/{cfg.trainer.validation_period}/"
+                    f"{cfg.trainer.save_period}/{cfg.trainer.log_period}) so this run "
+                    f"covers the same total data (and wall-clock time) as a config "
+                    f"training at real batch = max_train_batch_size alone."
                 )
 
         if not args.no_wandb:
@@ -743,8 +777,28 @@ if __name__ == "__main__":
 
     # ---- Data ----
     cfg_data = cfg.dataset
-    eff_bs = cfg.dataloader.effective_batch_size
-    accumulation_steps = eff_bs // cfg.dataloader.max_train_batch_size
+    # effective_batch_size is optional and defaults to max_train_batch_size
+    # (accumulation_steps=1, i.e. no local accumulation): it only exists for
+    # configs that need to simulate a larger batch on a single GPU (see
+    # v5-1.yaml). A multi-GPU config doesn't need it — DDP's cross-rank
+    # gradient averaging already provides that multiplier for free, so the
+    # real per-step batch there is simply max_train_batch_size * world_size,
+    # and max_train_batch_size is the only batch-size knob such a config
+    # needs to set (see v5-1-lumi.yaml).
+    eff_bs = cfg.dataloader.get("effective_batch_size", cfg.dataloader.max_train_batch_size)
+    # accumulation_steps micro-batches (each max_train_batch_size samples,
+    # per rank) are accumulated into one real optimizer step, so the true
+    # per-step batch a gradient update is computed over is
+    # max_train_batch_size * accumulation_steps * world_size (DDP averages
+    # gradients across ranks on top of this).
+    accumulation_steps = max(1, eff_bs // cfg.dataloader.max_train_batch_size)
+    if is_main_process:
+        real_batch = cfg.dataloader.max_train_batch_size * accumulation_steps * world_size
+        logging.info(
+            f"Batch size: {cfg.dataloader.max_train_batch_size} per micro-batch "
+            f"x {accumulation_steps} accumulation step(s) x {world_size} rank(s) "
+            f"= {real_batch} real batch per optimizer step."
+        )
 
     base_dataset = LazyPatchDataset({
         'input_dir': cfg_data.input_dir,
@@ -928,6 +982,13 @@ if __name__ == "__main__":
     t_end = t_start + timedelta(minutes=args.exit_after) if args.exit_after > 0 else None
 
     step = start_step
+    # Position within the current accumulation window (0..accumulation_steps-1)
+    # — a real optimizer step only happens, and `step` only advances, when
+    # this reaches accumulation_steps-1. Always starts a fresh window on
+    # resume: a resumed run doesn't know which micro-batches the checkpointed
+    # step already included, so starting mid-window would silently apply a
+    # partial-batch gradient update.
+    micro_step = 0
     best_r2 = -1e8
     val_offset = 0
     val_subset_size = max(1, len(val_dataset) // 10)
@@ -986,23 +1047,36 @@ if __name__ == "__main__":
             # ================================================================
             # Step 1: update SR  (FM frozen via no_grad on its forward pass)
             # ================================================================
+            is_first_micro = (micro_step == 0)
+            is_last_micro  = (micro_step == accumulation_steps - 1)
+            # Only the final micro-batch of a window should let DDP all-reduce
+            # gradients; earlier ones accumulate locally (see _maybe_no_sync).
+            skip_sync = is_distributed and not is_last_micro
+
             skip_sr_training = cfg.trainer.get("skip_sr_training", False)
             if not skip_sr_training:
                 use_tdp = (step >= warmup_sr_steps)
                 _freeze(fm_refiner.unet)
                 _freeze(fm_refiner.controlnet)
 
-                loss_dict = _sr_step(
-                    fm_refiner, sr_module,
-                    landsat, landsat_hr, inputs_hr, h_coarse,
-                    pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
-                    concat_landsat_cond=concat_landsat_cond,
-                )
-                optimizer_sr.zero_grad()
-                loss_dict["l_total"].backward()
+                if is_first_micro:
+                    optimizer_sr.zero_grad()
 
-                torch.nn.utils.clip_grad_norm_(sr_module_raw.parameters(), max_norm=1.0)
-                optimizer_sr.step()
+                with _maybe_no_sync([sr_module] if is_distributed else [], skip_sync):
+                    loss_dict = _sr_step(
+                        fm_refiner, sr_module,
+                        landsat, landsat_hr, inputs_hr, h_coarse,
+                        pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
+                        concat_landsat_cond=concat_landsat_cond,
+                    )
+                    # Scale down so accumulation_steps backward() calls (summed
+                    # into .grad by autograd) land on the *average* gradient
+                    # over the effective batch, not its sum.
+                    (loss_dict["l_total"] / accumulation_steps).backward()
+
+                if is_last_micro:
+                    torch.nn.utils.clip_grad_norm_(sr_module_raw.parameters(), max_norm=1.0)
+                    optimizer_sr.step()
 
                 # detach SR output before releasing the computation graph
                 pseudo_ps_detached = loss_dict["pseudo_ps"].detach().clone()
@@ -1021,22 +1095,33 @@ if __name__ == "__main__":
             _unfreeze(fm_refiner.unet)
             _unfreeze(fm_refiner.controlnet)
 
-            loss_fm = _task_step(
-                fm_refiner,
-                inputs_hr, h_coarse, targets,
-                pseudo_ps_detached,
-                p_null_drop, p_pseudo_ps, device,
-            )
-            optimizer_fm.zero_grad()
-            loss_fm.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(unet_raw.parameters()) +
-                list(controlnet_raw.parameters()),
-                max_norm=1.0,
-            )
-            optimizer_fm.step()
+            if is_first_micro:
+                optimizer_fm.zero_grad()
+
+            fm_modules = [fm_refiner.unet, fm_refiner.controlnet] if is_distributed else []
+            with _maybe_no_sync(fm_modules, skip_sync):
+                loss_fm = _task_step(
+                    fm_refiner,
+                    inputs_hr, h_coarse, targets,
+                    pseudo_ps_detached,
+                    p_null_drop, p_pseudo_ps, device,
+                )
+                (loss_fm / accumulation_steps).backward()
+
+            if is_last_micro:
+                torch.nn.utils.clip_grad_norm_(
+                    list(unet_raw.parameters()) +
+                    list(controlnet_raw.parameters()),
+                    max_norm=1.0,
+                )
+                optimizer_fm.step()
 
             loss_fm_accum += loss_fm.item()
+
+            if not is_last_micro:
+                micro_step += 1
+                continue
+            micro_step = 0
 
             if lr_scheduler_sr is not None:
                 lr_scheduler_sr.step()
@@ -1047,8 +1132,11 @@ if __name__ == "__main__":
             pbar.update(1)
 
             # ---- Logging (rank0 only) ----
+            # loss_*_accum accumulates every micro-batch (not just every real
+            # step), so the averaging window is log_period real steps' worth
+            # of micro-batches, not log_period micro-batches.
             if is_main_process and step % cfg.trainer.log_period == 0:
-                log_n = cfg.trainer.log_period
+                log_n = cfg.trainer.log_period * accumulation_steps
                 lr_sr = optimizer_sr.param_groups[0]["lr"]
                 lr_fm = optimizer_fm.param_groups[0]["lr"]
                 log_dict = {
