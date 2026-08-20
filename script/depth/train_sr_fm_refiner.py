@@ -510,7 +510,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v2-2.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v10-1.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -697,6 +697,18 @@ if __name__ == "__main__":
     tdp_weight      = float(cfg.sr_loss.tdp_weight)
     tdp_hook        = str(cfg.sr_loss.get("tdp_hook", "unet.up_blocks.2"))
 
+    # Pixel-loss annealing: after warmup, linearly decay pixel_weight down to
+    # pixel_weight_final over pixel_weight_anneal_steps, then hold constant.
+    # Disabled (pixel_weight stays fixed) if pixel_weight_anneal_steps <= 0.
+    pixel_weight_final        = float(cfg.sr_loss.get("pixel_weight_final", pixel_weight))
+    pixel_weight_anneal_steps = int(cfg.sr_loss.get("pixel_weight_anneal_steps", 0))
+
+    def _pixel_weight_at(step: int) -> float:
+        if step < warmup_sr_steps or pixel_weight_anneal_steps <= 0:
+            return pixel_weight
+        progress = min(1.0, (step - warmup_sr_steps) / pixel_weight_anneal_steps)
+        return pixel_weight + (pixel_weight_final - pixel_weight) * progress
+
     # SR trains every batch; FM trains every batch with detached SR output.
     # Both modules stay in train mode throughout.
     _unfreeze(sr_module)
@@ -762,13 +774,14 @@ if __name__ == "__main__":
             skip_sr_training = cfg.trainer.get("skip_sr_training", False)
             if not skip_sr_training:
                 use_tdp = (step >= warmup_sr_steps)
+                pixel_weight_t = _pixel_weight_at(step)
                 _freeze(fm_refiner.unet)
                 _freeze(fm_refiner.controlnet)
 
                 loss_dict = _sr_step(
                     fm_refiner, sr_module,
                     landsat, landsat_hr, inputs_hr, h_coarse,
-                    pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
+                    pixel_weight_t, tdp_weight, use_tdp, tdp_hook, device,
                 )
                 optimizer_sr.zero_grad()
                 loss_dict["l_total"].backward()
@@ -828,6 +841,7 @@ if __name__ == "__main__":
                     "train/l_pix": loss_pix_accum / log_n,
                     "train/l_tdp": loss_tdp_accum / log_n,
                     "train/l_fm":  loss_fm_accum  / log_n,
+                    "train/pixel_weight": _pixel_weight_at(step),
                 }
                 logging.info(
                     f"[step {step}] "
