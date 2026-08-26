@@ -3,7 +3,7 @@ base_config:
 
 wandb:
   project: marigold
-  name: sr_fm_refiner_v5
+  name: sr_fm_refiner_v5-R
 
 # Dataset config – same as fm_refiner_v4.yaml
 dataset:
@@ -96,12 +96,16 @@ sr_loss:
 
 
 # Optimizers
+# v5-R: gradient accumulation bug fixed (effective_batch_size now really
+# applies, real batch = 4 instead of 1). LR scaled conservatively via the
+# sqrt rule for Adam-family optimizers (x2 for unet/controlnet); lr_sr
+# bumped less aggressively since it starts from SwinIR pretrained weights.
 optimizer:
-  lr_unet: 1.0e-05
-  lr_controlnet: 1.0e-04
+  lr_unet: 2.0e-05
+  lr_controlnet: 2.0e-04
   weight_decay: 1.0e-02
 
-  lr_sr: 2.0e-04
+  lr_sr: 3.0e-04
   weight_decay_sr: 0.0
 
 
@@ -134,6 +138,8 @@ trainer:
 
   # Steps before TDP loss is activated (pixel-only warmup)
   warmup_sr_steps: 200
+
+  concat_landsat_hr: False
 
 
 # Validation / inference

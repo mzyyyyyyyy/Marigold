@@ -1,0 +1,152 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: baseline_sr4ir_reg
+
+# Dataset config – same input_dir/output_dir/patch_coord as sr_fm_refiner_v5*
+# so this baseline trains/validates on the exact same patches. 3-band (p50)
+# input, matching the current SR experiments (SR4IR/base1_v1.yaml originally
+# used the same 3 bands too).
+dataset:
+  input_dir: "/mnt/data/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/mnt/data/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/mnt/data/dataset/CHM_EUR/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/mnt/data/dataset/CHM_EUR/PS_test2_statistics.json"
+
+  # net_reg predicts raw canopy height (meters) directly, matching
+  # SR4IR/base1_v1.yaml (normalize_target=False, minmax_target=False).
+  use_target_minmax: False
+  use_target_norm: False
+  target_stats_file: "/mnt/data/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: False
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  # Same patch_coord as sr_fm_refiner_v5* → identical train/val/test split.
+  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/save_20260609.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  # SwinIR pretrained weights (DIV2K classical SR, 4x upscale) – same as
+  # sr_fm_refiner_v5* / SR4IR/base1_v1.yaml's path:network_sr.
+  sr_pretrained_path: "/mnt/data/model/SR4IR/pretrained_models/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
+  sr_pretrained_key: "params"
+
+  # net_reg backbone: kept consistent with the rest of this project's DAv2
+  # usage (sr_fm_refiner*/baseline_dav2), instead of base1_v1.yaml's original
+  # "Depth-Anything-V2-Metric-Outdoor-Base-hf", so results are comparable.
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+
+
+# SR module architecture – identical to SR4IR/base1_v1.yaml's network_sr block
+sr_module:
+  in_chans: 3
+  out_chans: 3
+  upscale: 4
+  img_size: 48
+  window_size: 8
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2.0
+  upsampler: pixelshuffle
+  resi_connection: 1conv
+
+
+# SR training losses (Phase 1) – values from base1_v1.yaml's pixel_opt/tdp_opt
+sr_loss:
+  pixel_weight: 1.0   # L1(img_sr, real_ps)
+  tdp_weight: 1.0      # L1 on net_reg neck.fusion_stage features (img_sr vs real_ps)
+
+
+# Optimizers – values from base1_v1.yaml's optim_sr / optim_reg
+optimizer:
+  lr_sr: 1.0e-04
+  weight_decay_sr: 0.0
+
+  lr_reg: 2.5e-05
+  weight_decay_reg: 3.0e-05
+
+
+# LR scheduler (cosine annealing, no restarts, shared T_max = max_iter) –
+# same convention as the rest of the project. base1_v1.yaml originally used
+# CosineAnnealingRestartLR with 6x50-epoch periods; simplified here to a
+# single cosine decay per this project's established preference.
+lr_scheduler:
+  eta_min_sr: 1.0e-06
+  eta_min_reg: 1.0e-07
+
+
+# Dataloader – effective_batch_size == max_train_batch_size == 4 means no
+# gradient accumulation: every batch is a real batch_size=4 step, matching
+# base1_v1.yaml's batch_size=4 (4 GPU in the original, single-GPU here).
+dataloader:
+  effective_batch_size: 4
+  max_train_batch_size: 4
+  seed: 2024
+
+
+# Trainer
+trainer:
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # Steps before TDP loss is activated (pixel-only warmup). base1_v1.yaml
+  # used warmup_epoch=20 with max_iters=150/epoch (~3000 iters); ported here
+  # as an iteration count to match this project's iter-based convention.
+  warmup_sr_steps: 3000
+
+  # huber_hr_opt.delta in base1_v1.yaml (real units, meters)
+  huber_delta: 1.0
+  target_vis_vmax: 30.0
+
+
+# Training budget – matches the max_iter used across sr_fm_refiner*/fm_refiner*
+# configs in this project (also batch_size=4 in both, so no rescaling needed).
+max_epoch: 1000
+max_iter: 100000
+
+
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

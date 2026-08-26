@@ -510,7 +510,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v10-1.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v5-R.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -729,6 +729,7 @@ if __name__ == "__main__":
     loss_tdp_accum = 0.0
     loss_fm_accum  = 0.0
     _pix_check_buf = []
+    micro_step = 0
 
     logging.info("Starting joint SR + FM training (every batch updates both).")
     pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True)
@@ -783,11 +784,13 @@ if __name__ == "__main__":
                     landsat, landsat_hr, inputs_hr, h_coarse,
                     pixel_weight_t, tdp_weight, use_tdp, tdp_hook, device,
                 )
-                optimizer_sr.zero_grad()
-                loss_dict["l_total"].backward()
+                if micro_step % accumulation_steps == 0:
+                    optimizer_sr.zero_grad()
+                (loss_dict["l_total"] / accumulation_steps).backward()
 
-                torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
-                optimizer_sr.step()
+                if (micro_step + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(sr_module.parameters(), max_norm=1.0)
+                    optimizer_sr.step()
 
                 # detach SR output before releasing the computation graph
                 pseudo_ps_detached = loss_dict["pseudo_ps"].detach().clone()
@@ -812,16 +815,24 @@ if __name__ == "__main__":
                 pseudo_ps_detached,
                 p_null_drop, p_pseudo_ps, device,
             )
-            optimizer_fm.zero_grad()
-            loss_fm.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(fm_refiner.unet.parameters()) +
-                list(fm_refiner.controlnet.parameters()),
-                max_norm=1.0,
-            )
-            optimizer_fm.step()
+            if micro_step % accumulation_steps == 0:
+                optimizer_fm.zero_grad()
+            (loss_fm / accumulation_steps).backward()
+
+            is_accum_boundary = (micro_step + 1) % accumulation_steps == 0
+            if is_accum_boundary:
+                torch.nn.utils.clip_grad_norm_(
+                    list(fm_refiner.unet.parameters()) +
+                    list(fm_refiner.controlnet.parameters()),
+                    max_norm=1.0,
+                )
+                optimizer_fm.step()
 
             loss_fm_accum += loss_fm.item()
+            micro_step += 1
+
+            if not is_accum_boundary:
+                continue
 
             if lr_scheduler_sr is not None:
                 lr_scheduler_sr.step()
