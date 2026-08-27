@@ -203,8 +203,10 @@ def validate(
 
         h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method)
 
-        all_preds.append(h_fine.cpu().flatten())
-        all_gts.append(targets.cpu().flatten())
+        pred_m = _denormalize_target(h_fine, target_stats)
+        gt_m = _denormalize_target(targets, target_stats)
+        all_preds.append(pred_m.cpu().flatten())
+        all_gts.append(gt_m.cpu().flatten())
 
         # Collect vis samples from the first image of this batch
         if len(vis_samples) < n_vis_samples:
@@ -236,6 +238,15 @@ def _normalize_coarse(h_coarse: torch.Tensor, target_stats: dict) -> torch.Tenso
     h_norm = (h_coarse - p1) / (p99 - p1 + 1e-8)   # [0, 1]
     h_norm = h_norm * 2.0 - 1.0                       # [-1, 1]
     return h_norm.clamp(-1.0, 1.0)
+
+
+def _denormalize_target(h: torch.Tensor, target_stats: dict) -> torch.Tensor:
+    """[-1, 1] -> metres, inverse of _normalize_coarse (same as infer_fm_refiner._denormalize)."""
+    p1 = float(target_stats["p1"][0])
+    p99 = float(target_stats["p99"][0])
+    h = (h.float() + 1.0) / 2.0        # [0, 1]
+    h = h * (p99 - p1) + p1             # metres
+    return h
 
 
 def _load_target_stats(stats_file: str, year: int) -> dict:
@@ -284,7 +295,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="FM Refiner Training")
-    parser.add_argument("--config", type=str, default="config/fm_refiner_v3-3.yaml")
+    parser.add_argument("--config", type=str, default="config/fm_refiner-R.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
