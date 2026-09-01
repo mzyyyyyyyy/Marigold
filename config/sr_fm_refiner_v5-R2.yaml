@@ -1,0 +1,164 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: sr_fm_refiner_v5-R2
+
+# Dataset config – same as fm_refiner_v4.yaml
+dataset:
+  input_dir: "/mnt/data/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/mnt/data/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/mnt/data/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/mnt/data/dataset/CHM_EUR/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/mnt/data/dataset/CHM_EUR/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/mnt/data/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/mnt/data/dataset/CHM_EUR_marigold/train_patch_coord/save_20260609.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  sd_pretrained_path: "/mnt/data/model/marigold/stable-diffusion-2"
+  dav2_pretrained_path: "/mnt/data/model/CHM_EUR/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+  # SwinIR pretrained weights (DIV2K classical SR, 4× upscale).
+  # Set to null to train SR from scratch.
+  sr_pretrained_path: "/mnt/data/model/SR4IR/pretrained_models/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
+  sr_pretrained_key: "params"   # key inside the .pth dict
+
+
+# SR module architecture – mirrors SR4IR options/reg/base1_v2.yaml network_sr block
+sr_module:
+  in_chans: 3
+  out_chans: 3
+  upscale: 4
+  img_size: 48
+  window_size: 8
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2.0
+  upsampler: pixelshuffle
+  resi_connection: 1conv
+
+
+# SR training losses (Phase 1)
+sr_loss:
+  pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
+  tdp_weight: 1.0     # L1 on ControlNet mid-block features (pseudo vs real)
+  tdp_hook: "controlnet.cond_embedding"   # "controlnet.mid_block" or "unet.up_blocks.N" (N=0..3)
+
+
+# Alternate training schedule
+
+
+# Optimizers
+# v5-R: gradient accumulation bug fixed (effective_batch_size now really
+# applies, real batch = 4 instead of 1). LR scaled conservatively via the
+# sqrt rule for Adam-family optimizers (x2 for unet/controlnet); lr_sr
+# bumped less aggressively since it starts from SwinIR pretrained weights.
+optimizer:
+  lr_unet: 2.0e-05
+  lr_controlnet: 2.0e-04
+  weight_decay: 1.0e-02
+
+  lr_sr: 2.0e-04
+  weight_decay_sr: 0.0
+
+
+# LR scheduler (cosine annealing, shared T_max = max_iter)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader
+dataloader:
+  effective_batch_size: 4
+  max_train_batch_size: 1
+  seed: 2024
+
+
+# Trainer
+trainer:
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # PS source probabilities per batch (mutually exclusive):
+  #   p_null_drop → null PS token (modality dropout)
+  #   p_pseudo_ps → SR-generated pseudo-PS
+  #   remainder   → real PS
+  p_null_drop: 0.0
+  p_pseudo_ps: 1.0
+
+  bridge_sigma: 0.3
+
+  # Steps before TDP loss is activated (pixel-only warmup)
+  warmup_sr_steps: 200
+
+  concat_landsat_hr: True
+
+
+# Validation / inference
+validation:
+  n_steps: 4
+  method: euler
+  # True  → validation uses SR pseudo-PS via refine_with_ps()
+  # False → validation uses null PS via refine() (baseline comparison)
+  use_sr_pseudo_ps: True
+  n_avg: 5
+
+
+# Training budget
+max_epoch: 1000
+max_iter: 100000
+
+
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

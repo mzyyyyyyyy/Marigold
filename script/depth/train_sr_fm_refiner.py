@@ -158,6 +158,15 @@ def _load_target_stats(stats_file: str, year: int) -> dict:
     return all_stats[str(year)]
 
 
+def _denormalize_target(h: torch.Tensor, target_stats: dict) -> torch.Tensor:
+    """[-1, 1] -> metres, inverse of _normalize_coarse (matches train_fm_refiner.py)."""
+    p1 = float(target_stats["p1"][0])
+    p99 = float(target_stats["p99"][0])
+    h = (h.float() + 1.0) / 2.0        # [0, 1]
+    h = h * (p99 - p1) + p1             # metres
+    return h
+
+
 # -------------------------------------------------------------------------
 # Validation
 # -------------------------------------------------------------------------
@@ -243,8 +252,10 @@ def validate(
         else:
             h_fine = _run_refine()
 
-        all_preds.append(h_fine.cpu().flatten())
-        all_gts.append(targets.cpu().flatten())
+        pred_m = _denormalize_target(h_fine, target_stats)
+        gt_m = _denormalize_target(targets, target_stats)
+        all_preds.append(pred_m.cpu().flatten())
+        all_gts.append(gt_m.cpu().flatten())
 
         if len(vis_samples) < n_vis_samples:
             pseudo_ps_vis = ps_vis
@@ -510,7 +521,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v5-R.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v5-R2.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
