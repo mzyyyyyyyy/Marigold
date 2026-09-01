@@ -23,6 +23,7 @@ import copy
 import json
 import logging
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -47,7 +48,7 @@ from depthfm.sr_module import SRModule, build_sr_module
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
 from src.util.ps_lazydataset import LazyPatchDataset
-from src.util.seeding import generate_seed_sequence
+from src.util.seeding import seed_all
 
 
 # -------------------------------------------------------------------------
@@ -521,7 +522,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v5-R2.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v5-R3.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -572,6 +573,23 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     logging.info(f"device = {device}")
 
+    # ---- Seeding (reproducibility) ----
+    base_seed = int(cfg.dataloader.seed)
+    seed_all(base_seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    logging.info(f"Global seed = {base_seed} (cudnn deterministic=True, benchmark=False)")
+
+    def _worker_init_fn(worker_id: int):
+        # DataLoader auto-reseeds torch's RNG per worker, but NOT Python's
+        # `random` or numpy — LazyPatchDataset uses `random.randint`/`random.choice`
+        # for patch sampling, so without this, worker processes (forked) can
+        # share correlated `random` state across runs/machines.
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     # ---- Data ----
     cfg_data = cfg.dataset
     eff_bs = cfg.dataloader.effective_batch_size
@@ -619,9 +637,12 @@ if __name__ == "__main__":
     val_dataset   = _make_dataset(base_dataset, val_coords,   'val',   1)
 
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True,
-                              num_workers=cfg_data.workers, pin_memory=True)
+                              num_workers=cfg_data.workers, pin_memory=True,
+                              worker_init_fn=_worker_init_fn,
+                              generator=torch.Generator().manual_seed(base_seed))
     val_loader   = DataLoader(val_dataset,   batch_size=1, shuffle=False,
-                              num_workers=cfg_data.workers, pin_memory=True)
+                              num_workers=cfg_data.workers, pin_memory=True,
+                              worker_init_fn=_worker_init_fn)
 
     # ---- Models ----
     n_landsat_bands = len(cfg_data.selected_bands)
@@ -633,6 +654,7 @@ if __name__ == "__main__":
         n_ps_bands=n_ps_bands,
         ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
         bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
+        sample_sigma=cfg.trainer.get("sample_sigma", None),
         concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
         refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
         concat_landsat_hr=cfg.trainer.get("concat_landsat_hr", False),

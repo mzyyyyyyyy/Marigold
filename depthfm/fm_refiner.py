@@ -39,6 +39,7 @@ class FMRefiner(nn.Module):
         empty_text_embed: torch.Tensor,
         ps_dropout_p: float = 0.3,
         bridge_sigma: float = 0.0,
+        sample_sigma: Optional[float] = None,
         concat_z_coarse: bool = False,
         refine_threshold: float = 0.0,
         concat_landsat_hr: bool = False,
@@ -53,6 +54,10 @@ class FMRefiner(nn.Module):
 
         self.ps_dropout_p = ps_dropout_p
         self.bridge_sigma = bridge_sigma
+        # Noise scale used only at sampling time in refine(). Defaults to
+        # bridge_sigma (old behaviour). Set to 0.0 for deterministic ODE
+        # inference regardless of the training-time bridge noise.
+        self.sample_sigma = bridge_sigma if sample_sigma is None else sample_sigma
         self.concat_z_coarse = concat_z_coarse
         # If True, ControlNet conditioning is cat([landsat_hr, ps_cond], dim=1)
         # instead of ps_cond alone (ControlNet must be built with matching n_cond_channels).
@@ -156,12 +161,21 @@ class FMRefiner(nn.Module):
         else:
             mask_lat = None
 
-        # Bridge Matching: add noise proportional to sqrt(t*(1-t)) at midpoint.
+        # Stochastic-interpolant bridge: z_t = (1-t)*z_coarse + t*z_gt + gamma(t)*eps.
+        # gamma(t) = sigma*t*(1-t) (smooth, zero-derivative-free at t=0/1 — no 1/sqrt
+        # singularity like the Brownian-bridge sqrt(t(1-t)) schedule).
+        # The velocity target MUST include gamma'(t)*eps so that the deterministic
+        # ODE of the learned field reproduces the true marginal path of this noisy
+        # interpolant (Albergo & Vanden-Eijnden, Stochastic Interpolants). Dropping
+        # this term (as before) makes the target independent of eps, which biases
+        # the learned field towards an eps-averaged (blurred) direction.
         if self.bridge_sigma > 0.0:
             eps = torch.randn_like(z_coarse)
-            noise_scale = self.bridge_sigma * torch.sqrt(t4 * (1.0 - t4))
+            gamma_dot = self.bridge_sigma * (1.0 - 2.0 * t4)          # d/dt [sigma*t*(1-t)]
+            noise_scale = self.bridge_sigma * t4 * (1.0 - t4)          # gamma(t)
             z_t = (1.0 - t4) * z_coarse + t4 * z_gt + noise_scale * eps
         else:
+            gamma_dot = None
             z_t = (1.0 - t4) * z_coarse + t4 * z_gt
 
         # Selective refinement: for easy pixels (mask=0), fix z_t = z_coarse and v_target = 0.
@@ -169,8 +183,12 @@ class FMRefiner(nn.Module):
         if mask_lat is not None:
             z_t      = z_t * mask_lat + z_coarse * (1.0 - mask_lat)
             v_target = (z_gt - z_coarse) * mask_lat
+            if gamma_dot is not None:
+                v_target = v_target + (gamma_dot * eps) * mask_lat
         else:
             v_target = z_gt - z_coarse
+            if gamma_dot is not None:
+                v_target = v_target + gamma_dot * eps
 
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
         t_int    = (t * 999).long()
@@ -300,9 +318,11 @@ class FMRefiner(nn.Module):
                 z  = z + dt * 0.5 * (v1 + v2)
             else:
                 z = z + dt * v1
-            # SDE noise injection (skip on last step to avoid noise at t=1)
-            if self.bridge_sigma > 0.0 and not is_last:
-                z = z + self.bridge_sigma * (dt ** 0.5) * torch.randn_like(z)
+            # SDE noise injection (skip on last step to avoid noise at t=1).
+            # Uses sample_sigma (independent of the training-time bridge_sigma) so
+            # inference determinism can be controlled without retraining.
+            if self.sample_sigma > 0.0 and not is_last:
+                z = z + self.sample_sigma * (dt ** 0.5) * torch.randn_like(z)
 
         return self.decode(z)
 
@@ -341,6 +361,7 @@ def build_fm_refiner(
     n_ps_bands: int,
     ps_dropout_p: float = 0.3,
     bridge_sigma: float = 0.0,
+    sample_sigma: Optional[float] = None,
     concat_z_coarse: bool = False,
     refine_threshold: float = 0.0,
     device: str = "cuda",
@@ -398,6 +419,7 @@ def build_fm_refiner(
         empty_text_embed=empty_text_embed,
         ps_dropout_p=ps_dropout_p,
         bridge_sigma=bridge_sigma,
+        sample_sigma=sample_sigma,
         concat_z_coarse=concat_z_coarse,
         refine_threshold=refine_threshold,
         concat_landsat_hr=concat_landsat_hr,
