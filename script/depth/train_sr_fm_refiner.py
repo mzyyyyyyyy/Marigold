@@ -946,11 +946,32 @@ if __name__ == "__main__":
     # ---- LR schedulers ----
     lr_scheduler_fm, lr_scheduler_sr = None, None
     if cfg.get("lr_scheduler") is not None:
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-        lr_scheduler_fm = CosineAnnealingLR(optimizer_fm, T_max=cfg.max_iter,
-                                             eta_min=cfg.lr_scheduler.eta_min)
-        lr_scheduler_sr = CosineAnnealingLR(optimizer_sr, T_max=cfg.max_iter,
-                                             eta_min=cfg.lr_scheduler.eta_min)
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+        def _build_scheduler(optimizer):
+            warmup_steps = int(cfg.lr_scheduler.get("warmup_steps", 0))
+            if warmup_steps <= 0:
+                return CosineAnnealingLR(optimizer, T_max=cfg.max_iter,
+                                          eta_min=cfg.lr_scheduler.eta_min)
+            # Ramp linearly from 1% of each param group's target LR up to
+            # 100% over warmup_steps real optimizer steps, then hand off to
+            # the cosine decay for the remaining max_iter - warmup_steps
+            # (T_max is the post-warmup remainder, not max_iter itself, so
+            # the decay still actually reaches eta_min by the last step
+            # instead of stopping partway down the curve). Not auto-scaled
+            # by total_scale like max_iter/etc — warmup length is about how
+            # many real weight updates it takes to trust a given (possibly
+            # LR-scaled-up) step size, which isn't the same "same total
+            # data" bookkeeping those other knobs do.
+            warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
+                               total_iters=warmup_steps)
+            cosine = CosineAnnealingLR(optimizer, T_max=max(1, cfg.max_iter - warmup_steps),
+                                        eta_min=cfg.lr_scheduler.eta_min)
+            return SequentialLR(optimizer, schedulers=[warmup, cosine],
+                                 milestones=[warmup_steps])
+
+        lr_scheduler_fm = _build_scheduler(optimizer_fm)
+        lr_scheduler_sr = _build_scheduler(optimizer_sr)
 
     # ---- Resume ----
     start_step = 0

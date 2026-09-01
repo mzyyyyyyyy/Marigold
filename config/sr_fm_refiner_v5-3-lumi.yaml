@@ -3,7 +3,7 @@ base_config:
 
 wandb:
   project: marigold
-  name: sr_fm_refiner_v5-1-lumi
+  name: sr_fm_refiner_v5-3-lumi
 
 # Dataset config – same as fm_refiner_v4.yaml
 dataset:
@@ -97,35 +97,44 @@ sr_loss:
 
 # Optimizers
 #
-# This config trains at real batch 64 (max_train_batch_size=1 x 64 ranks —
-# see dataloader: below), versus the single-GPU v5-1 config's real batch of
-# 4 (max_train_batch_size=1 x 4 local accumulation steps, x1 rank). A 16x
-# larger batch with unscaled LR and proportionally fewer optimizer steps
-# (max_iter is auto-divided by accumulation_steps x world_size at runtime —
-# see train_sr_fm_refiner.py's total_scale block) undertrains relative to
-# the single-GPU run: investigation on 2026-08-18 found the plain v5-1 config
-# run unchanged on 64 GPUs (real batch 64, LR unchanged) finished at
-# R²=0.7535, versus 0.7812 for the single-GPU run at real batch 4 —
-# consistent with the classic "larger batch, same LR, fewer optimizer steps
-# ⇒ undertrained" effect (Goyal et al., "Accurate, Large Minibatch SGD").
-# LRs below are scaled by sqrt(64/4)=sqrt(16)=4 (not the full
-# linear-scaling-rule 16x) — AdamW's per-parameter adaptive scaling makes
-# it less batch-sensitive than plain SGD, and these are small fine-tuning
-# LRs on a pretrained UNet+ControlNet+SwinIR-SR stack where a full 16x jump
-# risks destabilizing training. There's no LR warmup in this script
-# (CosineAnnealingLR starts straight from the base LR at step 0) — if
-# training looks unstable in the first handful of steps, that's the first
-# thing to add, not just tuning these numbers further.
+# v5-3-lumi vs v5-1-lumi/v5-2-lumi: same real batch (64), no warmup (same
+# as v5-1-lumi — CosineAnnealingLR starts straight at the base LR from step
+# 0). Only LR changes: 6x instead of v5-1-lumi's 4x or v5-2-lumi's 8x.
+#
+# Full-curve comparison (2026-08-19) at matched steps, v5-1-lumi (4x, no
+# warmup) vs v5-2-lumi (8x, 50-step warmup):
+#   step  105: 0.7211 vs 0.6323      step  900: 0.7587 vs 0.6991
+#   step  300: 0.7594 vs 0.6090      step 1230: 0.7808 vs 0.6996
+#   step  600: 0.7445 vs 0.6540      step 1305: 0.7869 vs 0.7156 (v5-1 peak)
+#   final (best-ckpt full val):      0.7709 vs 0.7125
+# The gap opens by step ~105 (right as warmup hands off to steady-state LR
+# in v5-2-lumi) and stays ~0.10-0.15 for essentially the whole run, not
+# just the first few hundred steps — a warmup-implementation bug would only
+# have affected the first 50 steps, and a from-scratch check of the actual
+# scheduler code (constructing the same LinearLR+CosineAnnealingLR+
+# SequentialLR chain and printing the LR trajectory) confirmed warmup ran
+# correctly: 1% at step 0 -> 100% at step 50, smooth cosine handoff after.
+# So the 8x steady-state LR itself, not the warmup mechanism, is what hurt
+# v5-2-lumi — meaning 8x was already past the useful range for these small
+# AdamW fine-tuning LRs, not a safe "geometric mean" waypoint toward 16x as
+# hypothesized when v5-2-lumi was designed.
+#
+# 4x and 8x are the only two LR points tested so far — one good, one
+# clearly worse, nothing in between — so it's unknown whether going from 4x
+# to 8x degrades gradually or falls off a cliff somewhere in between. 6x
+# (no warmup, isolating LR magnitude as the only variable vs v5-1-lumi)
+# fills that gap directly.
 optimizer:
-  lr_unet: 4.0e-05        # 1.0e-05 x4
-  lr_controlnet: 4.0e-04  # 1.0e-04 x4
+  lr_unet: 6.0e-05        # 1.0e-05 x6
+  lr_controlnet: 6.0e-04  # 1.0e-04 x6
   weight_decay: 1.0e-02
 
-  lr_sr: 8.0e-04           # 2.0e-04 x4
+  lr_sr: 1.2e-03           # 2.0e-04 x6
   weight_decay_sr: 0.0
 
 
-# LR scheduler (cosine annealing, shared T_max = max_iter)
+# LR scheduler (cosine annealing, shared T_max = max_iter, no warmup — same
+# as v5-1-lumi, unlike v5-2-lumi)
 lr_scheduler:
   eta_min: 1.0e-07
 
@@ -144,8 +153,8 @@ dataloader:
   #
   # max_train_batch_size=1 x 64 ranks = 64 real batch (train_sr_fm_refiner.py
   # logs this exact line at startup so you can sanity-check it against
-  # whatever you set here). The optimizer LRs below are tuned for this
-  # real batch of 64 specifically — see the comment above optimizer:.
+  # whatever you set here). The optimizer LRs above are tuned for this
+  # real batch of 64 specifically.
   max_train_batch_size: 1
   seed: 2024
 
@@ -166,8 +175,8 @@ trainer:
   bridge_sigma: 0.5
 
   # Steps before TDP loss is activated (pixel-only warmup). Unrelated to LR
-  # warmup (there isn't any) — this just delays the ControlNet feature loss
-  # term. Scaled down at runtime same as v5-1 (see train_sr_fm_refiner.py's
+  # warmup above — this just delays the ControlNet feature loss term.
+  # Scaled down at runtime same as v5-1 (see train_sr_fm_refiner.py's
   # total_scale block), so left as-is here.
   warmup_sr_steps: 200
 
@@ -190,8 +199,10 @@ validation:
 # max_iter is scaled down by accumulation_steps x world_size at runtime
 # (see train_sr_fm_refiner.py's total_scale block) so 64 GPUs cover the
 # same total data/wall-clock as a config training at real batch =
-# max_train_batch_size alone — left as 100000 here, same as v5-1, on
-# purpose; this file only changes batch/LR, not that scaling strategy.
+# max_train_batch_size alone — left as 100000 here, same as v5-1/v5-1-lumi/
+# v5-2-lumi, on purpose; this file only changes LR, not that scaling
+# strategy (real steps still end up ~1562, same as the other two lumi
+# configs, so this stays a clean apples-to-apples comparison).
 max_epoch: 1000
 max_iter: 100000
 

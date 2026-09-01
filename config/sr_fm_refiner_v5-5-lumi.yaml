@@ -3,7 +3,7 @@ base_config:
 
 wandb:
   project: marigold
-  name: sr_fm_refiner_v5-1-lumi
+  name: sr_fm_refiner_v5-5-lumi
 
 # Dataset config – same as fm_refiner_v4.yaml
 dataset:
@@ -97,35 +97,19 @@ sr_loss:
 
 # Optimizers
 #
-# This config trains at real batch 64 (max_train_batch_size=1 x 64 ranks —
-# see dataloader: below), versus the single-GPU v5-1 config's real batch of
-# 4 (max_train_batch_size=1 x 4 local accumulation steps, x1 rank). A 16x
-# larger batch with unscaled LR and proportionally fewer optimizer steps
-# (max_iter is auto-divided by accumulation_steps x world_size at runtime —
-# see train_sr_fm_refiner.py's total_scale block) undertrains relative to
-# the single-GPU run: investigation on 2026-08-18 found the plain v5-1 config
-# run unchanged on 64 GPUs (real batch 64, LR unchanged) finished at
-# R²=0.7535, versus 0.7812 for the single-GPU run at real batch 4 —
-# consistent with the classic "larger batch, same LR, fewer optimizer steps
-# ⇒ undertrained" effect (Goyal et al., "Accurate, Large Minibatch SGD").
-# LRs below are scaled by sqrt(64/4)=sqrt(16)=4 (not the full
-# linear-scaling-rule 16x) — AdamW's per-parameter adaptive scaling makes
-# it less batch-sensitive than plain SGD, and these are small fine-tuning
-# LRs on a pretrained UNet+ControlNet+SwinIR-SR stack where a full 16x jump
-# risks destabilizing training. There's no LR warmup in this script
-# (CosineAnnealingLR starts straight from the base LR at step 0) — if
-# training looks unstable in the first handful of steps, that's the first
-# thing to add, not just tuning these numbers further.
+# v5-5-lumi vs v5-3-lumi: identical LR (6x v5-1's base LRs), no warmup.
+# Only trainer.bridge_sigma changes (0.5 -> 0.3, see trainer: below).
 optimizer:
-  lr_unet: 4.0e-05        # 1.0e-05 x4
-  lr_controlnet: 4.0e-04  # 1.0e-04 x4
+  lr_unet: 6.0e-05        # 1.0e-05 x6, same as v5-3-lumi
+  lr_controlnet: 6.0e-04  # 1.0e-04 x6, same as v5-3-lumi
   weight_decay: 1.0e-02
 
-  lr_sr: 8.0e-04           # 2.0e-04 x4
+  lr_sr: 1.2e-03           # 2.0e-04 x6, same as v5-3-lumi
   weight_decay_sr: 0.0
 
 
-# LR scheduler (cosine annealing, shared T_max = max_iter)
+# LR scheduler (cosine annealing, shared T_max = max_iter, no warmup — same
+# as v5-3-lumi)
 lr_scheduler:
   eta_min: 1.0e-07
 
@@ -144,8 +128,8 @@ dataloader:
   #
   # max_train_batch_size=1 x 64 ranks = 64 real batch (train_sr_fm_refiner.py
   # logs this exact line at startup so you can sanity-check it against
-  # whatever you set here). The optimizer LRs below are tuned for this
-  # real batch of 64 specifically — see the comment above optimizer:.
+  # whatever you set here). The optimizer LRs above are tuned for this
+  # real batch of 64 specifically.
   max_train_batch_size: 1
   seed: 2024
 
@@ -163,12 +147,29 @@ trainer:
   p_null_drop: 0.0
   p_pseudo_ps: 0.3
 
-  bridge_sigma: 0.5
+  # 0.5 -> 0.3 (only change vs v5-3-lumi). bridge_sigma scales the SDE-style
+  # Gaussian noise injected at every intermediate step of the bridge/flow
+  # sampling process — both during training's forward pass (fm_refiner.py's
+  # FMRefiner.forward, noise_scale = bridge_sigma * sqrt(t*(1-t))) and
+  # during refine()/refine_with_ps() sampling at validation/inference time
+  # (z = z + bridge_sigma * sqrt(dt) * randn_like(z) each step, skipped on
+  # the last step). Lower sigma -> less stochasticity injected at every
+  # step, on both sides:
+  #  - training: a less noisy bridge trajectory between coarse and target,
+  #    which changes what the model is actually being asked to learn to
+  #    invert, not just how noisy the optimization is — unlike the
+  #    accumulation_steps/LR-batch stuff, this isn't purely an optimizer
+  #    knob, it changes the training objective's noise level itself.
+  #  - validation/inference: less run-to-run randomness in the reported R²
+  #    (see the un-seeded-RNG discussion — n_avg=5 already averages this
+  #    down some, but doesn't remove it; lower bridge_sigma shrinks the
+  #    per-sample noise being averaged over in the first place).
+  bridge_sigma: 0.3
 
   # Steps before TDP loss is activated (pixel-only warmup). Unrelated to LR
-  # warmup (there isn't any) — this just delays the ControlNet feature loss
-  # term. Scaled down at runtime same as v5-1 (see train_sr_fm_refiner.py's
-  # total_scale block), so left as-is here.
+  # warmup — this just delays the ControlNet feature loss term. Scaled down
+  # at runtime same as v5-1 (see train_sr_fm_refiner.py's total_scale
+  # block), so left as-is here.
   warmup_sr_steps: 200
 
   # ControlNet conditioning = concat(landsat_hr, ps) (6 channels) instead of
@@ -190,8 +191,10 @@ validation:
 # max_iter is scaled down by accumulation_steps x world_size at runtime
 # (see train_sr_fm_refiner.py's total_scale block) so 64 GPUs cover the
 # same total data/wall-clock as a config training at real batch =
-# max_train_batch_size alone — left as 100000 here, same as v5-1, on
-# purpose; this file only changes batch/LR, not that scaling strategy.
+# max_train_batch_size alone — left as 100000 here, same as the other lumi
+# configs, on purpose; this file only changes bridge_sigma, not that
+# scaling strategy (real steps still end up ~1562, so this stays a clean
+# apples-to-apples comparison against v5-3-lumi).
 max_epoch: 1000
 max_iter: 100000
 
