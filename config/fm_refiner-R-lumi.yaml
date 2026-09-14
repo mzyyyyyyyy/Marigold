@@ -114,6 +114,7 @@ dataloader:
   # max_train_batch_size=2 x 64 ranks = 128 real batch (train_fm_refiner.py
   # logs this exact line at startup so you can sanity-check it against
   # whatever you set here).
+  effective_batch_size: 2
   max_train_batch_size: 2
   seed: 2024
 
