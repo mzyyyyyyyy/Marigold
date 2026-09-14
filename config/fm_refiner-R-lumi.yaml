@@ -1,0 +1,146 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: fm_refiner-R-lumi
+
+# Dataset config – same as fm_refiner-R.yaml, paths moved to LUMI's Flash
+# storage (/mnt/data/... on the single-GPU server -> /flash/project_465002934/...
+# here). Data must be copied/synced to these paths on LUMI before running.
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord/save_20260609.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+
+# Optimizer
+#
+# This config trains at real batch 128 (max_train_batch_size=2 x 64 ranks —
+# see dataloader: below), versus the single-GPU fm_refiner-R config's real
+# batch of 8 (max_train_batch_size=2 x 4 local accumulation steps, x1 rank).
+# A 16x larger batch with unscaled LR and proportionally fewer optimizer
+# steps (max_iter is auto-divided by accumulation_steps x world_size at
+# runtime — see train_fm_refiner.py's total_scale block) risks undertraining
+# relative to the single-GPU run (see train_sr_fm_refiner.sh / sr_fm_refiner
+# v5-1-lumi.yaml for the analogous effect observed there). LRs below are
+# scaled by sqrt(64/4)=4 (not the full linear-scaling-rule 16x) — AdamW's
+# per-parameter adaptive scaling makes it less batch-sensitive than plain
+# SGD, and these are fine-tuning LRs on a pretrained UNet+ControlNet stack
+# where a full 16x jump risks destabilizing training. Treat this as a
+# starting point, not a validated value — re-tune against a single-GPU
+# fm_refiner-R run the way sr_fm_refiner_v5-1-lumi.yaml was.
+optimizer:
+  lr_unet: 4.0e-05        # 1.0e-05 x4
+  lr_controlnet: 4.0e-04  # 1.0e-04 x4
+  weight_decay: 1.0e-02
+
+
+# LR scheduler (cosine annealing)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader
+dataloader:
+  # No effective_batch_size here on purpose (unlike fm_refiner-R.yaml): that
+  # field only exists to simulate a larger batch via *local* gradient
+  # accumulation on a single GPU. A multi-GPU config doesn't need it — DDP's
+  # cross-rank gradient averaging already provides a real multiplier of
+  # exactly world_size (64, fixed by --nodes/--ntasks-per-node in
+  # train_fm_refiner.sh, not a yaml setting) for free. So on this config
+  # max_train_batch_size is the only batch-size knob:
+  #
+  #     real batch per optimizer step = max_train_batch_size x 64
+  #
+  # max_train_batch_size=2 x 64 ranks = 128 real batch (train_fm_refiner.py
+  # logs this exact line at startup so you can sanity-check it against
+  # whatever you set here).
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  use_controlnet: True
+  controlnet_cond_mode: "landsat_ps"  # ControlNet takes Landsat HR only, no PlanetScope
+  ps_dropout_p: 0.3       # probability of replacing PS with null token
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+
+# Validation / inference
+validation:
+  n_steps: 1              # Euler integration steps (1–4); 1 is fastest
+
+
+# Training budget
+# max_iter is scaled down by accumulation_steps x world_size at runtime
+# (see train_fm_refiner.py's total_scale block) so 64 GPUs cover the same
+# total data/wall-clock as a config training at real batch =
+# max_train_batch_size alone — left as 50000 here, same as fm_refiner-R.yaml,
+# on purpose; this file only changes batch/LR, not that scaling strategy.
+max_epoch: 1000
+max_iter: 50000
+
+
+# Eval metrics logged during validation
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

@@ -8,14 +8,24 @@ Pipeline:
   v_pred = UNet(z_t, t) + ControlNet(Landsat_HR, PS_or_null)
   loss = MSE(v_pred, z_gt - z_coarse)
 
-Usage:
+Usage (single GPU):
   python script/depth/train_fm_refiner.py --config config/fm_refiner.yaml
+
+Usage (multi-GPU, standard DDP, e.g. 8 GPUs via srun -n8):
+  Reads SLURM_PROCID / SLURM_NTASKS / SLURM_LOCALID from the environment
+  automatically (mirroring infer_fm_refiner.py), no extra flags needed — see
+  script/depth/train_fm_refiner.sh. unet/controlnet are DDP-wrapped; data is
+  sharded via DistributedSampler; validation runs sharded across all ranks
+  (parallel inference) and is gathered to rank0, which alone handles
+  logging/wandb/checkpointing.
 """
 
+import contextlib
 import copy
 import json
 import logging
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -26,11 +36,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from datetime import datetime, timedelta
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
@@ -150,36 +164,61 @@ def _make_vis_figure(samples: list) -> plt.Figure:
 def validate(
     fm_refiner: FMRefiner,
     dav2_model,
-    val_loader: DataLoader,
+    val_dataset,
     device: torch.device,
     n_steps: int,
     target_stats: dict,
     n_landsat_bands: int,
-    val_offset: int = 0,           # rotating start index into val_loader
+    val_offset: int = 0,           # rotating start index into val_dataset
     n_vis_samples: int = 5,        # how many samples to visualize
-    full: bool = False,            # if True, iterate entire val_loader
+    full: bool = False,            # if True, iterate entire val_dataset
     method: str = "euler",         # integration method: "euler" or "heun"
+    global_rank: int = 0,
+    world_size: int = 1,
+    is_distributed: bool = False,
+    num_workers: int = 0,
 ) -> tuple:
     """
-    Returns (metrics_dict, wandb_figure_or_None).
+    Runs validation in parallel across all ranks: every rank forwards its own
+    shard of a deterministic index window through its local raw (non-DDP)
+    modules — no gradients, so no DDP participation is needed — and
+    per-sample predictions are gathered to rank0, which computes the
+    aggregate metrics. Non-rank0 callers get back (None, None).
 
-    Subset mode: iterates val_subset_size batches starting from val_offset,
+    Subset mode: iterates a val_subset_size window starting from val_offset,
     wrapping around circularly.  full=True ignores offset and iterates all.
     """
+    # Always run validation through the raw (non-DDP) modules: DDP's forward
+    # hooks assume every rank calls it in lockstep for gradient sync, which
+    # doesn't apply here (no backward pass, independent per-rank shards).
+    orig_unet, orig_controlnet = fm_refiner.unet, fm_refiner.controlnet
+    fm_refiner.unet = _raw(orig_unet)
+    if orig_controlnet is not None:
+        fm_refiner.controlnet = _raw(orig_controlnet)
+
     fm_refiner.eval()
     all_preds, all_gts = [], []
     vis_samples = []
 
-    val_list = list(val_loader)
-    n_total = len(val_list)
+    # Every rank computes the identical (deterministic) index window, then
+    # takes a disjoint shard of it — this keeps ranks in sync without
+    # needing to broadcast anything, and without duplicating/missing
+    # samples. Indices are resolved to actual data via a small on-demand
+    # DataLoader over just this shard's Subset, so only the handful of
+    # samples this rank actually needs get read off disk — not the full
+    # val_dataset (which materializing a val_loader up front would force
+    # on every rank, every validation call).
+    n_total = len(val_dataset)
     if full:
-        batches = val_list
+        indices = list(range(n_total))
     else:
         subset_size = max(1, n_total // 10)
         indices = [(val_offset + i) % n_total for i in range(subset_size)]
-        batches = [val_list[i] for i in indices]
+    local_indices = indices[global_rank::world_size] if is_distributed else indices
+    local_loader = DataLoader(Subset(val_dataset, local_indices), batch_size=1,
+                               shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    for batch in tqdm(batches, desc="Validation", leave=False):
+    for batch in tqdm(local_loader, desc="Validation", leave=False, disable=(global_rank != 0)):
         inputs_lr, inputs_hr, targets = batch
         if inputs_lr.dim() == 5:
             inputs_lr = inputs_lr.squeeze(0)
@@ -218,13 +257,35 @@ def validate(
                 "gt":      _to_vis_depth(targets[0]),
             })
 
-    pred_cat = torch.cat(all_preds, dim=0)
-    gt_cat = torch.cat(all_gts, dim=0)
-    metrics = compute_metrics(pred_cat, gt_cat)
-
-    fig = _make_vis_figure(vis_samples) if vis_samples else None
+    pred_local = torch.cat(all_preds, dim=0) if all_preds else torch.empty(0)
+    gt_local   = torch.cat(all_gts, dim=0)   if all_gts   else torch.empty(0)
 
     fm_refiner.train()
+    # Restore the (possibly DDP-wrapped) modules used for training.
+    fm_refiner.unet, fm_refiner.controlnet = orig_unet, orig_controlnet
+
+    if is_distributed:
+        # NCCL doesn't implement the point-to-point gather primitive, so use
+        # all_gather_object (backed by all_gather, which NCCL does support)
+        # even though only rank0 ends up using the result — every rank must
+        # still pre-allocate the output list and call this collectively.
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, (pred_local, gt_local, vis_samples))
+        if global_rank != 0:
+            return None, None
+        pred_cat = torch.cat([g[0] for g in gathered if g[0].numel() > 0], dim=0)
+        gt_cat   = torch.cat([g[1] for g in gathered if g[1].numel() > 0], dim=0)
+        vis_samples = []
+        for g in gathered:
+            vis_samples.extend(g[2])
+            if len(vis_samples) >= n_vis_samples:
+                break
+        vis_samples = vis_samples[:n_vis_samples]
+    else:
+        pred_cat, gt_cat = pred_local, gt_local
+
+    metrics = compute_metrics(pred_cat, gt_cat)
+    fig = _make_vis_figure(vis_samples) if vis_samples else None
     return metrics, fig
 
 
@@ -259,14 +320,21 @@ def _load_target_stats(stats_file: str, year: int) -> dict:
 # Checkpoint helpers
 # -------------------------------------------------------------------------
 
+def _raw(module: nn.Module) -> nn.Module:
+    """Unwrap a DDP-wrapped module to the underlying module (shares the same
+    parameter tensors), so state_dict() keys stay unprefixed regardless of
+    whether distributed training is active."""
+    return module.module if isinstance(module, DDP) else module
+
+
 def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_dir, name="latest"):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.pth")
     torch.save({
         "step": step,
         "use_controlnet": fm_refiner.use_controlnet,
-        "unet_state": fm_refiner.unet.state_dict(),
-        "controlnet_state": fm_refiner.controlnet.state_dict() if fm_refiner.use_controlnet else None,
+        "unet_state": _raw(fm_refiner.unet).state_dict(),
+        "controlnet_state": _raw(fm_refiner.controlnet).state_dict() if fm_refiner.use_controlnet else None,
         "null_ps_state": fm_refiner._null_ps,
         "optimizer_state": optimizer.state_dict(),
         "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
@@ -276,15 +344,38 @@ def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_di
 
 def load_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, path):
     ckpt = torch.load(path, map_location="cpu")
-    fm_refiner.unet.load_state_dict(ckpt["unet_state"])
+    _raw(fm_refiner.unet).load_state_dict(ckpt["unet_state"])
     if fm_refiner.use_controlnet and ckpt.get("controlnet_state") is not None:
-        fm_refiner.controlnet.load_state_dict(ckpt["controlnet_state"])
+        _raw(fm_refiner.controlnet).load_state_dict(ckpt["controlnet_state"])
     if ckpt.get("null_ps_state") is not None:
         fm_refiner._null_ps = ckpt["null_ps_state"]
     optimizer.load_state_dict(ckpt["optimizer_state"])
     if lr_scheduler and ckpt.get("lr_scheduler_state"):
         lr_scheduler.load_state_dict(ckpt["lr_scheduler_state"])
     return ckpt["step"]
+
+
+@contextlib.contextmanager
+def _maybe_no_sync(modules, skip_sync: bool):
+    """Suppress DDP's gradient all-reduce on non-final micro-batches of a
+    gradient-accumulation window.
+
+    DDP triggers an all-reduce on every .backward() call by default, which
+    would average+sync gradients after each individual micro-batch instead
+    of once per real optimizer step — wasteful (accumulation_steps-1 extra
+    rounds of communication per step) and, if zero_grad() isn't also called
+    each time, redundant on top of the local accumulation. `.no_sync()`
+    defers the all-reduce to the next backward() outside this context, so
+    gradients accumulate locally across the window and get averaged across
+    ranks exactly once, on the final micro-batch.
+    """
+    if not skip_sync:
+        yield
+        return
+    with contextlib.ExitStack() as stack:
+        for m in modules:
+            stack.enter_context(m.no_sync())
+        yield
 
 
 # -------------------------------------------------------------------------
@@ -307,6 +398,72 @@ if __name__ == "__main__":
     parser.add_argument("--add_datetime_prefix", action="store_true")
     args = parser.parse_args()
 
+    # ---- Distributed setup (mirrors infer_fm_refiner.py's SLURM env reading) ----
+    # global_rank/world_size come from SLURM_PROCID/SLURM_NTASKS (srun sets one
+    # task per GPU); local_rank (SLURM_LOCALID) selects the GPU on this node.
+    global_rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", 0)))
+    world_size  = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", 1)))
+    local_rank  = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", 0)))
+    is_distributed  = world_size > 1
+    is_main_process = global_rank == 0
+
+    # Every rank builds its own full copy of LazyPatchDataset (needed for its
+    # DataLoader), whose __init__ is chatty (print() + several tqdm bars over
+    # every patch). Left unguarded, world_size copies of that output interleave
+    # into one stderr/stdout stream. Since the dataset construction is
+    # identical on every rank, only rank0's copy of the output is useful —
+    # silence print() and disable tqdm rendering everywhere else.
+    if not is_main_process:
+        sys.stdout = open(os.devnull, "w")
+        import functools
+        import src.util.ps_lazydataset as _pld
+        _pld.tqdm = functools.partial(_pld.tqdm, disable=True)
+
+    if is_distributed:
+        # MASTER_ADDR should be set by the launch script for multi-node runs
+        # (e.g. the first node's hostname); defaults to localhost for a
+        # single-node, multi-GPU srun/torchrun launch.
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        backend = "nccl" if (torch.cuda.is_available() and not args.no_cuda) else "gloo"
+        dist.init_process_group(
+            backend=backend, rank=global_rank, world_size=world_size,
+            timeout=timedelta(minutes=2),
+        )
+
+    # ---- Device ----
+    if torch.cuda.is_available() and not args.no_cuda:
+        n_visible = torch.cuda.device_count()
+        device_index = local_rank % n_visible if n_visible > 0 else 0
+        torch.cuda.set_device(device_index)
+        device = torch.device(f"cuda:{device_index}")
+        gpu_name = torch.cuda.get_device_name(device_index)
+    else:
+        n_visible = 0
+        device = torch.device("cpu")
+        gpu_name = "cpu"
+    # print (not logging.info — no handler is configured yet at this point,
+    # and Python's logging silently drops INFO records without one) to
+    # sys.stderr (not stdout — non-rank0 stdout is redirected to devnull
+    # above) so every rank's GPU binding is visible for sanity-checking that
+    # DDP is actually spread across distinct physical GPUs.
+    print(
+        f"[rank {global_rank}/{world_size}] SLURM_LOCALID={local_rank} "
+        f"visible_gpus={n_visible} -> using {device} ({gpu_name})",
+        file=sys.stderr, flush=True,
+    )
+
+    def _barrier():
+        # Passing device_ids avoids NCCL's "devices used by this process are
+        # currently unknown" warning on every barrier() call.
+        dist.barrier(device_ids=[device.index] if device.type == "cuda" else None)
+
+    if is_distributed:
+        # Warm up every rank-pair connection on a trivial call before DDP's
+        # construction broadcast gets to it — see train_sr_fm_refiner.sh for
+        # the LUMI Slingshot connection-setup race this mitigates.
+        _barrier()
+
     # ---- Config ----
     if args.resume_run is not None:
         out_dir_run = os.path.dirname(os.path.dirname(args.resume_run))
@@ -314,47 +471,131 @@ if __name__ == "__main__":
         job_name = os.path.basename(out_dir_run)
     else:
         cfg = recursive_load_config(args.config)
+
+        # A "step" consumes max_train_batch_size * accumulation_steps *
+        # world_size samples: accumulation_steps from this config's own
+        # local gradient accumulation (see dataloader.effective_batch_size),
+        # times world_size again from DDP averaging gradients across ranks
+        # on top of that. Both multiply total data-per-step independently
+        # of each other, so both must be divided out — not just world_size
+        # — to keep max_iter (and the other step-counted knobs below)
+        # anchored to the same total sample count these numbers were
+        # actually tuned against.
+        #
+        # That reference point is real batch = max_train_batch_size *
+        # _REFERENCE_ACCUM_STEPS, NOT max_train_batch_size alone:
+        # fm_refiner-R.yaml (this config's single-GPU basis) was tuned with
+        # effective_batch_size=8 / max_train_batch_size=2, i.e.
+        # accumulation_steps=4 already in effect. A *-lumi config typically
+        # drops effective_batch_size back to max_train_batch_size (relying
+        # on DDP's world_size multiplier instead of local accumulation), so
+        # this config's own accumulation_steps no longer carries that
+        # factor — it has to be reinstated explicitly here or max_iter
+        # silently ends up scaled for 1/_REFERENCE_ACCUM_STEPS of the
+        # intended total data. Applied once, here, on a fresh run — a
+        # resumed run reloads the already-scaled config.yaml saved by the
+        # run being resumed.
+        _REFERENCE_ACCUM_STEPS = 4
+        _eff_bs = cfg.dataloader.get("effective_batch_size", cfg.dataloader.max_train_batch_size)
+        _accum_steps = max(1, _eff_bs // cfg.dataloader.max_train_batch_size)
+        total_scale = max(1, (_accum_steps * (world_size if is_distributed else 1)) // _REFERENCE_ACCUM_STEPS)
+        if total_scale > 1:
+            cfg.max_iter = max(1, cfg.max_iter // total_scale)
+            cfg.trainer.validation_period = max(1, cfg.trainer.validation_period // total_scale)
+            cfg.trainer.save_period = max(1, cfg.trainer.save_period // total_scale)
+            cfg.trainer.log_period = max(1, cfg.trainer.log_period // total_scale)
+
         pure_job_name = os.path.basename(args.config).split(".")[0]
         job_name = (
             f"{t_start.strftime('%y_%m_%d-%H_%M_%S')}-{pure_job_name}"
             if args.add_datetime_prefix else pure_job_name
         )
         out_dir_run = os.path.join(args.output_dir or "./output", job_name)
-        os.makedirs(out_dir_run, exist_ok=False)
+        if is_main_process:
+            os.makedirs(out_dir_run, exist_ok=False)
 
     base_ckpt_dir = args.base_ckpt_dir or os.environ.get("BASE_CKPT_DIR", "")
 
     out_dir_ckpt = os.path.join(out_dir_run, "checkpoint")
-    os.makedirs(out_dir_ckpt, exist_ok=True)
 
-    # ---- Logging ----
-    config_logging(cfg.logging, out_dir=out_dir_run)
-    if args.resume_run is None:
-        with open(os.path.join(out_dir_run, "config.yaml"), "w") as f:
-            OmegaConf.save(cfg, f)
+    # ---- Logging / wandb (rank0 only: avoids racing directory creation and
+    # duplicate wandb runs/log files across ranks) ----
+    if is_main_process:
+        os.makedirs(out_dir_ckpt, exist_ok=True)
+        config_logging(cfg.logging, out_dir=out_dir_run)
+        if args.resume_run is None:
+            with open(os.path.join(out_dir_run, "config.yaml"), "w") as f:
+                OmegaConf.save(cfg, f)
+            if total_scale > 1:
+                logging.info(
+                    f"[scale] (accumulation_steps={_accum_steps} x world_size="
+                    f"{world_size if is_distributed else 1}) / reference_accum_steps="
+                    f"{_REFERENCE_ACCUM_STEPS} = {total_scale}: scaled "
+                    f"max_iter/validation_period/save_period/log_period down by "
+                    f"1/{total_scale} (now {cfg.max_iter}/{cfg.trainer.validation_period}/"
+                    f"{cfg.trainer.save_period}/{cfg.trainer.log_period}) so this run "
+                    f"covers the same total data (and wall-clock time) as a config "
+                    f"training at real batch = max_train_batch_size * "
+                    f"{_REFERENCE_ACCUM_STEPS}."
+                )
 
-    if not args.no_wandb:
-        wandb_cfg = {
-            "config": dict(cfg),
-            "name": job_name,
-            "mode": "online",
-            "dir": out_dir_run,
-            **cfg.wandb,
-        }
-        init_wandb(enable=True, **wandb_cfg)
+        if not args.no_wandb:
+            wandb_cfg = {
+                "config": dict(cfg),
+                "name": job_name,
+                "mode": "online",
+                "dir": out_dir_run,
+                **{k: v for k, v in cfg.wandb.items() if k != "name"},
+            }
+            init_wandb(enable=True, **wandb_cfg)
+        else:
+            init_wandb(enable=False)
+
+        tb_logger.set_dir(os.path.join(out_dir_run, "tensorboard"))
     else:
-        init_wandb(enable=False)
+        logging.basicConfig(level=logging.INFO)
 
-    tb_logger.set_dir(os.path.join(out_dir_run, "tensorboard"))
+    if is_distributed:
+        _barrier()
 
-    # ---- Device ----
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    logging.info(f"device = {device}")
+    # ---- Seeding (reproducibility) ----
+    base_seed = int(cfg.dataloader.seed)
+
+    def _worker_init_fn(worker_id: int):
+        # DataLoader auto-reseeds torch's RNG per worker, but NOT Python's
+        # `random` or numpy — LazyPatchDataset uses `random.randint`/`random.choice`
+        # for patch sampling, so without this, worker processes (forked) can
+        # share correlated `random` state across runs/machines.
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
 
     # ---- Data ----
     cfg_data = cfg.dataset
-    eff_bs = cfg.dataloader.effective_batch_size
-    accumulation_steps = eff_bs // cfg.dataloader.max_train_batch_size
+    # effective_batch_size is optional and defaults to max_train_batch_size
+    # (accumulation_steps=1, i.e. no local accumulation): it only exists for
+    # configs that need to simulate a larger batch on a single GPU (see
+    # fm_refiner-R.yaml). A multi-GPU config doesn't need it — DDP's
+    # cross-rank gradient averaging already provides that multiplier for
+    # free, so the real per-step batch there is simply
+    # max_train_batch_size * world_size, and max_train_batch_size is the
+    # only batch-size knob such a config needs to set (see
+    # fm_refiner-R-lumi.yaml).
+    eff_bs = cfg.dataloader.get("effective_batch_size", cfg.dataloader.max_train_batch_size)
+    # accumulation_steps micro-batches (each max_train_batch_size samples,
+    # per rank) are accumulated into one real optimizer step, so the true
+    # per-step batch a gradient update is computed over is
+    # max_train_batch_size * accumulation_steps * world_size (DDP averages
+    # gradients across ranks on top of this).
+    accumulation_steps = max(1, eff_bs // cfg.dataloader.max_train_batch_size)
+    if is_main_process:
+        real_batch = cfg.dataloader.max_train_batch_size * accumulation_steps * world_size
+        logging.info(
+            f"Batch size: {cfg.dataloader.max_train_batch_size} per micro-batch "
+            f"x {accumulation_steps} accumulation step(s) x {world_size} rank(s) "
+            f"= {real_batch} real batch per optimizer step."
+        )
 
     base_dataset = LazyPatchDataset({
         'input_dir': cfg_data.input_dir,
@@ -398,10 +639,23 @@ if __name__ == "__main__":
     train_dataset = _make_dataset(base_dataset, train_coords, 'train', cfg.dataloader.max_train_batch_size)
     val_dataset = _make_dataset(base_dataset, val_coords, 'val', 1)
 
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True,
-                              num_workers=cfg_data.workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
-                            num_workers=cfg_data.workers, pin_memory=True)
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank,
+                           shuffle=True, seed=cfg.dataloader.seed)
+        if is_distributed else None
+    )
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=(train_sampler is None),
+                              sampler=train_sampler,
+                              num_workers=cfg_data.workers, pin_memory=True,
+                              worker_init_fn=_worker_init_fn,
+                              generator=torch.Generator().manual_seed(base_seed))
+    # validate() builds its own small on-demand DataLoader per call, over a
+    # Subset of just the sample indices it actually needs (see validate()) —
+    # so no val_loader is built here. Materializing a full DataLoader over
+    # val_dataset up front is fine on 1 rank, but at high rank counts each
+    # validation call would otherwise force every process to eagerly
+    # read+transform the *entire* val set from shared storage before
+    # subsetting down to the handful of samples actually used.
 
     # ---- Model ----
     n_landsat_bands = len(cfg_data.selected_bands)
@@ -431,10 +685,19 @@ if __name__ == "__main__":
     # Load target stats for coarse normalization (same p1/p99 as dataloader)
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
 
+    # ---- DDP wrapping ----
+    unet_raw       = fm_refiner.unet
+    controlnet_raw = fm_refiner.controlnet if use_controlnet else None
+    if is_distributed:
+        ddp_ids = [device.index] if device.type == "cuda" else None
+        fm_refiner.unet = DDP(unet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+        if use_controlnet:
+            fm_refiner.controlnet = DDP(controlnet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+
     # ---- Optimizer ----
-    param_groups = [{"params": fm_refiner.unet.parameters(), "lr": cfg.optimizer.lr_unet}]
+    param_groups = [{"params": unet_raw.parameters(), "lr": cfg.optimizer.lr_unet}]
     if use_controlnet:
-        param_groups.append({"params": fm_refiner.controlnet.parameters(), "lr": cfg.optimizer.lr_controlnet})
+        param_groups.append({"params": controlnet_raw.parameters(), "lr": cfg.optimizer.lr_controlnet})
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.optimizer.weight_decay)
 
     lr_scheduler = None
@@ -450,28 +713,44 @@ if __name__ == "__main__":
     start_step = 0
     if args.resume_run is not None:
         start_step = load_checkpoint(fm_refiner, optimizer, lr_scheduler, args.resume_run)
-        logging.info(f"Resumed from step {start_step}")
+        if is_main_process:
+            logging.info(f"Resumed from step {start_step}")
 
     # ---- Training loop ----
     t_end = t_start + timedelta(minutes=args.exit_after) if args.exit_after > 0 else None
 
     step = start_step
+    # Position within the current accumulation window (0..accumulation_steps-1)
+    # — a real optimizer step only happens, and `step` only advances, when
+    # this reaches accumulation_steps-1. Always starts a fresh window on
+    # resume: a resumed run doesn't know which micro-batches the checkpointed
+    # step already included, so starting mid-window would silently apply a
+    # partial-batch gradient update.
+    micro_step = 0
     best_r2 = -1e8
-    val_offset = 0                                          # rotating pointer into val_loader
-    val_subset_size = max(1, len(val_loader) // 10)         # 10% of val data per validation
+    val_offset = 0                                          # rotating pointer into val_dataset
+    val_subset_size = max(1, len(val_dataset) // 10)        # 10% of val data per validation
 
     fm_refiner.train()
 
-    logging.info("Starting FM Refiner training")
-    pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True)
+    if is_main_process:
+        logging.info("Starting FM Refiner training")
+    pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True,
+                disable=not is_main_process)
     loss_val = 0.0
     for epoch in range(cfg.max_epoch):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         for batch in train_loader:
             if step >= cfg.max_iter:
                 break
             if t_end is not None and datetime.now() >= t_end:
-                logging.info("Exit after time limit reached.")
-                save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "latest")
+                if is_main_process:
+                    logging.info("Exit after time limit reached.")
+                    save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "latest")
+                if is_distributed:
+                    _barrier()
+                    dist.destroy_process_group()
                 pbar.close()
                 sys.exit(0)
 
@@ -500,31 +779,46 @@ if __name__ == "__main__":
                 h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
                 h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-            # FM loss
-            loss = fm_refiner(
-                landsat_lr=landsat_hr,  # ControlNet sees HR-resolution Landsat
-                ps_hr=inputs_hr,
-                h_coarse=h_coarse,
-                h_gt=targets,
-            )
-            loss = loss / accumulation_steps
-            loss.backward()
+            # Only the final micro-batch of a window should let DDP all-reduce
+            # gradients; earlier ones accumulate locally (see _maybe_no_sync).
+            is_first_micro = (micro_step == 0)
+            is_last_micro  = (micro_step == accumulation_steps - 1)
+            skip_sync = is_distributed and not is_last_micro
 
-            if (step + 1) % accumulation_steps == 0:
-                all_params = list(fm_refiner.unet.parameters())
+            if is_first_micro:
+                optimizer.zero_grad()
+
+            ddp_modules = [m for m in (fm_refiner.unet, fm_refiner.controlnet if use_controlnet else None)
+                           if isinstance(m, DDP)]
+            with _maybe_no_sync(ddp_modules, skip_sync):
+                # FM loss
+                loss = fm_refiner(
+                    landsat_lr=landsat_hr,  # ControlNet sees HR-resolution Landsat
+                    ps_hr=inputs_hr,
+                    h_coarse=h_coarse,
+                    h_gt=targets,
+                )
+                (loss / accumulation_steps).backward()
+
+            if is_last_micro:
+                all_params = list(unet_raw.parameters())
                 if use_controlnet:
-                    all_params += list(fm_refiner.controlnet.parameters())
+                    all_params += list(controlnet_raw.parameters())
                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 optimizer.step()
                 if lr_scheduler is not None:
                     lr_scheduler.step()
-                optimizer.zero_grad()
+
+            if not is_last_micro:
+                micro_step += 1
+                continue
+            micro_step = 0
 
             step += 1
             pbar.update(1)
 
-            # Logging
-            if step % cfg.trainer.log_period == 0:
+            # Logging (rank0 only)
+            if is_main_process and step % cfg.trainer.log_period == 0:
                 loss_val = loss.item() * accumulation_steps
                 lr_unet = optimizer.param_groups[0]["lr"]
                 pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
@@ -538,35 +832,48 @@ if __name__ == "__main__":
                 wandb.log(log_dict, step=step)
                 tb_logger.log_dict({"train/loss": loss_val}, global_step=step)
 
-            # Validation (rotating 10% subset)
+            # Validation (rotating 10% subset). Every rank participates
+            # (sharded, parallel inference — see validate()'s docstring);
+            # only rank0 gets real metrics back and acts on them.
             if step % cfg.trainer.validation_period == 0:
                 metrics, fig = validate(
-                    fm_refiner, dav2_model, val_loader, device,
+                    fm_refiner, dav2_model, val_dataset, device,
                     n_steps=cfg.validation.n_steps,
                     target_stats=target_stats,
                     n_landsat_bands=n_landsat_bands,
                     val_offset=val_offset,
                     method=cfg.validation.get("method", "euler"),
+                    global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
                 )
-                val_offset = (val_offset + val_subset_size) % len(val_loader)
+                # Deterministic given val_offset/val_subset_size/len(val_dataset),
+                # which are identical on every rank — safe to update everywhere.
+                val_offset = (val_offset + val_subset_size) % len(val_dataset)
 
-                logging.info(f"[step {step}] val: {metrics}")
-                log_dict = {f"val/{k}": v for k, v in metrics.items()}
-                if fig is not None:
-                    log_dict["val/samples"] = wandb.Image(fig)
-                    plt.close(fig)
-                wandb.log(log_dict, step=step)
-                tb_logger.log_dict({f"val/{k}": v for k, v in metrics.items()}, global_step=step)
+                if is_main_process:
+                    logging.info(f"[step {step}] val: {metrics}")
+                    log_dict = {f"val/{k}": v for k, v in metrics.items()}
+                    if fig is not None:
+                        log_dict["val/samples"] = wandb.Image(fig)
+                        plt.close(fig)
+                    wandb.log(log_dict, step=step)
+                    tb_logger.log_dict({f"val/{k}": v for k, v in metrics.items()}, global_step=step)
 
-                # Save best
-                if metrics["r2"] > best_r2:
-                    best_r2 = metrics["r2"]
-                    pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
-                    save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "best")
-                    logging.info(f"New best R²={best_r2:.4f} at step {step}")
+                    # Save best
+                    if metrics["r2"] > best_r2:
+                        best_r2 = metrics["r2"]
+                        pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
+                        save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "best")
+                        logging.info(f"New best R²={best_r2:.4f} at step {step}")
 
-            # Periodic checkpoint
-            if step % cfg.trainer.save_period == 0:
+                fm_refiner.train()
+
+                if is_distributed:
+                    # rank0's checkpoint write above must finish before other
+                    # ranks resume training and possibly overwrite "latest".
+                    _barrier()
+
+            # Periodic checkpoint (rank0 only)
+            if is_main_process and step % cfg.trainer.save_period == 0:
                 save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "latest")
 
         if step >= cfg.max_iter:
@@ -574,30 +881,42 @@ if __name__ == "__main__":
 
     pbar.close()
 
-    # Final full validation on entire val set
-    # Final full validation – load best checkpoint first
+    # Final full validation on entire val set — every rank must load the
+    # same best checkpoint (not just rank0) since the sharded validate()
+    # call below combines predictions across ranks — mixing a stale-weight
+    # rank into that would corrupt the aggregate metric.
     best_ckpt_path = os.path.join(out_dir_ckpt, "best.pth")
     if os.path.exists(best_ckpt_path):
         load_checkpoint(fm_refiner, optimizer, lr_scheduler, best_ckpt_path)
-        logging.info(f"Loaded best checkpoint from {best_ckpt_path} for final validation")
-    else:
+        if is_main_process:
+            logging.info(f"Loaded best checkpoint from {best_ckpt_path} for final validation")
+    elif is_main_process:
         logging.warning("Best checkpoint not found, using final model weights for full validation")
 
-    logging.info("Running full validation on entire val set...")
+    if is_main_process:
+        logging.info("Running full validation on entire val set...")
     final_metrics, final_fig = validate(
-        fm_refiner, dav2_model, val_loader, device,
+        fm_refiner, dav2_model, val_dataset, device,
         n_steps=cfg.validation.n_steps,
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         full=True,
         method=cfg.validation.get("method", "euler"),
+        global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
+        num_workers=cfg_data.workers,  # full=True shards the whole val set,
+        # worth the worker-process cost here (unlike the periodic call above).
     )
-    logging.info(f"Final val metrics: {final_metrics}")
-    final_log = {f"val_final/{k}": v for k, v in final_metrics.items()}
-    if final_fig is not None:
-        final_log["val_final/samples"] = wandb.Image(final_fig)
-        plt.close(final_fig)
-    wandb.log(final_log, step=step)
+    if is_main_process:
+        logging.info(f"Final val metrics: {final_metrics}")
+        final_log = {f"val_final/{k}": v for k, v in final_metrics.items()}
+        if final_fig is not None:
+            final_log["val_final/samples"] = wandb.Image(final_fig)
+            plt.close(final_fig)
+        wandb.log(final_log, step=step)
 
-    save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "final")
-    logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
+        save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "final")
+        logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
+
+    if is_distributed:
+        _barrier()
+        dist.destroy_process_group()

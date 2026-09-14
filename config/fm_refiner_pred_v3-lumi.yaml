@@ -1,0 +1,45 @@
+# Inference config for the Flow Matching CHM Refiner, adapted to run on
+# LUMI (multi-node, multi-GPU, sharded by SLURM rank — see
+# script/depth/infer_fm_refiner.sh and infer_fm_refiner.py's module
+# docstring). Paths moved to LUMI's Flash storage (/mnt/data/... on the
+# single-GPU server -> /flash/project_465002934/... here).
+#
+# Run:
+#   srun ... python script/depth/infer_fm_refiner.py --config config/fm_refiner_pred_v3-lumi.yaml
+#   srun --ntasks=1 python script/depth/infer_fm_refiner.py --config config/fm_refiner_pred_v3-lumi.yaml --merge
+
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2_map/2019"
+  output_dir: "/flash/project_465002934/result/chm/EUR_fm_refiner_v3"
+
+  file_type_input: "jp2"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR/LS_test2_statistics.json"
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+
+
+model:
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"
+
+  # Fine-tuned FM Refiner checkpoint trained via train_fm_refiner.sh
+  # (config/fm_refiner-R-lumi.yaml) — update once that run has produced a
+  # checkpoint. Checkpoints live under OUTPUT_DIR from train_fm_refiner.sh.
+  fm_refiner_path: "/flash/project_465002934/Marigold_output/fm_refiner-R-lumi/checkpoint/best.pth"
+
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  out_in_scale_factor: 4
+
+  n_ps_bands: 3
+  ps_dropout_p: 0.3
+
+
+prediction:
+  patch_size_lr: 240      # HR output patch = 240 × 4 = 960 px
+  stride_lr: 120
+  n_steps: 4
+  method: "euler"
