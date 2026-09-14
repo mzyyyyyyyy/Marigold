@@ -5,12 +5,13 @@ wandb:
   project: marigold
   name: fm_refiner-R-lumi
 
-# Dataset config – same as fm_refiner-R.yaml, paths moved to LUMI's Flash
-# storage (/mnt/data/... on the single-GPU server -> /flash/project_465002934/...
-# here). Data must be copied/synced to these paths on LUMI before running.
+# Dataset config – same as fm_refiner-R.yaml, but pointing at the same data
+# already staged on LUMI's Flash storage for sr_finer_lumi (this branch uses
+# the identical eur_test2 Landsat/PlanetScope/CHM_EUR dataset — see
+# sr_fm_refiner_v5-1-lumi.yaml), not a fresh /mnt/data -> /flash translation.
 dataset:
   input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
-  input_dir_hr: "/flash/project_465002934/data/PlanetScope/EUR_crop_area_test2_ResizeMultimodal"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
   output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
 
   file_type_input: "jp2"
@@ -25,15 +26,15 @@ dataset:
 
   use_input_minmax: True
   use_input_norm: False
-  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR/LS_test2_statistics.json"
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
 
   use_input_hr_minmax: True
   use_input_hr_norm: False
-  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR/PS_test2_statistics.json"
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
 
   use_target_minmax: True
   use_target_norm: False
-  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
 
   scale_input_to_neg1_1: True
   scale_input_hr_to_neg1_1: True
@@ -53,7 +54,11 @@ dataset:
   split_seed: 42
 
   workers: 6
-  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord/save_20260609.pkl"
+  # Same resolved patch-coord pickle sr_finer_lumi uses (identical source
+  # dataset, and the absolute paths embedded in the pickle needed
+  # re-resolving to LUMI's /flash prefix when the data was staged there —
+  # see sr_fm_refiner_v5-1-lumi.yaml).
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
 
   correlation_cleaning: False
   unit_scale_ratio: 1

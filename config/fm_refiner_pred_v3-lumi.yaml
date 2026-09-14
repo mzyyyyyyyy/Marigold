@@ -1,8 +1,10 @@
 # Inference config for the Flow Matching CHM Refiner, adapted to run on
 # LUMI (multi-node, multi-GPU, sharded by SLURM rank — see
 # script/depth/infer_fm_refiner.sh and infer_fm_refiner.py's module
-# docstring). Paths moved to LUMI's Flash storage (/mnt/data/... on the
-# single-GPU server -> /flash/project_465002934/... here).
+# docstring). Points at the same data already staged on LUMI's Flash
+# storage for sr_finer_lumi (identical eur_test2_map dataset — see
+# sr_fm_refiner_v5_infer_ls.yaml), not a fresh /mnt/data -> /flash
+# translation.
 #
 # Run:
 #   srun ... python script/depth/infer_fm_refiner.py --config config/fm_refiner_pred_v3-lumi.yaml
@@ -18,8 +20,8 @@ dataset:
   selected_bands: [0, 1, 2]
   selected_percentile: ["p50"]
 
-  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR/LS_test2_statistics.json"
-  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR/EUR_CHM_test_statistics.json"
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
 
 
 model:
