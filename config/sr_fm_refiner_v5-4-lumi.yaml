@@ -178,7 +178,7 @@ trainer:
 
   # ControlNet conditioning = concat(landsat_hr, ps) (6 channels) instead of
   # ps-only (3 channels) — mirrors sr_fm_refiner_v2's design.
-  concat_landsat_cond: True
+  concat_landsat_hr: True
 
 
 # Validation / inference

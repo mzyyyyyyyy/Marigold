@@ -32,6 +32,7 @@ import copy
 import json
 import logging
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -59,7 +60,7 @@ from depthfm.sr_module import SRModule, build_sr_module
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
 from src.util.ps_lazydataset import LazyPatchDataset
-from src.util.seeding import generate_seed_sequence
+from src.util.seeding import seed_all
 
 
 # -------------------------------------------------------------------------
@@ -170,6 +171,15 @@ def _load_target_stats(stats_file: str, year: int) -> dict:
     return all_stats[str(year)]
 
 
+def _denormalize_target(h: torch.Tensor, target_stats: dict) -> torch.Tensor:
+    """[-1, 1] -> metres, inverse of _normalize_coarse (matches train_fm_refiner.py)."""
+    p1 = float(target_stats["p1"][0])
+    p99 = float(target_stats["p99"][0])
+    h = (h.float() + 1.0) / 2.0        # [0, 1]
+    h = h * (p99 - p1) + p1             # metres
+    return h
+
+
 # -------------------------------------------------------------------------
 # Validation
 # -------------------------------------------------------------------------
@@ -215,6 +225,7 @@ def validate(
 
     fm_refiner.eval()
     sr_module.eval()
+    torch.manual_seed(42)
     all_preds, all_gts = [], []
     vis_samples = []
 
@@ -273,16 +284,18 @@ def validate(
         def _run_refine():
             if ps_input is not None:
                 return fm_refiner.refine_with_ps(ps_input, h_coarse, n_steps=n_steps, method=method,
-                                                  landsat_lr=landsat_hr)
-            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method, landsat_lr=landsat_hr)
+                                                  landsat_hr=landsat_hr)
+            return fm_refiner.refine(h_coarse, n_steps=n_steps, method=method, landsat_hr=landsat_hr)
 
         if n_avg > 1:
             h_fine = torch.stack([_run_refine() for _ in range(n_avg)]).mean(dim=0)
         else:
             h_fine = _run_refine()
 
-        all_preds.append(h_fine.cpu().flatten())
-        all_gts.append(targets.cpu().flatten())
+        pred_m = _denormalize_target(h_fine, target_stats)
+        gt_m = _denormalize_target(targets, target_stats)
+        all_preds.append(pred_m.cpu().flatten())
+        all_gts.append(gt_m.cpu().flatten())
 
         if len(vis_samples) < n_vis_samples:
             pseudo_ps_vis = ps_vis
@@ -432,7 +445,6 @@ def _sr_step(
     use_tdp: bool,               # False during warmup
     tdp_hook: str,               # e.g. "controlnet.cond_embedding" / "controlnet.mid_block" / "unet.up_blocks.2"
     device: torch.device,
-    concat_landsat_cond: bool = False,
 ) -> dict:
     """
     Compute SR Phase-1 loss and return a dict with loss tensors.
@@ -465,15 +477,11 @@ def _sr_step(
     # Pixel loss: L1(pseudo_ps, real_ps)
     l_pix = F.l1_loss(pseudo_ps, real_ps.detach()) * pixel_weight
 
+    cond_fake = fm_refiner._maybe_concat_landsat(pseudo_ps, landsat_hr)
+    cond_real = fm_refiner._maybe_concat_landsat(real_ps, landsat_hr)
+
     l_tdp = torch.tensor(0.0, device=device)
     if use_tdp and tdp_weight > 0:
-        if concat_landsat_cond:
-            cond_fake = torch.cat([landsat_hr, pseudo_ps], dim=1)
-            cond_real = torch.cat([landsat_hr, real_ps], dim=1)
-        else:
-            cond_fake = pseudo_ps
-            cond_real = real_ps
-
         if tdp_hook == "controlnet.cond_embedding":
             # Directly call controlnet_cond_embedding — no z_t context, no full CN forward.
             # Grad flows: l_tdp → cond_embedding(pseudo_ps) → pseudo_ps → SR
@@ -555,6 +563,7 @@ def _sr_step(
 def _task_step(
     fm_refiner: FMRefiner,
     real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
+    landsat_hr: torch.Tensor,    # (B, C_ls, H_hr, W_hr)
     h_coarse: torch.Tensor,
     h_gt: torch.Tensor,
     pseudo_ps_detached: torch.Tensor,  # (B, C_ps, H_hr, W_hr) — SR output already detached
@@ -595,7 +604,7 @@ def _task_step(
                 ps_cond[i] = pseudo_ps_detached[i]
 
     loss = fm_refiner(
-        landsat_lr=landsat_hr,
+        landsat_hr=landsat_hr,
         ps_hr=real_ps,
         h_coarse=h_coarse,
         h_gt=h_gt,
@@ -651,7 +660,7 @@ if __name__ == "__main__":
         backend = "nccl" if (torch.cuda.is_available() and not args.no_cuda) else "gloo"
         dist.init_process_group(
             backend=backend, rank=global_rank, world_size=world_size,
-            timeout=timedelta(minutes=5),
+            timeout=timedelta(minutes=2),
         )
 
     # ---- Device ----
@@ -707,17 +716,31 @@ if __name__ == "__main__":
         # on top of that. Both multiply total data-per-step independently
         # of each other, so both must be divided out — not just world_size
         # — to keep max_iter (and the other step-counted knobs below)
-        # anchored to "how many steps at max_train_batch_size", which is
-        # what these numbers were originally tuned against (2026-08-18:
-        # confirmed against the single-GPU baseline that predates the
-        # gradient-accumulation fix, i.e. accumulation_steps was always 1
-        # then regardless of effective_batch_size — so that's the correct
-        # zero point to scale from). Applied once, here, on a fresh run — a
+        # anchored to the same total sample count these numbers were
+        # actually tuned against.
+        #
+        # That reference point is real batch = max_train_batch_size *
+        # _REFERENCE_ACCUM_STEPS, NOT max_train_batch_size alone: max_iter
+        # in these configs (e.g. sr_fm_refiner_v5-1.yaml / v5-R3.yaml on the
+        # sr_finer branch, whose max_iter/effective_batch_size the *-lumi
+        # configs here copy) was tuned with dataloader.effective_batch_size
+        # = 4 already in effect, i.e. against 4x the sample count that
+        # max_train_batch_size alone would give. A *-lumi config typically
+        # drops effective_batch_size back to 1 (relying on DDP's world_size
+        # multiplier instead of local accumulation), so this config's own
+        # accumulation_steps no longer carries that factor — it has to be
+        # reinstated explicitly here or max_iter silently ends up scaled
+        # for 1/_REFERENCE_ACCUM_STEPS of the intended total data (observed
+        # 2026-09-01: sr_fm_refiner_v5-R3-lumi.yaml trained on ~100k samples
+        # over 1562 steps instead of the ~400k / 6250 steps its v5-R3
+        # basis actually used, correlating with blurrier SR/FM output than
+        # the sr_finer-branch run). Applied once, here, on a fresh run — a
         # resumed run reloads the already-scaled config.yaml saved by the
         # run being resumed.
+        _REFERENCE_ACCUM_STEPS = 4
         _eff_bs = cfg.dataloader.get("effective_batch_size", cfg.dataloader.max_train_batch_size)
         _accum_steps = max(1, _eff_bs // cfg.dataloader.max_train_batch_size)
-        total_scale = _accum_steps * (world_size if is_distributed else 1)
+        total_scale = max(1, (_accum_steps * (world_size if is_distributed else 1)) // _REFERENCE_ACCUM_STEPS)
         if total_scale > 1:
             cfg.max_iter = max(1, cfg.max_iter // total_scale)
             cfg.trainer.warmup_sr_steps = max(1, cfg.trainer.warmup_sr_steps // total_scale)
@@ -746,14 +769,16 @@ if __name__ == "__main__":
                 OmegaConf.save(cfg, f)
             if total_scale > 1:
                 logging.info(
-                    f"[scale] accumulation_steps={_accum_steps} x world_size="
-                    f"{world_size if is_distributed else 1} = {total_scale}: scaled "
+                    f"[scale] (accumulation_steps={_accum_steps} x world_size="
+                    f"{world_size if is_distributed else 1}) / reference_accum_steps="
+                    f"{_REFERENCE_ACCUM_STEPS} = {total_scale}: scaled "
                     f"max_iter/warmup_sr_steps/validation_period/save_period/log_period "
                     f"down by 1/{total_scale} (now {cfg.max_iter}/"
                     f"{cfg.trainer.warmup_sr_steps}/{cfg.trainer.validation_period}/"
                     f"{cfg.trainer.save_period}/{cfg.trainer.log_period}) so this run "
                     f"covers the same total data (and wall-clock time) as a config "
-                    f"training at real batch = max_train_batch_size alone."
+                    f"training at real batch = max_train_batch_size * "
+                    f"{_REFERENCE_ACCUM_STEPS}."
                 )
 
         if not args.no_wandb:
@@ -774,6 +799,24 @@ if __name__ == "__main__":
 
     if is_distributed:
         _barrier()
+
+    # ---- Seeding (reproducibility) ----
+    base_seed = int(cfg.dataloader.seed)
+    seed_all(base_seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    if is_main_process:
+        logging.info(f"Global seed = {base_seed} (cudnn deterministic=True, benchmark=False)")
+
+    def _worker_init_fn(worker_id: int):
+        # DataLoader auto-reseeds torch's RNG per worker, but NOT Python's
+        # `random` or numpy — LazyPatchDataset uses `random.randint`/`random.choice`
+        # for patch sampling, so without this, worker processes (forked) can
+        # share correlated `random` state across runs/machines.
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
 
     # ---- Data ----
     cfg_data = cfg.dataset
@@ -848,7 +891,9 @@ if __name__ == "__main__":
     )
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=(train_sampler is None),
                               sampler=train_sampler,
-                              num_workers=cfg_data.workers, pin_memory=True)
+                              num_workers=cfg_data.workers, pin_memory=True,
+                              worker_init_fn=_worker_init_fn,
+                              generator=torch.Generator().manual_seed(base_seed))
     # validate() builds its own small on-demand DataLoader per call, over a
     # Subset of just the sample indices it actually needs (see validate()) —
     # so no val_loader is built here. Materializing a full DataLoader over
@@ -861,7 +906,6 @@ if __name__ == "__main__":
     # ---- Models ----
     n_landsat_bands = len(cfg_data.selected_bands)
     n_ps_bands      = len(cfg_data.selected_bands_hr)
-    concat_landsat_cond = bool(cfg.trainer.get("concat_landsat_cond", False))
 
     fm_refiner = build_fm_refiner(
         sd_pretrained_path=cfg.model.sd_pretrained_path,
@@ -869,9 +913,10 @@ if __name__ == "__main__":
         n_ps_bands=n_ps_bands,
         ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
         bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
+        sample_sigma=cfg.trainer.get("sample_sigma", None),
         concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
-        concat_landsat_cond=concat_landsat_cond,
         refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
+        concat_landsat_hr=cfg.trainer.get("concat_landsat_hr", False),
         device=str(device),
     ).to(device)
 
@@ -1088,7 +1133,6 @@ if __name__ == "__main__":
                         fm_refiner, sr_module,
                         landsat, landsat_hr, inputs_hr, h_coarse,
                         pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
-                        concat_landsat_cond=concat_landsat_cond,
                     )
                     # Scale down so accumulation_steps backward() calls (summed
                     # into .grad by autograd) land on the *average* gradient
@@ -1123,7 +1167,7 @@ if __name__ == "__main__":
             with _maybe_no_sync(fm_modules, skip_sync):
                 loss_fm = _task_step(
                     fm_refiner,
-                    inputs_hr, h_coarse, targets,
+                    inputs_hr, landsat_hr, h_coarse, targets,
                     pseudo_ps_detached,
                     p_null_drop, p_pseudo_ps, device,
                 )

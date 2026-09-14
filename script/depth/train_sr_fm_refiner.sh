@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=256G
-#SBATCH --time=0-03:00:00
+#SBATCH --time=0-05:00:00
 #SBATCH --account=project_465002934
 #SBATCH --output=train_%j.out
 #SBATCH --error=train_%j.err
@@ -46,7 +46,7 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_sr_fm_refiner.py
-CONFIG=config/sr_fm_refiner_v5-5-lumi.yaml
+CONFIG=config/sr_fm_refiner_v5-R3-lumi.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write. Write outputs to the project's Flash storage
@@ -89,7 +89,7 @@ mkdir -p "$NCCL_DEBUG_ROOT"
 #
 # 1. In-allocation retries (cheap, no queue wait): a fresh attempt reuses
 #    this same 8-node allocation but builds new NCCL communicators.
-#    train_sr_fm_refiner.py's dist.init_process_group() has a 5-minute
+#    train_sr_fm_refiner.py's dist.init_process_group() has a 2-minute
 #    collective timeout, so a stuck attempt aborts on its own with a clear
 #    "Watchdog caught collective timeout" error instead of hanging until
 #    the 3-hour SBATCH limit. Handles a transient connection-setup race.

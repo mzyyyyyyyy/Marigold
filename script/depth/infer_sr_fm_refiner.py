@@ -184,8 +184,8 @@ class SRFMPredictor:
         n_ps      = len(train_cfg.dataset.selected_bands_hr)
         # Checkpoints trained before sr_fm_refiner_v5 used ControlNet
         # conditioning = concat(landsat_hr, ps) instead of ps-only. Set
-        # model.concat_landsat_cond: true in the infer yaml for those.
-        self.concat_landsat_cond = bool(model_cfg.get("concat_landsat_cond", False))
+        # model.concat_landsat_hr: true in the infer yaml for those.
+        self.concat_landsat_hr = bool(model_cfg.get("concat_landsat_hr", False))
 
         self.fm_refiner = build_fm_refiner(
             sd_pretrained_path=train_cfg.model.sd_pretrained_path,
@@ -193,8 +193,9 @@ class SRFMPredictor:
             n_ps_bands=n_ps,
             ps_dropout_p=0.0,
             bridge_sigma=model_cfg["bridge_sigma"],
+            sample_sigma=model_cfg.get("sample_sigma", None),
             concat_z_coarse=train_cfg.trainer.get("concat_z_coarse", False),
-            concat_landsat_cond=self.concat_landsat_cond,
+            concat_landsat_hr=self.concat_landsat_hr,
             device=str(self.device),
         ).to(self.device)
 
@@ -497,13 +498,13 @@ class SRFMPredictor:
                     # ControlNet conditioning; current ones ignore it.
                     landsat_hr = (
                         F.interpolate(lr, size=hr_size, mode="bilinear", align_corners=False)
-                        if self.concat_landsat_cond else None
+                        if self.concat_landsat_hr else None
                     )
 
                     preds = [
                         self.fm_refiner.refine_with_ps(
                             pseudo_ps, h_coarse, n_steps=n_steps, method=method,
-                            landsat_lr=landsat_hr,
+                            landsat_hr=landsat_hr,
                         )
                         for _ in range(n_average)
                     ]

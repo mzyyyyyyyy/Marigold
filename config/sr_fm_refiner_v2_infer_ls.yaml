@@ -43,7 +43,7 @@ model:
 
   # v2 checkpoint predates sr_fm_refiner_v5: ControlNet was trained on
   # concat(landsat_hr, pseudo_ps) conditioning (6 ch), not ps-only (3 ch).
-  concat_landsat_cond: true
+  concat_landsat_hr: true
 
 prediction:
   batch_size: 1          # one LR patch at a time (model is memory-heavy)

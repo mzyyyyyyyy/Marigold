@@ -3,7 +3,7 @@ base_config:
 
 wandb:
   project: marigold
-  name: sr_fm_refiner_v5-1
+  name: sr_fm_refiner_v5-R3-lumi
 
 # Dataset config – same as fm_refiner_v4.yaml
 dataset:
@@ -88,20 +88,36 @@ sr_module:
 # SR training losses (Phase 1)
 sr_loss:
   pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
-  tdp_weight: 0.3     # L1 on ControlNet cond_embedding features (pseudo vs real)
-  tdp_hook: "controlnet.cond_embedding"  # z_t-independent: aligns cond_embedding features only (matches sr_fm_refiner_v10)
+  tdp_weight: 1.0     # L1 on ControlNet mid-block features (pseudo vs real)
+  tdp_hook: "controlnet.cond_embedding"   # "controlnet.mid_block" or "unet.up_blocks.N" (N=0..3)
 
 
 # Alternate training schedule
 
 
 # Optimizers
+#
+# Base (single-GPU sr_fm_refiner_v5-R3) trains at real batch 4
+# (max_train_batch_size=1 x effective_batch_size=4 local accumulation).
+# This lumi config drops the local accumulation (see dataloader: below) and
+# relies on DDP's cross-rank gradient averaging instead, giving real batch
+# = max_train_batch_size(1) x world_size(64) = 64 — a 16x jump from the
+# base's real batch of 4. LRs below are scaled by sqrt(64/4)=sqrt(16)=4
+# (not the full linear-scaling-rule 16x) — AdamW's per-parameter adaptive
+# scaling makes it less batch-sensitive than plain SGD, and these are small
+# fine-tuning LRs on a pretrained UNet+ControlNet+SwinIR-SR stack where a
+# full 16x jump risks destabilizing training (same rule used for
+# sr_fm_refiner_v5-1-lumi, see its optimizer: comment for the investigation
+# that motivated it). There's no LR warmup in this script (CosineAnnealingLR
+# starts straight from the base LR at step 0) — if training looks unstable
+# in the first handful of steps, that's the first thing to add, not just
+# tuning these numbers further.
 optimizer:
-  lr_unet: 1.0e-05
-  lr_controlnet: 1.0e-04
+  lr_unet: 8.0e-05        # 2.0e-05 x4
+  lr_controlnet: 8.0e-04  # 2.0e-04 x4
   weight_decay: 1.0e-02
 
-  lr_sr: 2.0e-04
+  lr_sr: 8.0e-04           # 2.0e-04 x4
   weight_decay_sr: 0.0
 
 
@@ -112,7 +128,21 @@ lr_scheduler:
 
 # Dataloader
 dataloader:
-  effective_batch_size: 4
+  # No effective_batch_size here on purpose (unlike the base v5-R3 config):
+  # that field only exists to simulate a larger batch via *local* gradient
+  # accumulation on a single GPU, which this config doesn't need — DDP's
+  # cross-rank gradient averaging already provides a real multiplier of
+  # exactly world_size (64, fixed by --nodes/--ntasks-per-node in
+  # train_sr_fm_refiner.sh, not a yaml setting) for free. So on this config
+  # max_train_batch_size is the *only* batch-size knob:
+  #
+  #     real batch per optimizer step = max_train_batch_size x 64
+  #
+  # max_train_batch_size=1 x 64 ranks = 64 real batch (train_sr_fm_refiner.py
+  # logs this exact line at startup so you can sanity-check it against
+  # whatever you set here). The optimizer LRs above are tuned for this real
+  # batch of 64 specifically — see the comment above optimizer:.
+  effective_batch_size: 1
   max_train_batch_size: 1
   seed: 2024
 
@@ -128,15 +158,21 @@ trainer:
   #   p_pseudo_ps → SR-generated pseudo-PS
   #   remainder   → real PS
   p_null_drop: 0.0
-  p_pseudo_ps: 0.3
+  p_pseudo_ps: 1.0
 
-  bridge_sigma: 0.5
+  # Training-time stochastic-interpolant bridge noise (see fm_refiner.py):
+  # z_t = (1-t)*z_coarse + t*z_gt + sigma*t*(1-t)*eps, with v_target corrected
+  # by gamma'(t)*eps so the deterministic ODE stays consistent with this noisy
+  # interpolant (fixes the v5-R2 bug where v_target ignored eps entirely).
+  bridge_sigma: 0.3
+
+  # Inference-time sampling noise, decoupled from bridge_sigma above.
+  # 0.0 = deterministic ODE integration (no SDE noise injected in refine()).
+  sample_sigma: 0.0
 
   # Steps before TDP loss is activated (pixel-only warmup)
   warmup_sr_steps: 200
 
-  # ControlNet conditioning = concat(landsat_hr, ps) (6 channels) instead of
-  # ps-only (3 channels) — mirrors sr_fm_refiner_v2's design.
   concat_landsat_hr: True
 
 
@@ -147,10 +183,15 @@ validation:
   # True  → validation uses SR pseudo-PS via refine_with_ps()
   # False → validation uses null PS via refine() (baseline comparison)
   use_sr_pseudo_ps: True
-  n_avg: 5
+  n_avg: 1
 
 
 # Training budget
+# max_iter is scaled down by accumulation_steps x world_size at runtime
+# (see train_sr_fm_refiner.py's total_scale block) so 64 GPUs cover the
+# same total data/wall-clock as the base config training at real batch =
+# max_train_batch_size alone — left as 100000 here, same as the base v5-R3,
+# on purpose; this file only changes batch/LR, not that scaling strategy.
 max_epoch: 1000
 max_iter: 100000
 
