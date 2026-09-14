@@ -348,11 +348,14 @@ def _sr_step(
     landsat_hr: torch.Tensor,    # (B, C_ls, H_hr, W_hr)
     real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
     h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
+    h_gt: torch.Tensor,          # (B, 1, H_hr, W_hr) — needed for t-consistent z_t in mid_block/up_block hooks
     pixel_weight: float,
     tdp_weight: float,
     use_tdp: bool,               # False during warmup
     tdp_hook: str,               # e.g. "controlnet.cond_embedding" / "controlnet.mid_block" / "unet.up_blocks.2"
     device: torch.device,
+    tdp_t_min: float = 0.0,
+    tdp_t_max: float = 1.0,
 ) -> dict:
     """
     Compute SR Phase-1 loss and return a dict with loss tensors.
@@ -368,6 +371,10 @@ def _sr_step(
                                     cleanest option: features depend only on PS input)
       "controlnet.mid_block"      – hook ControlNet mid_block (requires full CN forward with z_coarse)
       "unet.up_blocks.N"          – hook UNet up_blocks[N], runs ControlNet + UNet forward
+
+    tdp_t_min / tdp_t_max: range for the per-batch t ~ U(tdp_t_min, tdp_t_max) used to
+    build the interpolated z_t sample for the mid_block/up_block hooks (ignored by
+    cond_embedding, which is t-independent). Defaults to the full [0, 1] range.
     """
     B = landsat.shape[0]
     H_hr, W_hr = real_ps.shape[2], real_ps.shape[3]
@@ -390,13 +397,30 @@ def _sr_step(
             with torch.no_grad():
                 feat_real = fm_refiner.controlnet.controlnet_cond_embedding(cond_real)
         else:
-            # Original hook-based path (controlnet.mid_block or unet.up_blocks.N)
+            # Hook-based path (controlnet.mid_block or unet.up_blocks.N).
+            #
+            # `sample` must be the *interpolated* z_t = (1-t)*z_coarse + t*z_gt,
+            # consistent with the `t` passed as `timestep` — ControlNet/UNet
+            # modulate every internal layer via a time embedding derived from
+            # `timestep`, so feeding a fixed z_coarse (a t=0 point) together with
+            # an arbitrary `timestep` puts the network on an (sample, t) pair it
+            # never sees during real FM training/inference (see FMRefiner.forward,
+            # where sample and t are always paired consistently). Sampling
+            # t ~ U(0, 1) per batch, matching the FM training distribution, also
+            # spreads the TDP gradient across the whole coarse→gt trajectory
+            # instead of a single arbitrary point.
             with torch.no_grad():
                 z_coarse = fm_refiner.encode(h_coarse)
+                z_gt     = fm_refiner.encode(h_gt)
+
+            t_val = tdp_t_min + (tdp_t_max - tdp_t_min) * torch.rand(B, device=device)
+            t4    = t_val.view(B, 1, 1, 1)
+            z_t   = (1.0 - t4) * z_coarse + t4 * z_gt
+            t_int = (t_val * 999).long()
+            sample = torch.cat([z_t, z_coarse], dim=1) if fm_refiner.concat_z_coarse else z_t
+            sample = sample.detach()
 
             text_emb = fm_refiner.empty_text_embed.to(device).expand(B, -1, -1)
-            t_val = torch.full((B,), 0.5, device=device)
-            t_int = (t_val * 999).long()
 
             use_unet = tdp_hook.startswith("unet.")
             if use_unet:
@@ -413,7 +437,7 @@ def _sr_step(
             hook = hook_module.register_forward_hook(_hook)
 
             cn_fake_out = fm_refiner.controlnet(
-                sample=z_coarse.detach(),
+                sample=sample,
                 timestep=t_int,
                 encoder_hidden_states=text_emb,
                 controlnet_cond=cond_fake,
@@ -421,7 +445,7 @@ def _sr_step(
             )
             if use_unet:
                 fm_refiner.unet(
-                    sample=z_coarse.detach(),
+                    sample=sample,
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
                     down_block_additional_residuals=cn_fake_out.down_block_res_samples,
@@ -432,7 +456,7 @@ def _sr_step(
 
             with torch.no_grad():
                 cn_real_out = fm_refiner.controlnet(
-                    sample=z_coarse.detach(),
+                    sample=sample,
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
                     controlnet_cond=cond_real,
@@ -440,7 +464,7 @@ def _sr_step(
                 )
                 if use_unet:
                     fm_refiner.unet(
-                        sample=z_coarse.detach(),
+                        sample=sample,
                         timestep=t_int,
                         encoder_hidden_states=text_emb,
                         down_block_additional_residuals=cn_real_out.down_block_res_samples,
@@ -522,7 +546,7 @@ if __name__ == "__main__":
     t_start = datetime.now()
 
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
-    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v5-R3.yaml")
+    parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v2-R3.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
@@ -729,6 +753,8 @@ if __name__ == "__main__":
     pixel_weight    = float(cfg.sr_loss.pixel_weight)
     tdp_weight      = float(cfg.sr_loss.tdp_weight)
     tdp_hook        = str(cfg.sr_loss.get("tdp_hook", "unet.up_blocks.2"))
+    tdp_t_min       = float(cfg.sr_loss.get("tdp_t_min", 0.0))
+    tdp_t_max       = float(cfg.sr_loss.get("tdp_t_max", 1.0))
 
     # Pixel-loss annealing: after warmup, linearly decay pixel_weight down to
     # pixel_weight_final over pixel_weight_anneal_steps, then hold constant.
@@ -814,8 +840,9 @@ if __name__ == "__main__":
 
                 loss_dict = _sr_step(
                     fm_refiner, sr_module,
-                    landsat, landsat_hr, inputs_hr, h_coarse,
+                    landsat, landsat_hr, inputs_hr, h_coarse, targets,
                     pixel_weight_t, tdp_weight, use_tdp, tdp_hook, device,
+                    tdp_t_min=tdp_t_min, tdp_t_max=tdp_t_max,
                 )
                 if micro_step % accumulation_steps == 0:
                     optimizer_sr.zero_grad()
