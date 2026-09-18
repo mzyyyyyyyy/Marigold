@@ -20,6 +20,19 @@
 export MASTER_ADDR=$(scontrol show hostname "$SLURM_NODELIST" | head -n1)
 export MASTER_PORT=29500
 
+# Without this, RCCL auto-detects a network interface for inter-node
+# collectives and can pick the cluster's management NIC instead of the
+# Slingshot 11 fabric (hsn0-3) — that's indistinguishable from "the network
+# is fine" until the first real collective (DDP's initial parameter
+# broadcast) tries to actually move data over it and hangs until NCCL's
+# watchdog timeout, exactly the SeqNum=5 OpType=BROADCAST timeout seen
+# across 3 separate fresh node allocations on 2026-09-17 (train_22121526/
+# 22121824/22121935.err). This is LUMI's own documented fix for that
+# failure mode, not something specific to this job — see
+# https://lumi-supercomputer.github.io/LUMI-training-materials/2day-20251020/205-Containers/
+export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
+export NCCL_NET_GDR_LEVEL=3   # harmless no-op on ROCm >=6.2, still required on older images
+
 # The DAv2 backbone (depth-anything/Depth-Anything-V2-Base-hf) is already
 # cached locally, but transformers' from_pretrained() still does a live HTTP
 # HEAD request to huggingface.co to check for updates unless told not to.
@@ -43,7 +56,7 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_fm_refiner.py
-CONFIG=config/fm_refiner-R-lumi.yaml
+CONFIG=config/fm_refiner-R-lumi-4.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write (see train_sr_fm_refiner.sh). Write outputs to the

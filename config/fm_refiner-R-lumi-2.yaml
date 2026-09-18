@@ -1,0 +1,142 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: fm_refiner-R-lumi-2
+
+# Dataset config – identical to fm_refiner-R-lumi.yaml (see that file's
+# comments for the data-staging history). This config only changes the
+# flow matching parameterization and inference sampling, not the data.
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+
+# Optimizer – unchanged from fm_refiner-R-lumi.yaml
+optimizer:
+  lr_unet: 4.0e-05        # 1.0e-05 x4
+  lr_controlnet: 4.0e-04  # 1.0e-04 x4
+  weight_decay: 1.0e-02
+
+
+# LR scheduler (cosine annealing)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader – unchanged from fm_refiner-R-lumi.yaml
+dataloader:
+  effective_batch_size: 2
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  use_controlnet: True
+  controlnet_cond_mode: "landsat_ps"  # ControlNet takes Landsat HR only, no PlanetScope
+  ps_dropout_p: 0.3       # probability of replacing PS with null token
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # InDI-style flow matching (Delbracio & Milanfar 2023; adapted to
+  # coarse-to-fine refinement per CH3Depth, Li et al. CVPR 2025 Eq.6-7):
+  # v_target = z_gt - z_t = (1-t)*(z_gt - z_coarse), instead of the constant
+  # v_target = z_gt - z_coarse used by fm_refiner-R-lumi.yaml ("fixed").
+  # Equivalent to "fixed" only under a perfectly-learned network (Eq.7) —
+  # in practice this reweights the training loss across t (the t=0 label is
+  # identical between "indi"/"fixed", but t is sampled ~Uniform(0,1) across
+  # training, and the shared, t-conditioned network's weights — and hence
+  # its output at every t, including t=0 — are shaped by the whole training
+  # distribution, not just the t=0 slice). CH3Depth reports this already
+  # improves accuracy at 1-step inference (their Tab.1, "one-step
+  # denoising", shows InDI-trained models beating fixed-velocity DepthFM),
+  # not just at multi-step — do not assume n_steps=1 makes this run
+  # equivalent to fm_refiner-R-lumi.yaml.
+  velocity_parameterization: "indi"
+
+
+# Validation / inference
+validation:
+  # n_steps=1 still benefits from the InDI training-loss reweighting (see
+  # trainer.velocity_parameterization comment) — it is NOT a no-op relative
+  # to fm_refiner-R-lumi.yaml. Set to 4 here to additionally exercise the
+  # non-uniform multi-step sampling below (CH3Depth Tab.4 ablation: InDI
+  # alone already helps, non-uniform sampling adds a further gain on top).
+  n_steps: 4
+  method: euler   # only "euler" is implemented for velocity_parameterization="indi"
+  # Non-uniform step schedule (CH3Depth Eq.8): larger steps early, finer
+  # steps near t=1 to preserve detail. "sqrt" was CH3Depth's best-performing
+  # option (Tab.5); "uniform" (identity) and "square" (convex, opposite
+  # bias) are also implemented in depthfm/fm_refiner.py::_sampling_warp for
+  # sweeping later.
+  sampling_fn: sqrt
+
+
+# Training budget – unchanged from fm_refiner-R-lumi.yaml
+max_epoch: 1000
+max_iter: 50000
+
+
+# Eval metrics logged during validation
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

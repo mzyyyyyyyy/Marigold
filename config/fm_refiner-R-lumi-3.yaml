@@ -1,0 +1,164 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: fm_refiner-R-lumi-3
+
+# Dataset config – identical to fm_refiner-R-lumi.yaml. This config only
+# adds InDI-style bridge noise on top of the "fixed" velocity
+# parameterization (see trainer.noise_sigma/sample_sigma below) — it does
+# NOT include the InDI training-target reweighting from fm_refiner-R-lumi-2.yaml;
+# these are two independent experiment axes.
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+
+# Optimizer – unchanged from fm_refiner-R-lumi.yaml
+optimizer:
+  lr_unet: 4.0e-05        # 1.0e-05 x4
+  lr_controlnet: 4.0e-04  # 1.0e-04 x4
+  weight_decay: 1.0e-02
+
+
+# LR scheduler (cosine annealing)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader – unchanged from fm_refiner-R-lumi.yaml
+dataloader:
+  effective_batch_size: 2
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  use_controlnet: True
+  controlnet_cond_mode: "landsat_ps"  # ControlNet takes Landsat HR only, no PlanetScope
+  ps_dropout_p: 0.3       # probability of replacing PS with null token
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # velocity_parameterization left at its default "fixed" (not set here) —
+  # noise_sigma/sample_sigma are only implemented for "fixed"; combining them
+  # with fm_refiner-R-lumi-2.yaml's "indi" target is a separate, unimplemented
+  # experiment (see depthfm/fm_refiner.py __init__'s guard).
+
+  # InDI-style asymmetric bridge noise (Delbracio & Milanfar 2023, Eq.7),
+  # mirrored to this codebase's t-convention (z_coarse at t=0 is the
+  # "degraded" end, z_gt at t=1 is the "clean" end that must be hit exactly
+  # — opposite of InDI's own x-at-t=0/y-at-t=1 convention, so the noise
+  # schedule is (1-t)*sigma here instead of their t*epsilon):
+  #   z_t = (1-t)*z_coarse + t*z_gt + (1-t)*noise_sigma*eps
+  #   v_target = (z_gt - z_coarse) - noise_sigma*eps
+  # 0.01 is InDI's own paper's general illustrative value (their images are
+  # also normalized to [-1,1], same as this project's scale_*_to_neg1_1
+  # dataset fields, so directly comparable in scale) — their task-specific
+  # values range 0 (deblurring) to 0.06 (JPEG Q15); no value from their
+  # paper maps exactly onto DAv2-coarse-to-CHM-fine refinement, so treat
+  # this as an unvalidated starting point, not a tuned choice.
+  noise_sigma: 0.01
+
+  # Independent inference-time SDE noise strength (Euler-Maruyama, see
+  # refine()) — InDI's own paper uses the SAME schedule for train/sample
+  # (no separate parameter); this project's sr_finer_lumi branch's
+  # bridge_noise instead decouples them (sample_sigma defaults to the
+  # training sigma but is overridable, e.g. to 0.0 for deterministic
+  # inference without retraining) — kept here for that same flexibility.
+  # Set equal to noise_sigma to start (matches InDI's paper exactly).
+  sample_sigma: 0.01
+
+
+# Validation / inference
+validation:
+  # sample_sigma's SDE noise is only injected between steps (skipped on the
+  # last step — see refine()), so total injected noise variance over the
+  # trajectory is (n_steps-1)/n_steps * sample_sigma^2 relative to the
+  # continuous-SDE target: 0% at n_steps=1 (no effect at all), 50% at 2,
+  # 75% at 4, 87.5% at 8 (diminishing returns after that, and higher step
+  # counts risk the multi-step drift/darkening seen in earlier experiments
+  # on this codebase) — 4 is a reasonable middle ground, not a tuned value.
+  n_steps: 4
+
+  # Each periodic/final validation call runs refine() this many times per
+  # sample (independent random draws, since sample_sigma>0 makes refine()
+  # stochastic) and averages the results before computing metrics — reduces
+  # the variance introduced by SDE sampling noise, at ensemble_size x the
+  # inference cost. Averaging trades away some of the detail/realism the
+  # noise is meant to add in exchange for better point-accuracy metrics
+  # (same perception-distortion tradeoff discussed for multi-step sampling)
+  # — if you want to inspect single-sample detail instead, use
+  # infer_fm_refiner.py directly rather than lowering this. 1 = no
+  # ensembling (default, matches fm_refiner-R-lumi.yaml/-2.yaml behavior).
+  ensemble_size: 5
+
+
+# Training budget – unchanged from fm_refiner-R-lumi.yaml
+max_epoch: 1000
+max_iter: 50000
+
+
+# Eval metrics logged during validation
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

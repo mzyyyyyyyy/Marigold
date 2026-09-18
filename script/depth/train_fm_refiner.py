@@ -173,6 +173,8 @@ def validate(
     n_vis_samples: int = 5,        # how many samples to visualize
     full: bool = False,            # if True, iterate entire val_dataset
     method: str = "euler",         # integration method: "euler" or "heun"
+    sampling_fn: str = "uniform",  # step-warp for velocity_parameterization="indi"
+    ensemble_size: int = 1,        # average this many independent refine() draws per sample
     global_rank: int = 0,
     world_size: int = 1,
     is_distributed: bool = False,
@@ -240,7 +242,15 @@ def validate(
         h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
-        h_fine = fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method)
+        # Each call is an independent stochastic draw when sample_sigma>0
+        # (fresh SDE noise per call); averaging reduces sampling variance at
+        # ensemble_size x the inference cost. A stack+mean of a single
+        # element (ensemble_size=1, the default) is a no-op.
+        h_fine_draws = [
+            fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method, sampling_fn=sampling_fn)
+            for _ in range(ensemble_size)
+        ]
+        h_fine = torch.stack(h_fine_draws, dim=0).mean(dim=0)
 
         pred_m = _denormalize_target(h_fine, target_stats)
         gt_m = _denormalize_target(targets, target_stats)
@@ -663,6 +673,7 @@ if __name__ == "__main__":
 
     use_controlnet = cfg.trainer.get("use_controlnet", True)
     controlnet_cond_mode = cfg.trainer.get("controlnet_cond_mode", "landsat_ps")
+    velocity_parameterization = cfg.trainer.get("velocity_parameterization", "fixed")
     fm_refiner = build_fm_refiner(
         sd_pretrained_path=cfg.model.sd_pretrained_path,
         n_landsat_bands=n_landsat_bands,
@@ -670,6 +681,10 @@ if __name__ == "__main__":
         ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
         use_controlnet=use_controlnet,
         controlnet_cond_mode=controlnet_cond_mode,
+        velocity_parameterization=velocity_parameterization,
+        noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
+        sample_sigma=cfg.trainer.get("sample_sigma", None),
+        sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
         device=str(device),
     )
     fm_refiner = fm_refiner.to(device)
@@ -843,6 +858,8 @@ if __name__ == "__main__":
                     n_landsat_bands=n_landsat_bands,
                     val_offset=val_offset,
                     method=cfg.validation.get("method", "euler"),
+                    sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
+                    ensemble_size=cfg.validation.get("ensemble_size", 1),
                     global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
                 )
                 # Deterministic given val_offset/val_subset_size/len(val_dataset),
@@ -902,6 +919,8 @@ if __name__ == "__main__":
         n_landsat_bands=n_landsat_bands,
         full=True,
         method=cfg.validation.get("method", "euler"),
+        sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
+        ensemble_size=cfg.validation.get("ensemble_size", 1),
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
         num_workers=cfg_data.workers,  # full=True shards the whole val set,
         # worth the worker-process cost here (unlike the periodic call above).

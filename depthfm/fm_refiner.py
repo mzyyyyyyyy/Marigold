@@ -9,14 +9,30 @@ Architecture:
 
 Training (Flow Matching):
   z_t = (1-t)*z_coarse + t*z_gt       # linear interpolation
-  v_target = z_gt - z_coarse           # constant velocity
+  v_target = z_gt - z_coarse           # constant velocity   ("fixed", default)
+           = z_gt - z_t                # InDI velocity       ("indi", see velocity_parameterization)
   v_pred = UNet(z_t, t) + ControlNet(landsat, ps_or_null)
   loss = MSE(v_pred, v_target)
+
+  Optional InDI-style noise (noise_sigma > 0, only with velocity_parameterization=
+  "fixed"): adds asymmetric noise that vanishes at the clean/z_gt end (t=1) and
+  is largest at the coarse/z_coarse end (t=0) — mirrored from InDI Eq.7's
+  t*eps*n (their clean end is at t=0, ours is at t=1, so the schedule flips):
+    h(t) = (1-t)*noise_sigma
+    z_t  = (1-t)*z_coarse + t*z_gt + h(t)*eps
+    v_target = (z_gt - z_coarse) + h'(t)*eps = (z_gt - z_coarse) - noise_sigma*eps
+  The h'(t)*eps correction is required so the network's target reflects this
+  particular noisy sample's true marginal velocity (see sr_finer_lumi branch's
+  bridge_noise for the analogous — and previously buggy, since-fixed —
+  correction term for its symmetric t(1-t) schedule).
 
 Inference (Euler integration, 1-4 steps):
   z_0 = z_coarse
   v = model(z_0, t=0, null_ps)
-  z_fine = z_0 + dt * v  (per Euler step)
+  "fixed": z_fine = z_0 + dt * v  (per Euler step, uniform dt)
+  "indi":  z_fine = z_0 + [f(t_next)-f(t)]/(1-f(t)) * v  (per step, f = sampling_fn warp)
+           — required because the InDI target is (1-t)-scaled relative to "fixed";
+           dividing by (1-t) undoes that scaling to recover the true step.
 """
 
 import torch
@@ -30,6 +46,22 @@ from typing import Optional
 VAE_SCALE_FACTOR = 0.18215
 
 
+def _sampling_warp(x: float, kind: str) -> float:
+    """Map a uniform step index in [0,1] to a warped position on the [0,1]
+    flow-time axis, per CH3Depth's non-uniform sampling (Eq.8). Must pass
+    through (0,0) and (1,1). 'sqrt' (concave) takes larger steps early and
+    finer steps near t=1; 'square' (convex) is the opposite; 'uniform' is
+    the identity (no warp)."""
+    if kind == "uniform":
+        return x
+    elif kind == "sqrt":
+        return x ** 0.5
+    elif kind == "square":
+        return x ** 2
+    else:
+        raise ValueError(f"Unknown sampling_fn: {kind!r}. Expected 'uniform', 'sqrt', or 'square'.")
+
+
 class FMRefiner(nn.Module):
     def __init__(
         self,
@@ -39,12 +71,47 @@ class FMRefiner(nn.Module):
         empty_text_embed: torch.Tensor,
         ps_dropout_p: float = 0.3,
         use_controlnet: bool = True,
+        velocity_parameterization: str = "fixed",
+        noise_sigma: float = 0.0,
+        sample_sigma: Optional[float] = None,
+        sample_noise_mode: str = "sde",
     ):
         super().__init__()
         self.vae = vae
         self.unet = unet
         self.controlnet = controlnet
         self.use_controlnet = use_controlnet
+        if velocity_parameterization not in ("fixed", "indi"):
+            raise ValueError(
+                f"velocity_parameterization must be 'fixed' or 'indi', got {velocity_parameterization!r}"
+            )
+        self.velocity_parameterization = velocity_parameterization
+
+        # InDI-style asymmetric bridge noise (training) + independent SDE
+        # sampling noise (inference) — see module docstring. Only supported
+        # with velocity_parameterization="fixed"; the v_target correction
+        # term has not been derived/implemented for "indi".
+        self.noise_sigma = noise_sigma
+        # sample_sigma defaults to noise_sigma (same schedule at train/sample,
+        # matching InDI's own paper) but can be overridden independently —
+        # e.g. sample_sigma=0.0 for deterministic ODE inference from a
+        # noise-trained checkpoint without retraining.
+        self.sample_sigma = noise_sigma if sample_sigma is None else sample_sigma
+        # "sde": inject fresh noise at every step (Euler-Maruyama, skipped on
+        #   the last step) — the existing bridge_noise-style behavior.
+        # "init_only": inject sample_sigma*eps exactly once, right after
+        #   encoding h_coarse, before the Euler loop starts; the loop itself
+        #   is then a pure deterministic ODE with no further noise — mirrors
+        #   RFMSR's inference (x = z_lr + sigma*randn(...), then plain Euler).
+        if sample_noise_mode not in ("sde", "init_only"):
+            raise ValueError(f"sample_noise_mode must be 'sde' or 'init_only', got {sample_noise_mode!r}")
+        self.sample_noise_mode = sample_noise_mode
+        if (self.noise_sigma > 0.0 or self.sample_sigma > 0.0) and velocity_parameterization == "indi":
+            raise NotImplementedError(
+                "noise_sigma/sample_sigma > 0 is only supported with "
+                "velocity_parameterization='fixed' — the InDI-target v_target "
+                "correction for noise has not been derived for 'indi'."
+            )
 
         # Fixed empty text embedding (not a parameter)
         self.register_buffer("empty_text_embed", empty_text_embed)
@@ -127,8 +194,23 @@ class FMRefiner(nn.Module):
         t4 = t.view(B, 1, 1, 1)
         z_t = (1.0 - t4) * z_coarse + t4 * z_gt
 
-        # Velocity target (constant, flow matching straight path)
-        v_target = z_gt - z_coarse             # (B, 4, h, w)
+        # Velocity target
+        if self.velocity_parameterization == "indi":
+            # InDI: remaining displacement to the target, shrinks as t -> 1.
+            # Identically z_gt - z_t == (1-t)*(z_gt - z_coarse) (CH3Depth Eq.6/7).
+            v_target = z_gt - z_t              # (B, 4, h, w)
+        else:
+            # Flow matching straight path: constant velocity across all t.
+            v_target = z_gt - z_coarse         # (B, 4, h, w)
+
+        # InDI-style asymmetric bridge noise (see module docstring). Only
+        # active when noise_sigma > 0 (velocity_parameterization="fixed",
+        # enforced in __init__).
+        if self.noise_sigma > 0.0:
+            eps = torch.randn_like(z_coarse)
+            noise_scale = (1.0 - t4) * self.noise_sigma   # h(t): 0 at t=1 (z_gt), max at t=0 (z_coarse)
+            z_t = z_t + noise_scale * eps
+            v_target = v_target - self.noise_sigma * eps  # h'(t)*eps correction, h'(t) = -noise_sigma (constant)
 
         # Scale t to [0, 999] for UNet timestep embedding
         t_int = (t * 999).long()
@@ -233,7 +315,8 @@ class FMRefiner(nn.Module):
         landsat_lr: torch.Tensor,   # (B, C_ls, H_hr, W_hr)
         h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
         n_steps: int = 1,
-        method: str = "euler",       # "euler" or "heun"
+        method: str = "euler",       # "euler" or "heun" (heun only supported with velocity_parameterization="fixed")
+        sampling_fn: str = "uniform",  # "uniform"/"sqrt"/"square" step warp (only used with velocity_parameterization="indi")
     ) -> torch.Tensor:
         """
         Refine coarse prediction via ODE integration.
@@ -241,8 +324,15 @@ class FMRefiner(nn.Module):
         When use_controlnet=True, uses null PS token at inference time.
         When use_controlnet=False, runs UNet only.
 
-        method="euler": 1st-order Euler (original behaviour)
-        method="heun":  2nd-order Heun (trapezoidal corrector), costs 2× NFE per step
+        velocity_parameterization="fixed" (this model's setting, fixed at construction):
+            method="euler": 1st-order Euler, uniform step size, ignores sampling_fn.
+            method="heun":  2nd-order Heun (trapezoidal corrector), costs 2x NFE per step.
+
+        velocity_parameterization="indi":
+            Non-uniform step schedule via sampling_fn (CH3Depth Eq.8): the network is
+            queried at the warped position f(s/n_steps), and each step's raw output is
+            divided by (1 - f(s/n_steps)) to undo the (1-t) scaling baked into the InDI
+            training target. Only method="euler" is implemented.
 
         Returns:
             h_fine: (B, 1, H_hr, W_hr) refined height map
@@ -252,6 +342,12 @@ class FMRefiner(nn.Module):
         dtype = h_coarse.dtype
 
         z = self.encode(h_coarse)  # (B, 4, h, w)
+        # "init_only" mode (RFMSR-style): perturb the coarse starting point
+        # once, here, before any integration — the Euler loop below then
+        # runs as a pure deterministic ODE (see the per-step "sde" branch
+        # further down, which is skipped entirely in this mode).
+        if self.sample_sigma > 0.0 and self.sample_noise_mode == "init_only":
+            z = z + self.sample_sigma * torch.randn_like(z)
         text_emb = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 
         if self.use_controlnet:
@@ -270,18 +366,44 @@ class FMRefiner(nn.Module):
         else:
             control_input = None
 
-        dt = 1.0 / n_steps
-        ts = [i / n_steps for i in range(n_steps)]
+        if self.velocity_parameterization == "indi":
+            if method != "euler":
+                raise NotImplementedError(
+                    f"refine(): method={method!r} is not supported with "
+                    f"velocity_parameterization='indi' — only 'euler' is implemented."
+                )
+            taus = [_sampling_warp(s / n_steps, sampling_fn) for s in range(n_steps + 1)]
+            for s in range(n_steps):
+                t_cur, t_next = taus[s], taus[s + 1]
+                v = self._vel(z, t_cur, control_input, text_emb)
+                coeff = (t_next - t_cur) / (1.0 - t_cur)
+                z = z + coeff * v
+        else:
+            if sampling_fn != "uniform":
+                raise ValueError(
+                    f"sampling_fn={sampling_fn!r} requires velocity_parameterization='indi' "
+                    f"— a 'fixed'-parameterization model must use uniform-step Euler/Heun."
+                )
+            dt = 1.0 / n_steps
+            ts = [i / n_steps for i in range(n_steps)]
 
-        for t_val in ts:
-            v1 = self._vel(z, t_val, control_input, text_emb)
-            if method == "heun":
-                t_next = min(t_val + dt, 1.0)
-                z_pred = z + dt * v1
-                v2 = self._vel(z_pred, t_next, control_input, text_emb)
-                z = z + dt * 0.5 * (v1 + v2)
-            else:
-                z = z + dt * v1
+            for i, t_val in enumerate(ts):
+                is_last = (i == n_steps - 1)
+                v1 = self._vel(z, t_val, control_input, text_emb)
+                if method == "heun":
+                    t_next = min(t_val + dt, 1.0)
+                    z_pred = z + dt * v1
+                    v2 = self._vel(z_pred, t_next, control_input, text_emb)
+                    z = z + dt * 0.5 * (v1 + v2)
+                else:
+                    z = z + dt * v1
+                # SDE noise injection (Euler-Maruyama), skipped on the last
+                # step so z lands exactly at the clean z_gt-side endpoint
+                # with no residual noise. Independent of noise_sigma — see
+                # sample_sigma in __init__. Only in "sde" mode — "init_only"
+                # already perturbed z once above and stays pure-ODE from here.
+                if self.sample_sigma > 0.0 and self.sample_noise_mode == "sde" and not is_last:
+                    z = z + self.sample_sigma * (dt ** 0.5) * torch.randn_like(z)
 
         h_fine = self.decode(z)
         return h_fine
@@ -298,6 +420,10 @@ def build_fm_refiner(
     ps_dropout_p: float = 0.3,
     use_controlnet: bool = True,
     controlnet_cond_mode: str = "landsat_ps",
+    velocity_parameterization: str = "fixed",
+    noise_sigma: float = 0.0,
+    sample_sigma: Optional[float] = None,
+    sample_noise_mode: str = "sde",
     device: str = "cuda",
 ) -> FMRefiner:
     """
@@ -309,6 +435,16 @@ def build_fm_refiner(
         n_ps_bands: number of PlanetScope input channels
         ps_dropout_p: dropout probability for PS conditioning
         use_controlnet: if False, ControlNet is not built and UNet runs unconditionally
+        velocity_parameterization: "fixed" (constant flow-matching velocity, default)
+            or "indi" (InDI-style (1-t)-scaled velocity, see module docstring)
+        noise_sigma: InDI-style asymmetric bridge noise strength (training), 0.0 disables.
+            Only supported with velocity_parameterization="fixed".
+        sample_sigma: independent SDE noise strength at inference (refine()); defaults
+            to noise_sigma when None (same schedule as training, matching the InDI
+            paper), pass 0.0 explicitly for deterministic ODE inference.
+        sample_noise_mode: "sde" (default; noise injected every step, bridge_noise-style)
+            or "init_only" (RFMSR-style; noise injected once before integration starts,
+            then a pure deterministic ODE) — see refine()/module docstring.
         device: device string
     """
     from transformers import CLIPTextModel, CLIPTokenizer
@@ -355,6 +491,10 @@ def build_fm_refiner(
         empty_text_embed=empty_text_embed,
         ps_dropout_p=ps_dropout_p,
         use_controlnet=use_controlnet,
+        velocity_parameterization=velocity_parameterization,
+        noise_sigma=noise_sigma,
+        sample_sigma=sample_sigma,
+        sample_noise_mode=sample_noise_mode,
     )
     model.controlnet_cond_mode = controlnet_cond_mode
     return model
