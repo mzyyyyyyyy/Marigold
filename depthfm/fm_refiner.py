@@ -39,7 +39,9 @@ class FMRefiner(nn.Module):
         empty_text_embed: torch.Tensor,
         ps_dropout_p: float = 0.3,
         bridge_sigma: float = 0.0,
+        noise_sigma: float = 0.0,
         sample_sigma: Optional[float] = None,
+        sample_noise_mode: str = "sde",
         concat_z_coarse: bool = False,
         refine_threshold: float = 0.0,
         concat_landsat_hr: bool = False,
@@ -53,11 +55,32 @@ class FMRefiner(nn.Module):
         self.register_buffer("empty_text_embed", empty_text_embed)
 
         self.ps_dropout_p = ps_dropout_p
+        # bridge_sigma: symmetric Stochastic-Interpolants noise, sigma*t*(1-t)
+        #   (Albergo & Vanden-Eijnden) — the original mechanism on this branch.
+        # noise_sigma: InDI-style asymmetric noise, (1-t)*sigma — ported from
+        #   fm_refiner-R-lumi-4 on the finer_lumi branch. Mutually exclusive
+        #   with bridge_sigma (see forward()).
+        if bridge_sigma > 0.0 and noise_sigma > 0.0:
+            raise ValueError(
+                "bridge_sigma and noise_sigma are mutually exclusive noise "
+                "mechanisms — set only one of them > 0."
+            )
         self.bridge_sigma = bridge_sigma
+        self.noise_sigma = noise_sigma
         # Noise scale used only at sampling time in refine(). Defaults to
-        # bridge_sigma (old behaviour). Set to 0.0 for deterministic ODE
-        # inference regardless of the training-time bridge noise.
-        self.sample_sigma = bridge_sigma if sample_sigma is None else sample_sigma
+        # whichever training-time sigma is active (old behaviour, extended to
+        # noise_sigma). Set to 0.0 for deterministic ODE inference regardless
+        # of the training-time noise.
+        _default_sample_sigma = noise_sigma if noise_sigma > 0.0 else bridge_sigma
+        self.sample_sigma = _default_sample_sigma if sample_sigma is None else sample_sigma
+        # "sde": inject fresh noise every step (Euler-Maruyama, skipped on the
+        #   last step) — original behaviour.
+        # "init_only": inject sample_sigma*eps once, before integration starts,
+        #   then a pure deterministic ODE (RFMSR-style; see fm_refiner-R-lumi-4
+        #   on finer_lumi for the origin of this mode).
+        if sample_noise_mode not in ("sde", "init_only"):
+            raise ValueError(f"sample_noise_mode must be 'sde' or 'init_only', got {sample_noise_mode!r}")
+        self.sample_noise_mode = sample_noise_mode
         self.concat_z_coarse = concat_z_coarse
         # If True, ControlNet conditioning is cat([landsat_hr, ps_cond], dim=1)
         # instead of ps_cond alone (ControlNet must be built with matching n_cond_channels).
@@ -173,6 +196,14 @@ class FMRefiner(nn.Module):
             eps = torch.randn_like(z_coarse)
             gamma_dot = self.bridge_sigma * (1.0 - 2.0 * t4)          # d/dt [sigma*t*(1-t)]
             noise_scale = self.bridge_sigma * t4 * (1.0 - t4)          # gamma(t)
+            z_t = (1.0 - t4) * z_coarse + t4 * z_gt + noise_scale * eps
+        elif self.noise_sigma > 0.0:
+            # InDI-style asymmetric noise (ported from fm_refiner-R-lumi-4,
+            # finer_lumi branch): h(t) = (1-t)*noise_sigma, zero at the clean
+            # z_gt end (t=1), max at the coarse z_coarse end (t=0).
+            eps = torch.randn_like(z_coarse)
+            gamma_dot = -self.noise_sigma * torch.ones_like(t4)        # h'(t) = -noise_sigma (constant)
+            noise_scale = (1.0 - t4) * self.noise_sigma                 # h(t)
             z_t = (1.0 - t4) * z_coarse + t4 * z_gt + noise_scale * eps
         else:
             gamma_dot = None
@@ -296,6 +327,12 @@ class FMRefiner(nn.Module):
 
         z_coarse_lat = self.encode(h_coarse)
         z            = z_coarse_lat.clone()
+        # "init_only" mode: perturb the coarse starting point once, here,
+        # before any integration — the Euler loop below then runs as a pure
+        # deterministic ODE (the per-step "sde" branch further down is
+        # skipped entirely in this mode).
+        if self.sample_sigma > 0.0 and self.sample_noise_mode == "init_only":
+            z = z + self.sample_sigma * torch.randn_like(z)
         text_emb     = self.empty_text_embed.to(device, dtype).expand(B, -1, -1)
 
         if ps_hr is not None:
@@ -319,9 +356,11 @@ class FMRefiner(nn.Module):
             else:
                 z = z + dt * v1
             # SDE noise injection (skip on last step to avoid noise at t=1).
-            # Uses sample_sigma (independent of the training-time bridge_sigma) so
-            # inference determinism can be controlled without retraining.
-            if self.sample_sigma > 0.0 and not is_last:
+            # Uses sample_sigma (independent of the training-time bridge_sigma/
+            # noise_sigma) so inference determinism can be controlled without
+            # retraining. Only in "sde" mode — "init_only" already perturbed
+            # z once above and stays pure-ODE from here.
+            if self.sample_sigma > 0.0 and self.sample_noise_mode == "sde" and not is_last:
                 z = z + self.sample_sigma * (dt ** 0.5) * torch.randn_like(z)
 
         return self.decode(z)
@@ -361,7 +400,9 @@ def build_fm_refiner(
     n_ps_bands: int,
     ps_dropout_p: float = 0.3,
     bridge_sigma: float = 0.0,
+    noise_sigma: float = 0.0,
     sample_sigma: Optional[float] = None,
+    sample_noise_mode: str = "sde",
     concat_z_coarse: bool = False,
     refine_threshold: float = 0.0,
     device: str = "cuda",
@@ -376,6 +417,14 @@ def build_fm_refiner(
         n_landsat_bands: number of Landsat input channels (used only if concat_landsat_hr)
         n_ps_bands: number of PlanetScope input channels
         ps_dropout_p: dropout probability for PS conditioning
+        bridge_sigma: symmetric Stochastic-Interpolants training noise, 0.0 disables.
+            Mutually exclusive with noise_sigma.
+        noise_sigma: InDI-style asymmetric training noise (ported from fm_refiner-R-lumi-4,
+            finer_lumi branch), 0.0 disables. Mutually exclusive with bridge_sigma.
+        sample_sigma: independent inference-time noise strength (refine()); defaults to
+            whichever of bridge_sigma/noise_sigma is active when None.
+        sample_noise_mode: "sde" (default; noise injected every step) or "init_only"
+            (RFMSR-style; noise injected once before integration, then pure ODE).
         concat_landsat_hr: if True, ControlNet cond = cat([landsat_hr, ps]),
             channel count n_landsat_bands + n_ps_bands, instead of ps alone
         device: device string
@@ -419,7 +468,9 @@ def build_fm_refiner(
         empty_text_embed=empty_text_embed,
         ps_dropout_p=ps_dropout_p,
         bridge_sigma=bridge_sigma,
+        noise_sigma=noise_sigma,
         sample_sigma=sample_sigma,
+        sample_noise_mode=sample_noise_mode,
         concat_z_coarse=concat_z_coarse,
         refine_threshold=refine_threshold,
         concat_landsat_hr=concat_landsat_hr,

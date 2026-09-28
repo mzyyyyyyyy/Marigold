@@ -440,11 +440,14 @@ def _sr_step(
     landsat_hr: torch.Tensor,    # (B, C_ls, H_hr, W_hr)
     real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
     h_coarse: torch.Tensor,      # (B, 1, H_hr, W_hr)
+    h_gt: torch.Tensor,          # (B, 1, H_hr, W_hr) — needed for t-consistent z_t in mid_block/up_block hooks
     pixel_weight: float,
     tdp_weight: float,
     use_tdp: bool,               # False during warmup
     tdp_hook: str,               # e.g. "controlnet.cond_embedding" / "controlnet.mid_block" / "unet.up_blocks.2"
     device: torch.device,
+    tdp_t_min: float = 0.0,
+    tdp_t_max: float = 1.0,
 ) -> dict:
     """
     Compute SR Phase-1 loss and return a dict with loss tensors.
@@ -460,6 +463,13 @@ def _sr_step(
                                     cleanest option: features depend only on PS input)
       "controlnet.mid_block"      – hook ControlNet mid_block (requires full CN forward with z_coarse)
       "unet.up_blocks.N"          – hook UNet up_blocks[N], runs ControlNet + UNet forward
+
+    tdp_t_min / tdp_t_max: range for the per-batch t ~ U(tdp_t_min, tdp_t_max) used to
+    build the interpolated z_t sample for the mid_block/up_block hooks (ignored by
+    cond_embedding, which is t-independent). Defaults to the full [0, 1] range.
+    Ported from sr_finer branch's _sr_step (config/sr_fm_refiner_v2-R2.yaml) — this
+    replaces the old fixed t=0.5 + z_coarse-as-sample approach, which fed the network
+    an (sample, t) pair it never sees during real FM training/inference.
 
     Note: always operates on the raw (non-DDP-wrapped) unet/controlnet, since
     these are frozen during the SR step (no gradient sync required) — this
@@ -489,13 +499,46 @@ def _sr_step(
             with torch.no_grad():
                 feat_real = controlnet.controlnet_cond_embedding(cond_real)
         else:
-            # Original hook-based path (controlnet.mid_block or unet.up_blocks.N)
+            # Hook-based path (controlnet.mid_block or unet.up_blocks.N).
+            #
+            # `sample` must be the *interpolated* z_t = (1-t)*z_coarse + t*z_gt,
+            # consistent with the `t` passed as `timestep` — ControlNet/UNet
+            # modulate every internal layer via a time embedding derived from
+            # `timestep`, so feeding a fixed z_coarse (a t=0 point) together with
+            # an arbitrary `timestep` puts the network on an (sample, t) pair it
+            # never sees during real FM training/inference (see FMRefiner.forward,
+            # where sample and t are always paired consistently). Sampling
+            # t ~ U(tdp_t_min, tdp_t_max) per batch, matching the FM training
+            # distribution, also spreads the TDP gradient across the whole
+            # coarse→gt trajectory instead of a single arbitrary point.
             with torch.no_grad():
                 z_coarse = fm_refiner.encode(h_coarse)
+                z_gt     = fm_refiner.encode(h_gt)
+
+            t_val = tdp_t_min + (tdp_t_max - tdp_t_min) * torch.rand(B, device=device)
+            t4    = t_val.view(B, 1, 1, 1)
+            z_t   = (1.0 - t4) * z_coarse + t4 * z_gt
+
+            # Match the main FM step's noise (forward()): the shared UNet/
+            # ControlNet were trained on noisy z_t whenever noise_sigma > 0, so
+            # feeding a clean z_t here would itself be an out-of-distribution
+            # input, confounding the fake-vs-real feature comparison with a
+            # second variable besides "which PS was used". Both the fake and
+            # real forward passes below share this same noisy z_t (and same
+            # eps) — only the PS conditioning differs between them.
+            if fm_refiner.noise_sigma > 0.0:
+                eps_tdp = torch.randn_like(z_coarse)
+                z_t = z_t + (1.0 - t4) * fm_refiner.noise_sigma * eps_tdp
+            # Note: bridge_sigma (the older symmetric noise mechanism) is left
+            # out of this correction on purpose — fixing it would silently
+            # change results for existing bridge_sigma+hook configs (v5/v6/
+            # v6-1/v7/v8/v9). Only the newer noise_sigma path is corrected here.
+
+            t_int  = (t_val * 999).long()
+            sample = torch.cat([z_t, z_coarse], dim=1) if fm_refiner.concat_z_coarse else z_t
+            sample = sample.detach()
 
             text_emb = fm_refiner.empty_text_embed.to(device).expand(B, -1, -1)
-            t_val = torch.full((B,), 0.5, device=device)
-            t_int = (t_val * 999).long()
 
             use_unet = tdp_hook.startswith("unet.")
             if use_unet:
@@ -512,7 +555,7 @@ def _sr_step(
             hook = hook_module.register_forward_hook(_hook)
 
             cn_fake_out = controlnet(
-                sample=z_coarse.detach(),
+                sample=sample,
                 timestep=t_int,
                 encoder_hidden_states=text_emb,
                 controlnet_cond=cond_fake,
@@ -520,7 +563,7 @@ def _sr_step(
             )
             if use_unet:
                 unet(
-                    sample=z_coarse.detach(),
+                    sample=sample,
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
                     down_block_additional_residuals=cn_fake_out.down_block_res_samples,
@@ -531,7 +574,7 @@ def _sr_step(
 
             with torch.no_grad():
                 cn_real_out = controlnet(
-                    sample=z_coarse.detach(),
+                    sample=sample,
                     timestep=t_int,
                     encoder_hidden_states=text_emb,
                     controlnet_cond=cond_real,
@@ -539,7 +582,7 @@ def _sr_step(
                 )
                 if use_unet:
                     unet(
-                        sample=z_coarse.detach(),
+                        sample=sample,
                         timestep=t_int,
                         encoder_hidden_states=text_emb,
                         down_block_additional_residuals=cn_real_out.down_block_res_samples,
@@ -913,7 +956,9 @@ if __name__ == "__main__":
         n_ps_bands=n_ps_bands,
         ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
         bridge_sigma=cfg.trainer.get("bridge_sigma", 0.0),
+        noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
         sample_sigma=cfg.trainer.get("sample_sigma", None),
+        sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
         concat_z_coarse=cfg.trainer.get("concat_z_coarse", False),
         refine_threshold=cfg.trainer.get("refine_threshold", 0.0),
         concat_landsat_hr=cfg.trainer.get("concat_landsat_hr", False),
@@ -1035,6 +1080,8 @@ if __name__ == "__main__":
     pixel_weight    = float(cfg.sr_loss.pixel_weight)
     tdp_weight      = float(cfg.sr_loss.tdp_weight)
     tdp_hook        = str(cfg.sr_loss.get("tdp_hook", "unet.up_blocks.2"))
+    tdp_t_min       = float(cfg.sr_loss.get("tdp_t_min", 0.0))
+    tdp_t_max       = float(cfg.sr_loss.get("tdp_t_max", 1.0))
 
     # SR trains every batch; FM trains every batch with detached SR output.
     # Both modules stay in train mode throughout.
@@ -1131,8 +1178,9 @@ if __name__ == "__main__":
                 with _maybe_no_sync([sr_module] if is_distributed else [], skip_sync):
                     loss_dict = _sr_step(
                         fm_refiner, sr_module,
-                        landsat, landsat_hr, inputs_hr, h_coarse,
+                        landsat, landsat_hr, inputs_hr, h_coarse, targets,
                         pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
+                        tdp_t_min=tdp_t_min, tdp_t_max=tdp_t_max,
                     )
                     # Scale down so accumulation_steps backward() calls (summed
                     # into .grad by autograd) land on the *average* gradient

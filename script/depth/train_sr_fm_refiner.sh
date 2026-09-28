@@ -20,6 +20,25 @@
 export MASTER_ADDR=$(scontrol show hostname "$SLURM_NODELIST" | head -n1)
 export MASTER_PORT=29500
 
+# Without this, RCCL auto-detects a network interface for inter-node
+# collectives and can pick the cluster's management NIC instead of the
+# Slingshot 11 fabric (hsn0-3) — that's indistinguishable from "the network
+# is fine" until a real collective tries to actually move data over it and
+# hangs until NCCL's watchdog timeout. This is LUMI's own documented fix for
+# that failure mode (see
+# https://lumi-supercomputer.github.io/LUMI-training-materials/2day-20251020/205-Containers/),
+# ported from finer_lumi branch's train_fm_refiner.sh, where it fixed a
+# SeqNum=5 OpType=BROADCAST watchdog timeout. NOTE: this does NOT touch the
+# separate c10d TCPStore rendezvous that runs before any RCCL communicator
+# exists (plain socket connect to MASTER_ADDR:MASTER_PORT) — the "62/64
+# clients joined" DistStoreError seen on this script's own runs (e.g. job
+# 22397590) happens at that earlier stage, so this fix is not guaranteed to
+# resolve that specific symptom; it's added because it's a no-cost
+# precaution against the later-stage RCCL failure this script's own retry
+# history (see below) was otherwise built to paper over.
+export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
+export NCCL_NET_GDR_LEVEL=3   # harmless no-op on ROCm >=6.2, still required on older images
+
 # The DAv2 backbone (depth-anything/Depth-Anything-V2-Base-hf) is already
 # cached locally, but transformers' from_pretrained() still does a live HTTP
 # HEAD request to huggingface.co to check for updates unless told not to.
@@ -46,7 +65,7 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_sr_fm_refiner.py
-CONFIG=config/sr_fm_refiner_v5-R3-lumi.yaml
+CONFIG=config/sr_fm_refiner_v11-lumi.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write. Write outputs to the project's Flash storage
