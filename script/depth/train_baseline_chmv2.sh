@@ -33,7 +33,8 @@ export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export NCCL_NET_GDR_LEVEL=3   # harmless no-op on ROCm >=6.2, still required on older images
 
-# NOTE: the CHMv2 weights (facebook/dinov3-vitl16-chmv2-dpt-head) must already be in the local HF cache (or set model.chmv2_model_id to a local dir) — the DAv2 backbone in the sibling script was cached, this one is not verified. The DAv2 backbone (depth-anything/Depth-Anything-V2-Base-hf) is
+# NOTE: CHMv2 weights (facebook/dinov3-vitl16-chmv2-dpt-head, gated) must be in the local HF cache before submitting — offline mode below.
+# The DAv2 backbone (depth-anything/Depth-Anything-V2-Base-hf) is
 # cached locally, but transformers' from_pretrained() still does a live HTTP
 # HEAD request to huggingface.co to check for updates unless told not to.
 # With many ranks doing that at once, LUMI's compute-node network egress
@@ -55,6 +56,10 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /scratch/project_465002934:/scratch/project_465002934 \
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
+# The sif ships transformers 5.3.0, which has no CHMv2. This overlay dir holds
+# transformers 5.17.0 (+ matching tokenizers/safetensors), prepended to
+# PYTHONPATH for this job only, so the sif itself (and other jobs) are untouched.
+OVERLAY=/flash/project_465002934/env/py_overlay_tf517
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_baseline_chmv2.py
 CONFIG=config/baseline_chmv2-lumi.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
@@ -70,7 +75,7 @@ OUTPUT_DIR=/flash/project_465002934/Marigold_output
 # passed here) so the retry loop below can clear it before each retry.
 JOB_NAME=$(basename "$CONFIG" .yaml)
 RUN_DIR="$OUTPUT_DIR/$JOB_NAME"
-export BIND SIF SCRIPT CONFIG OUTPUT_DIR
+export BIND SIF SCRIPT CONFIG OUTPUT_DIR OVERLAY
 
 # Turn on RCCL/NCCL's own debug logging (one file per rank, since many ranks
 # interleaved on one stderr is unreadable) so that a multi-node collective
@@ -113,7 +118,7 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     # debug from Python tracebacks + NCCL_DEBUG logs instead.
     ulimit -c 0
     export NCCL_DEBUG_FILE="$NCCL_DEBUG_ROOT/rank_${SLURM_PROCID}_resubmit${RESUBMIT_COUNT}_attempt${ATTEMPT}.log"
-    singularity exec $BIND $SIF python -u $SCRIPT --config $CONFIG --output_dir $OUTPUT_DIR
+    singularity exec $BIND --env PYTHONPATH=$OVERLAY $SIF python -u $SCRIPT --config $CONFIG --output_dir $OUTPUT_DIR
   '
   status=$?
   if [ "$status" -eq 0 ]; then
