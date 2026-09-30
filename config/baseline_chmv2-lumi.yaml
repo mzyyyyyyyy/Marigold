@@ -65,7 +65,7 @@ dataset:
 # cache (or point chmv2_model_id at a local directory) since the sbatch script
 # sets HF_HUB_OFFLINE=1.
 model:
-  chmv2_model_id: "facebook/dinov3-vitl16-chmv2-dpt-head"
+  chmv2_model_id: "/flash/project_465002934/model/models--facebook--dinov3-vitl16-chmv2-dpt-head/snapshots/37130c851a3cf6720f974490707059f5edaeed4e"
   pretrained: True
   # CHMv2's own recipe: frozen DINOv3 encoder, only the DPT head trains.
   freeze_backbone: True
