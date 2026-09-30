@@ -1,0 +1,126 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: baseline_chmv2-lumi
+
+# Same LUMI dataset paths / patch split as fm_refiner-R-lumi*.yaml, so this
+# baseline trains/validates on the exact same patches. Unlike the FM configs
+# it predicts raw canopy height (metres) directly, like baseline_dav2.yaml.
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  # unused by this baseline (no PS/HR input) but required by LazyPatchDataset
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  # Raw metres target (no minmax / [-1,1] scaling), as in baseline_dav2.yaml.
+  use_target_minmax: False
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: False
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model: CHMv2 fine-tuned end-to-end. The weights must be in the local HF
+# cache (or point chmv2_model_id at a local directory) since the sbatch script
+# sets HF_HUB_OFFLINE=1.
+model:
+  chmv2_model_id: "facebook/dinov3-vitl16-chmv2-dpt-head"
+  pretrained: True
+  # CHMv2's own recipe: frozen DINOv3 encoder, only the DPT head trains.
+  freeze_backbone: True
+  # Landsat patches are 60/120 px vs 240/480 targets (4x). False feeds them
+  # as-is (like baseline_dav2, output bilinearly resized to target); True
+  # upsamples the input to target size first (more ViT tokens).
+  upsample_input_to_target: False
+  # Learnable 4x upsampling module (DepthAnythingV2Height.upsample_head-style
+  # Conv/ReLU/PixelShuffle stack) applied to the head's output, since targets
+  # are 4x the Landsat patch. Must stay 1 if upsample_input_to_target is True.
+  out_in_scale_factor: 4
+
+
+# baseline_dav2.yaml's lr (2e-4 at real batch 32) scaled by sqrt(128/32)=2 for
+# this config's real batch of 128 -- the same sqrt rule fm_refiner-R-lumi.yaml
+# uses (not linear scaling; AdamW is less batch-sensitive). wd unchanged.
+optimizer:
+  lr: 4.0e-04
+  weight_decay: 3.0e-04
+
+
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Same as fm_refiner-R-lumi-4.yaml: 64 GPUs (8 nodes) x batch 2 = real batch 128.
+# max_iter and the periods below are the same nominal values as that config;
+# the training script scales them by 1/16 at runtime (64 GPUs / 4), exactly as
+# train_fm_refiner.py does, so both models see the same 3125 x 128 = 400k samples.
+dataloader:
+  effective_batch_size: 2
+  max_train_batch_size: 2
+  seed: 2024
+
+
+trainer:
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # ls_da.yaml: loss_huber_thres 120 (metres)
+  huber_delta: 120.0
+  target_vis_vmax: 30.0
+
+  # Params that get no gradient are auto-frozen at startup (see train script),
+  # so DDP does not need the extra graph traversal.
+  ddp_find_unused_parameters: False
+
+
+max_epoch: 1000
+max_iter: 50000
+
+
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse
