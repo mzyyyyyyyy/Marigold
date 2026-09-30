@@ -49,6 +49,7 @@ from tqdm import tqdm
 
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
 from depthfm.chmv2 import CHMv2Height, load_chmv2_baseline
+from depthfm.flux_refiner import FluxRefiner, build_flux_refiner
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
 from src.util.ps_lazydataset import LazyPatchDataset
@@ -194,10 +195,12 @@ def validate(
     # Always run validation through the raw (non-DDP) modules: DDP's forward
     # hooks assume every rank calls it in lockstep for gradient sync, which
     # doesn't apply here (no backward pass, independent per-rank shards).
-    orig_unet, orig_controlnet = fm_refiner.unet, fm_refiner.controlnet
-    fm_refiner.unet = _raw(orig_unet)
-    if orig_controlnet is not None:
-        fm_refiner.controlnet = _raw(orig_controlnet)
+    is_flux = isinstance(fm_refiner, FluxRefiner)   # LoRA refiner: no DDP-wrapped modules
+    if not is_flux:
+        orig_unet, orig_controlnet = fm_refiner.unet, fm_refiner.controlnet
+        fm_refiner.unet = _raw(orig_unet)
+        if orig_controlnet is not None:
+            fm_refiner.controlnet = _raw(orig_controlnet)
 
     fm_refiner.eval()
     all_preds, all_gts = [], []
@@ -273,7 +276,8 @@ def validate(
 
     fm_refiner.train()
     # Restore the (possibly DDP-wrapped) modules used for training.
-    fm_refiner.unet, fm_refiner.controlnet = orig_unet, orig_controlnet
+    if not is_flux:
+        fm_refiner.unet, fm_refiner.controlnet = orig_unet, orig_controlnet
 
     if is_distributed:
         # NCCL doesn't implement the point-to-point gather primitive, so use
@@ -350,6 +354,17 @@ def _raw(module: nn.Module) -> nn.Module:
 def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_dir, name="latest"):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.pth")
+    if isinstance(fm_refiner, FluxRefiner):
+        # LoRA-only checkpoint (the 12B base is never modified).
+        torch.save({
+            "step": step,
+            "refiner_type": "flux",
+            "lora_state": fm_refiner.lora_state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
+        }, path)
+        logging.info(f"Checkpoint saved to {path}")
+        return
     torch.save({
         "step": step,
         "use_controlnet": fm_refiner.use_controlnet,
@@ -364,6 +379,12 @@ def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_di
 
 def load_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, path):
     ckpt = torch.load(path, map_location="cpu")
+    if isinstance(fm_refiner, FluxRefiner):
+        fm_refiner.load_lora_state_dict(ckpt["lora_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        if lr_scheduler and ckpt.get("lr_scheduler_state"):
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler_state"])
+        return ckpt["step"]
     _raw(fm_refiner.unet).load_state_dict(ckpt["unet_state"])
     if fm_refiner.use_controlnet and ckpt.get("controlnet_state") is not None:
         _raw(fm_refiner.controlnet).load_state_dict(ckpt["controlnet_state"])
@@ -684,20 +705,48 @@ if __name__ == "__main__":
     use_controlnet = cfg.trainer.get("use_controlnet", True)
     controlnet_cond_mode = cfg.trainer.get("controlnet_cond_mode", "landsat_ps")
     velocity_parameterization = cfg.trainer.get("velocity_parameterization", "fixed")
-    fm_refiner = build_fm_refiner(
-        sd_pretrained_path=cfg.model.sd_pretrained_path,
-        n_landsat_bands=n_landsat_bands,
-        n_ps_bands=n_ps_bands,
-        ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
-        use_controlnet=use_controlnet,
-        controlnet_cond_mode=controlnet_cond_mode,
-        velocity_parameterization=velocity_parameterization,
-        noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
-        sample_sigma=cfg.trainer.get("sample_sigma", None),
-        sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
-        device=str(device),
-    )
-    fm_refiner = fm_refiner.to(device)
+    # refiner_type: "sd" (default: SD2.1 UNet + ControlNet, FMRefiner) or
+    # "flux" (FLUX.1 transformer + LoRA + token-concat conditioning, FluxRefiner).
+    is_flux = cfg.model.get("refiner_type", "sd") == "flux"
+    if is_flux:
+        if velocity_parameterization != "fixed":
+            raise NotImplementedError("refiner_type='flux' supports only velocity_parameterization='fixed'.")
+        use_controlnet = False   # conditioning is token concatenation, no ControlNet
+        fm_refiner = build_flux_refiner(
+            model_id=cfg.model.flux_model_id,
+            text_cache_path=cfg.model.flux_text_cache,
+            lora_rank=cfg.model.get("lora_rank", 64),
+            lora_alpha=cfg.model.get("lora_alpha", 64),
+            ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
+            noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
+            sample_sigma=cfg.trainer.get("sample_sigma", None),
+            sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
+            guidance_scale=cfg.model.get("flux_guidance", 1.0),
+            grad_checkpointing=cfg.model.get("grad_checkpointing", True),
+        )
+        fm_refiner = fm_refiner.to(device)
+        if is_distributed:
+            fm_refiner.broadcast_lora(0)   # identical LoRA init on every rank
+        if is_main_process:
+            n_lora = sum(p.numel() for p in fm_refiner.lora_parameters())
+            logging.info(f"FLUX refiner: {fm_refiner.n_lora_layers} LoRA-wrapped linears, "
+                         f"{n_lora / 1e6:.1f}M trainable LoRA params "
+                         f"(rank {cfg.model.get('lora_rank', 64)}); base transformer frozen.")
+    else:
+        fm_refiner = build_fm_refiner(
+            sd_pretrained_path=cfg.model.sd_pretrained_path,
+            n_landsat_bands=n_landsat_bands,
+            n_ps_bands=n_ps_bands,
+            ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
+            use_controlnet=use_controlnet,
+            controlnet_cond_mode=controlnet_cond_mode,
+            velocity_parameterization=velocity_parameterization,
+            noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
+            sample_sigma=cfg.trainer.get("sample_sigma", None),
+            sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
+            device=str(device),
+        )
+        fm_refiner = fm_refiner.to(device)
 
     # ---- Coarse-height model (frozen): fine-tuned DAv2 (default) or CHMv2 baseline ----
     # (variable keeps its historical name dav2_model; it may hold either.)
@@ -723,17 +772,22 @@ if __name__ == "__main__":
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
 
     # ---- DDP wrapping ----
-    unet_raw       = fm_refiner.unet
-    controlnet_raw = fm_refiner.controlnet if use_controlnet else None
-    if is_distributed:
+    # (FLUX/LoRA path: no DDP -- the frozen 12B base would be broadcast to all
+    # ranks for nothing; only the small LoRA grads are all-reduced by hand.)
+    unet_raw       = None if is_flux else fm_refiner.unet
+    controlnet_raw = fm_refiner.controlnet if (use_controlnet and not is_flux) else None
+    if is_distributed and not is_flux:
         ddp_ids = [device.index] if device.type == "cuda" else None
         fm_refiner.unet = DDP(unet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
         if use_controlnet:
             fm_refiner.controlnet = DDP(controlnet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
 
     # ---- Optimizer ----
-    param_groups = [{"params": unet_raw.parameters(), "lr": cfg.optimizer.lr_unet}]
-    if use_controlnet:
+    if is_flux:
+        param_groups = [{"params": fm_refiner.lora_parameters(), "lr": cfg.optimizer.lr_lora}]
+    else:
+        param_groups = [{"params": unet_raw.parameters(), "lr": cfg.optimizer.lr_unet}]
+    if use_controlnet and not is_flux:
         param_groups.append({"params": controlnet_raw.parameters(), "lr": cfg.optimizer.lr_controlnet})
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.optimizer.weight_decay)
 
@@ -825,8 +879,9 @@ if __name__ == "__main__":
             if is_first_micro:
                 optimizer.zero_grad()
 
-            ddp_modules = [m for m in (fm_refiner.unet, fm_refiner.controlnet if use_controlnet else None)
-                           if isinstance(m, DDP)]
+            ddp_modules = [] if is_flux else [
+                m for m in (fm_refiner.unet, fm_refiner.controlnet if use_controlnet else None)
+                if isinstance(m, DDP)]
             with _maybe_no_sync(ddp_modules, skip_sync):
                 # FM loss
                 loss = fm_refiner(
@@ -838,9 +893,14 @@ if __name__ == "__main__":
                 (loss / accumulation_steps).backward()
 
             if is_last_micro:
-                all_params = list(unet_raw.parameters())
-                if use_controlnet:
-                    all_params += list(controlnet_raw.parameters())
+                if is_flux:
+                    if is_distributed:
+                        fm_refiner.all_reduce_grads(world_size)
+                    all_params = fm_refiner.lora_parameters()
+                else:
+                    all_params = list(unet_raw.parameters())
+                    if use_controlnet:
+                        all_params += list(controlnet_raw.parameters())
                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 optimizer.step()
                 if lr_scheduler is not None:
