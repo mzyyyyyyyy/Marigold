@@ -996,13 +996,16 @@ if __name__ == "__main__":
         logging.info("Running full validation on entire val set...")
     final_metrics, final_fig = validate(
         fm_refiner, dav2_model, val_dataset, device,
-        n_steps=cfg.validation.n_steps,
+        # Final full-val pass may use a heavier sampler than the periodic
+        # subset validations (final_n_steps / final_ensemble_size, default =
+        # the periodic values) -- see fm_refiner-R-lumi-6.yaml.
+        n_steps=cfg.validation.get("final_n_steps", cfg.validation.n_steps),
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         full=True,
         method=cfg.validation.get("method", "euler"),
         sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
-        ensemble_size=cfg.validation.get("ensemble_size", 1),
+        ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
         num_workers=cfg_data.workers,  # full=True shards the whole val set,
         # worth the worker-process cost here (unlike the periodic call above).

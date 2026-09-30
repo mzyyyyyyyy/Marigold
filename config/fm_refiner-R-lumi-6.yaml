@@ -158,18 +158,15 @@ trainer:
 
 # Validation / inference
 validation:
-  # RFMSR's own default (infer_rfmsr.py: INFER_STEPS = 28) is much higher
-  # than fm_refiner-R-lumi-3.yaml's 4 — 10 here is a compute-cost compromise,
-  # not a match to RFMSR's exact step count. Since sample_noise_mode=
-  # "init_only" injects noise once regardless of step count (unlike -3.yaml's
-  # "sde" mode, whose total injected noise fraction scales with n_steps —
-  # see -3.yaml's comment), n_steps here mainly affects ODE discretization
-  # accuracy, not how much noise gets added.
-  n_steps: 10
-
-  # Same rationale as fm_refiner-R-lumi-3.yaml: averages ensemble_size
-  # independent stochastic refine() draws before computing metrics.
-  ensemble_size: 5
+  # Periodic (rotating 10% subset) validation: cheap sampler. A FLUX forward is
+  # ~19s/sample at 10 steps x 5 ensemble (measured, 8 GPUs) -- ~3.6 min per
+  # validation at 64 GPUs x ~50 validations would cost more than the training.
+  n_steps: 4
+  ensemble_size: 1
+  # Final full-validation pass keeps fm_refiner-R-lumi-5's sampler (10 steps,
+  # ensemble 5) so the final metrics stay comparable with -5.
+  final_n_steps: 10
+  final_ensemble_size: 5
 
 
 # Training budget – unchanged from fm_refiner-R-lumi.yaml

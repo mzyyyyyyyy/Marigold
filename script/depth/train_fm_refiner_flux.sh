@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=256G
-#SBATCH --time=0-05:00:00
+#SBATCH --time=0-06:00:00
 #SBATCH --account=project_465002934
 #SBATCH --output=train_%j.out
 #SBATCH --error=train_%j.err
