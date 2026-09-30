@@ -55,8 +55,13 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /scratch/project_465002934:/scratch/project_465002934 \
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
+# The sif ships transformers 5.3.0, which has no CHMv2 (needed by
+# fm_refiner-R-lumi-5's coarse model). This overlay holds transformers 5.17.0
+# (+ matching tokenizers/safetensors), prepended to PYTHONPATH for this job
+# only; fm_refiner/diffusers 0.37 build fine with it (checked on CPU).
+OVERLAY=/flash/project_465002934/env/py_overlay_tf517
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_fm_refiner.py
-CONFIG=config/fm_refiner-R-lumi-4.yaml
+CONFIG=config/fm_refiner-R-lumi-5.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write (see train_sr_fm_refiner.sh). Write outputs to the
@@ -70,7 +75,7 @@ OUTPUT_DIR=/flash/project_465002934/Marigold_output
 # passed here) so the retry loop below can clear it before each retry.
 JOB_NAME=$(basename "$CONFIG" .yaml)
 RUN_DIR="$OUTPUT_DIR/$JOB_NAME"
-export BIND SIF SCRIPT CONFIG OUTPUT_DIR
+export BIND SIF SCRIPT CONFIG OUTPUT_DIR OVERLAY
 
 # Turn on RCCL/NCCL's own debug logging (one file per rank, since many ranks
 # interleaved on one stderr is unreadable) so that a multi-node collective
@@ -113,7 +118,7 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     # debug from Python tracebacks + NCCL_DEBUG logs instead.
     ulimit -c 0
     export NCCL_DEBUG_FILE="$NCCL_DEBUG_ROOT/rank_${SLURM_PROCID}_resubmit${RESUBMIT_COUNT}_attempt${ATTEMPT}.log"
-    singularity exec $BIND $SIF python -u $SCRIPT --config $CONFIG --output_dir $OUTPUT_DIR
+    singularity exec $BIND --env PYTHONPATH=$OVERLAY $SIF python -u $SCRIPT --config $CONFIG --output_dir $OUTPUT_DIR
   '
   status=$?
   if [ "$status" -eq 0 ]; then

@@ -48,6 +48,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
+from depthfm.chmv2 import CHMv2Height, load_chmv2_baseline
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
 from src.util.ps_lazydataset import LazyPatchDataset
@@ -239,7 +240,7 @@ def validate(
         landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
         landsat_for_dav2 = (landsat + 1.0) / 2.0
-        h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+        h_coarse = _run_coarse(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
         # Each call is an independent stochastic draw when sample_sigma>0
@@ -297,6 +298,15 @@ def validate(
     metrics = compute_metrics(pred_cat, gt_cat)
     fig = _make_vis_figure(vis_samples) if vis_samples else None
     return metrics, fig
+
+
+def _run_coarse(coarse_model, landsat_01: torch.Tensor, target_size: tuple) -> torch.Tensor:
+    """Coarse height (metres, (B,1,*target_size)) from Landsat in [0,1], from either
+    the fine-tuned DAv2 (run_dav2) or the fine-tuned CHMv2 baseline (CHMv2Height)."""
+    if isinstance(coarse_model, CHMv2Height):
+        with torch.no_grad():
+            return coarse_model(landsat_01, target_size=target_size)
+    return run_dav2(coarse_model, landsat_01, target_size=target_size)
 
 
 def _normalize_coarse(h_coarse: torch.Tensor, target_stats: dict) -> torch.Tensor:
@@ -689,12 +699,24 @@ if __name__ == "__main__":
     )
     fm_refiner = fm_refiner.to(device)
 
-    # ---- DAv2 (frozen) ----
-    dav2_model = load_dav2(
-        dav2_path=cfg.model.dav2_pretrained_path,
-        backbone=cfg.model.dav2_backbone,
-        out_in_scale_factor=cfg.model.dav2_out_in_scale_factor,
-    )
+    # ---- Coarse-height model (frozen): fine-tuned DAv2 (default) or CHMv2 baseline ----
+    # (variable keeps its historical name dav2_model; it may hold either.)
+    coarse_model_type = cfg.model.get("coarse_model", "dav2")
+    if coarse_model_type == "chmv2":
+        with open(cfg_data.input_stats_file) as f:
+            _in_stats = json.load(f)[str(cfg_data.year)]
+        dav2_model = load_chmv2_baseline(
+            model_dir=cfg.model.chmv2_model_id,
+            ckpt_path=cfg.model.chmv2_ckpt_path,
+            mean=_in_stats["mean"], std=_in_stats["std"],
+            out_in_scale_factor=cfg.model.chmv2_out_in_scale_factor,
+        )
+    else:
+        dav2_model = load_dav2(
+            dav2_path=cfg.model.dav2_pretrained_path,
+            backbone=cfg.model.dav2_backbone,
+            out_in_scale_factor=cfg.model.dav2_out_in_scale_factor,
+        )
     dav2_model = dav2_model.to(device)
 
     # Load target stats for coarse normalization (same p1/p99 as dataloader)
@@ -791,7 +813,7 @@ if __name__ == "__main__":
             # DAv2 expects [0,1] input; dataloader gives [-1,1] → convert back
             with torch.no_grad():
                 landsat_for_dav2 = (landsat + 1.0) / 2.0
-                h_coarse = run_dav2(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+                h_coarse = _run_coarse(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
                 h_coarse = _normalize_coarse(h_coarse, target_stats)
 
             # Only the final micro-batch of a window should let DDP all-reduce

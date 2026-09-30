@@ -140,3 +140,22 @@ class CHMv2Height(nn.Module):
         names = [n for n, p in self.named_parameters() if p.requires_grad and p.grad is None]
         self.zero_grad(set_to_none=True)
         return names
+
+
+def load_chmv2_baseline(model_dir: str, ckpt_path: str, mean: list, std: list,
+                        out_in_scale_factor: int = 1) -> nn.Module:
+    """Load a CHMv2Height checkpoint trained by script/depth/train_baseline_chmv2.py
+    (CHMv2 + learnable upsample_head) as a frozen coarse-height predictor.
+
+    model_dir: local dir of facebook/dinov3-vitl16-chmv2-dpt-head (only config is
+        read here -- pretrained=False -- all weights come from ckpt_path).
+    out_in_scale_factor: must match the value used in that training run.
+    Call as model(landsat_01, target_size) -> (B, 1, *target_size) in metres.
+    """
+    model = CHMv2Height(model_id=model_dir, mean=mean, std=std, pretrained=False,
+                        freeze_backbone=False, out_in_scale_factor=out_in_scale_factor)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=True)
+    model.requires_grad_(False)
+    model.eval()
+    return model
