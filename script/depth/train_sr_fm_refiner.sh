@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=256G
-#SBATCH --time=0-05:00:00
+#SBATCH --time=0-08:00:00
 #SBATCH --account=project_465002934
 #SBATCH --output=train_%j.out
 #SBATCH --error=train_%j.err
@@ -65,7 +65,11 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_sr_fm_refiner.py
-CONFIG=config/sr_fm_refiner_v11-lumi.yaml
+# The sif ships transformers 5.3.0, which has no CHMv2 (needed by v12's coarse
+# model). This overlay holds transformers 5.17.0, prepended to PYTHONPATH for
+# this job only (same as finer_lumi's train_fm_refiner.sh).
+OVERLAY=/flash/project_465002934/env/py_overlay_tf517
+CONFIG=config/sr_fm_refiner_v12-lumi.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write. Write outputs to the project's Flash storage
@@ -79,7 +83,7 @@ OUTPUT_DIR=/flash/project_465002934/Marigold_output
 # passed here) so the retry loop below can clear it before each retry.
 JOB_NAME=$(basename "$CONFIG" .yaml)
 RUN_DIR="$OUTPUT_DIR/$JOB_NAME"
-export BIND SIF SCRIPT CONFIG OUTPUT_DIR
+export BIND SIF SCRIPT CONFIG OUTPUT_DIR OVERLAY
 
 # Forcing GDR off (NCCL_NET_GDR_LEVEL=0) as a diagnostic only narrowed the
 # stall from "all 64 ranks hang" down to "2 of 64 ranks hang" — it didn't
@@ -139,7 +143,7 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     # them outright.
     ulimit -c 0
     export NCCL_DEBUG_FILE="$NCCL_DEBUG_ROOT/rank_${SLURM_PROCID}_resubmit${RESUBMIT_COUNT}_attempt${ATTEMPT}.log"
-    singularity exec $BIND $SIF python -u $SCRIPT --config $CONFIG --output_dir $OUTPUT_DIR
+    singularity exec $BIND --env PYTHONPATH=$OVERLAY $SIF python -u $SCRIPT --config $CONFIG --output_dir $OUTPUT_DIR
   '
   status=$?
   if [ "$status" -eq 0 ]; then

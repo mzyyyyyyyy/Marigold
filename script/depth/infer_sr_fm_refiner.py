@@ -59,6 +59,7 @@ from rasterio.transform import from_bounds
 from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
 
+from depthfm.chmv2 import load_chmv2_baseline
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
 from depthfm.sr_module import SRModule, build_sr_module
 
@@ -201,11 +202,24 @@ class SRFMPredictor:
             device=str(self.device),
         ).to(self.device)
 
-        self.dav2 = load_dav2(
-            dav2_path=model_cfg["dav2_pretrained_path"],
-            backbone=model_cfg["dav2_backbone"],
-            out_in_scale_factor=model_cfg["dav2_out_in_scale_factor"],
-        ).to(self.device)
+        self.coarse_model_type = model_cfg.get("coarse_model", "dav2")
+        if self.coarse_model_type == "chmv2":
+            # Fine-tuned CHMv2 baseline (same loader as train_sr_fm_refiner.py's
+            # coarse_model: chmv2_baseline); attribute keeps the name self.dav2.
+            with open(cfg["data"]["globalnorm_stats_file"]) as f:
+                _in_stats = json.load(f)[str(cfg["data"]["year"])]
+            self.dav2 = load_chmv2_baseline(
+                model_dir=model_cfg["chmv2_model_id"],
+                ckpt_path=model_cfg["chmv2_ckpt_path"],
+                mean=_in_stats["mean"], std=_in_stats["std"],
+                out_in_scale_factor=model_cfg["chmv2_out_in_scale_factor"],
+            ).to(self.device)
+        else:
+            self.dav2 = load_dav2(
+                dav2_path=model_cfg["dav2_pretrained_path"],
+                backbone=model_cfg["dav2_backbone"],
+                out_in_scale_factor=model_cfg["dav2_out_in_scale_factor"],
+            ).to(self.device)
 
         self.sr_module = build_sr_module(
             OmegaConf.to_container(train_cfg.sr_module, resolve=True)
@@ -490,9 +504,12 @@ class SRFMPredictor:
                 with torch.no_grad():
                     landsat_for_dav2 = (lr + 1.0) / 2.0
                     hr_size = (round(patch_size * out_scale), round(patch_size * out_scale))
-                    h_coarse = run_dav2(
-                        self.dav2, landsat_for_dav2, target_size=hr_size,
-                    )
+                    if self.coarse_model_type == "chmv2":
+                        h_coarse = self.dav2(landsat_for_dav2, target_size=hr_size)
+                    else:
+                        h_coarse = run_dav2(
+                            self.dav2, landsat_for_dav2, target_size=hr_size,
+                        )
                     h_coarse = _normalize_coarse(h_coarse, self.target_stats)
                     pseudo_ps = self.sr_module(lr, target_size=hr_size)
 

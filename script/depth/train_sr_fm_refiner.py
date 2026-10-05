@@ -55,7 +55,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
-from depthfm.chmv2 import load_chmv2, run_chmv2
+from depthfm.chmv2 import load_chmv2, load_chmv2_baseline, run_chmv2
 from depthfm.sr_module import SRModule, build_sr_module
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
@@ -264,7 +264,11 @@ def validate(
         landsat = inputs_lr[:, :n_landsat_bands]
         landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
-        if coarse_model_type == "chmv2":
+        if coarse_model_type == "chmv2_baseline":
+            # Fine-tuned CHMv2 baseline (CHMv2Height): takes [0,1] input.
+            with torch.no_grad():
+                h_coarse = coarse_model((landsat + 1.0) / 2.0, target_size=(H_hr, W_hr))
+        elif coarse_model_type == "chmv2":
             h_coarse = run_chmv2(coarse_model, landsat, (H_hr, W_hr), chmv2_mean, chmv2_std)
         else:
             landsat_for_dav2 = (landsat + 1.0) / 2.0
@@ -967,7 +971,17 @@ if __name__ == "__main__":
 
     coarse_model_type = cfg.model.get("coarse_model", "dav2")
     _chmv2_mean = _chmv2_std = None
-    if coarse_model_type == "chmv2":
+    if coarse_model_type == "chmv2_baseline":
+        # Frozen CHMv2 trained by train_baseline_chmv2.py (DPT head + 4x upsample_head)
+        input_stats = json.load(open(cfg_data.input_stats_file))
+        coarse_model = load_chmv2_baseline(
+            model_dir=cfg.model.chmv2_model_id,
+            ckpt_path=cfg.model.chmv2_ckpt_path,
+            mean=input_stats[str(cfg_data.year)]["mean"],
+            std=input_stats[str(cfg_data.year)]["std"],
+            out_in_scale_factor=cfg.model.chmv2_out_in_scale_factor,
+        ).to(device)
+    elif coarse_model_type == "chmv2":
         coarse_model = load_chmv2(cfg.model.chmv2_model_id).to(device)
         input_stats = json.load(open(cfg_data.input_stats_file))
         _chmv2_mean = input_stats[str(cfg_data.year)]["mean"]
@@ -1150,7 +1164,9 @@ if __name__ == "__main__":
 
             # Coarse depth (always frozen)
             with torch.no_grad():
-                if coarse_model_type == "chmv2":
+                if coarse_model_type == "chmv2_baseline":
+                    h_coarse = coarse_model((landsat + 1.0) / 2.0, target_size=(H_hr, W_hr))
+                elif coarse_model_type == "chmv2":
                     h_coarse = run_chmv2(coarse_model, landsat, (H_hr, W_hr), _chmv2_mean, _chmv2_std)
                 else:
                     landsat_for_dav2 = (landsat + 1.0) / 2.0
@@ -1353,7 +1369,7 @@ if __name__ == "__main__":
         logging.info("Running full validation on entire val set...")
     final_metrics, final_fig = validate(
         fm_refiner, sr_module, coarse_model, val_dataset, device,
-        n_steps=cfg.validation.n_steps,
+        n_steps=cfg.validation.get("final_n_steps", cfg.validation.n_steps),
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         full=True,
@@ -1363,7 +1379,7 @@ if __name__ == "__main__":
         coarse_model_type=coarse_model_type,
         chmv2_mean=_chmv2_mean if coarse_model_type == "chmv2" else None,
         chmv2_std=_chmv2_std if coarse_model_type == "chmv2" else None,
-        n_avg=cfg.validation.get("n_avg", 1),
+        n_avg=cfg.validation.get("final_n_avg", cfg.validation.get("n_avg", 1)),
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
         num_workers=cfg_data.workers,  # full=True shards the whole val set,
         # worth the worker-process cost here (unlike the periodic call above).

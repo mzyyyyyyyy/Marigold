@@ -1,0 +1,73 @@
+# Large-scale inference config for sr_fm_refiner_v12-lumi on Landsat EUR test tiles
+# Data mirrors sr_fm_refiner_v2_infer_ls.yaml (same tiles); model is the newly
+# trained sr_fm_refiner_v12-lumi (finer_lumi's InDI-style noise + v2-R2-style
+# TDP loss ported onto sr_finer_lumi's SR+ControlNet architecture).
+
+data:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2_map/2019"
+  year: 2019
+  output_dir: "/flash/project_465002934/result/sr_fm_refiner_v12"
+  output_suffix: "chm"
+  file_type: "jp2"
+  selected_bands: [0, 1, 2]          # RGB only (same as v2_infer_ls)
+  selected_percentile: ["p50"]
+  selected_resolution: ""
+  exclude_list: ["original_data", "lowres", "30m"]
+  exclude_strings: ["lowres", "1000m", "100m", "30m"]
+  selected_test_tile: []
+  grid_id_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_test_grids_1deg_lc.geojson"
+
+  use_gb_minmax: True
+  globalnorm_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  patch_size: 120        # LR patch size; output will be 4× = 480 px
+  out_scale: 4.0         # sr_fm_refiner upscales ×4 (SR + DAv2 both ×4)
+  stride: 16             # stride in LR pixels (= 64 px in output space)
+
+model:
+  # sr_fm_refiner_v12-lumi checkpoint (best.pth — the checkpoint the training
+  # run's own final full-validation loaded and reported metrics for; see
+  # train_sr_fm_refiner.py's "Final full validation" block).
+  ckpt_path: "/flash/project_465002934/Marigold_output/sr_fm_refiner_v12-lumi/checkpoint/best.pth"
+  config_path: "/flash/project_465002934/Marigold_output/sr_fm_refiner_v12-lumi/config.yaml"
+
+  # (DAv2 keys unused in v12)
+  # v12 coarse model: fine-tuned CHMv2 baseline (same as training config)
+  coarse_model: "chmv2"
+  chmv2_model_id: "/flash/project_465002934/model/models--facebook--dinov3-vitl16-chmv2-dpt-head/snapshots/37130c851a3cf6720f974490707059f5edaeed4e"
+  chmv2_ckpt_path: "/flash/project_465002934/Marigold_output/baseline_chmv2-lumi/checkpoint/best.pth"
+  chmv2_out_in_scale_factor: 4
+
+  # Target stats for coarse normalisation
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  # v12 was trained with the InDI (same as v11)-style asymmetric noise mechanism
+  # (depthfm/fm_refiner.py's noise_sigma/sample_noise_mode, ported from
+  # fm_refiner-R-lumi-4 on the finer_lumi branch), NOT this branch's own
+  # bridge_sigma mechanism that sr_fm_refiner_v2 used — bridge_sigma must
+  # stay 0.0 here, the noise is carried by noise_sigma/sample_sigma instead.
+  bridge_sigma: 0.0
+  noise_sigma: 1.0
+  sample_sigma: 1.0
+  sample_noise_mode: init_only   # noise injected once before integration, then pure ODE
+
+  # Matches sr_fm_refiner_v12-lumi.yaml's validation: block exactly, so this
+  # mapping run reproduces the same inference behavior that was actually
+  # validated during training (see config/sr_fm_refiner_v12-lumi.yaml).
+  # NOTE: n_average=5 means 5 independent stochastic refine() calls per
+  # patch (n_steps=10 each) — 50 network forward passes per patch, ~12.5x
+  # sr_fm_refiner_v2_infer_ls.yaml's cost (n_steps=4, n_average=1). Budget
+  # runtime accordingly for a large-scale map.
+  n_average: 5
+  n_steps: 10
+  method: "euler"
+
+  # sr_fm_refiner_v12-lumi was trained with concat_landsat_hr: True (see
+  # config/sr_fm_refiner_v12-lumi.yaml's trainer: block) — same as v2.
+  concat_landsat_hr: true
+
+prediction:
+  batch_size: 1          # one LR patch at a time (model is memory-heavy)
+  operator: "blend"
+  file_type: "tif"
+  data_type: "float32"

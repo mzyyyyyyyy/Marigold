@@ -24,11 +24,12 @@ BIND="--bind /var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libja
       --bind /flash/project_465002934:/flash/project_465002934"
 SIF=/flash/project_465002934/env/marigold_env.sif
 SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/infer_sr_fm_refiner.py
-CONFIG=config/sr_fm_refiner_v11_infer_ls.yaml
+OVERLAY=/flash/project_465002934/env/py_overlay_tf517   # transformers 5.17 (CHMv2)
+CONFIG=config/sr_fm_refiner_v12_infer_ls.yaml
 
 # Step 1: all 64 ranks compute their patch shard and write partials.
-srun singularity exec $BIND $SIF python -u $SCRIPT --config $CONFIG
+srun singularity exec $BIND --env PYTHONPATH=$OVERLAY $SIF python -u $SCRIPT --config $CONFIG
 
 # Step 2: single task merges all partials into final tifs. Runs after step 1
 # completes (srun steps within one job script run sequentially).
-srun --ntasks=1 --nodes=1 singularity exec $BIND $SIF python -u $SCRIPT --config $CONFIG --merge
+srun --ntasks=1 --nodes=1 singularity exec $BIND --env PYTHONPATH=$OVERLAY $SIF python -u $SCRIPT --config $CONFIG --merge
