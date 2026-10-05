@@ -670,6 +670,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SR + FM Refiner Alternate Training")
     parser.add_argument("--config", type=str, default="config/sr_fm_refiner_v10.yaml")
     parser.add_argument("--resume_run", type=str, default=None)
+    parser.add_argument("--eval_ckpt", type=str, default=None,
+                        help="Eval-only: skip training, load this checkpoint (<run>/checkpoint/X.pth) "
+                             "and run only the final full validation. Uses <run>/config.yaml and writes "
+                             "logs/metrics to <run>/eval_X/ without touching the run's checkpoints.")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_cuda", action="store_true")
     parser.add_argument("--no_wandb", action="store_true")
@@ -749,7 +753,13 @@ if __name__ == "__main__":
         _barrier()
 
     # ---- Config ----
-    if args.resume_run is not None:
+    if args.eval_ckpt is not None:
+        _run_dir = os.path.dirname(os.path.dirname(args.eval_ckpt))
+        cfg = OmegaConf.load(os.path.join(_run_dir, "config.yaml"))
+        job_name = os.path.basename(_run_dir)
+        out_dir_run = os.path.join(
+            _run_dir, "eval_" + os.path.splitext(os.path.basename(args.eval_ckpt))[0])
+    elif args.resume_run is not None:
         out_dir_run = os.path.dirname(os.path.dirname(args.resume_run))
         cfg = OmegaConf.load(os.path.join(out_dir_run, "config.yaml"))
         job_name = os.path.basename(out_dir_run)
@@ -811,7 +821,7 @@ if __name__ == "__main__":
     if is_main_process:
         os.makedirs(out_dir_ckpt, exist_ok=True)
         config_logging(cfg.logging, out_dir=out_dir_run)
-        if args.resume_run is None:
+        if args.resume_run is None and args.eval_ckpt is None:
             with open(os.path.join(out_dir_run, "config.yaml"), "w") as f:
                 OmegaConf.save(cfg, f)
             if total_scale > 1:
@@ -1130,7 +1140,7 @@ if __name__ == "__main__":
     pbar = tqdm(total=cfg.max_iter, initial=step, desc="Training", dynamic_ncols=True,
                 disable=not is_main_process)
 
-    for epoch in range(cfg.max_epoch):
+    for epoch in range(0 if args.eval_ckpt else cfg.max_epoch):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         for batch in train_loader:
@@ -1358,12 +1368,16 @@ if __name__ == "__main__":
     # Every rank must load the same best checkpoint (not just rank0) since
     # the sharded validate() call below combines predictions across ranks —
     # mixing a stale-weight rank into that would corrupt the aggregate metric.
-    best_ckpt = os.path.join(out_dir_ckpt, "best.pth")
+    best_ckpt = args.eval_ckpt or os.path.join(out_dir_ckpt, "best.pth")
     if os.path.exists(best_ckpt):
-        load_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
-                        lr_scheduler_fm, lr_scheduler_sr, best_ckpt)
+        _loaded_step = load_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
+                                       lr_scheduler_fm, lr_scheduler_sr, best_ckpt)
+        if args.eval_ckpt:
+            step = _loaded_step
         if is_main_process:
-            logging.info(f"Loaded best checkpoint for final validation")
+            logging.info(f"Loaded checkpoint for final validation: {best_ckpt} (step={_loaded_step})")
+    elif args.eval_ckpt:
+        raise FileNotFoundError(best_ckpt)
 
     if is_main_process:
         logging.info("Running full validation on entire val set...")
@@ -1393,9 +1407,17 @@ if __name__ == "__main__":
             plt.close(final_fig)
         wandb.log(flog, step=step)
 
-        save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
-                        lr_scheduler_fm, lr_scheduler_sr,
-                        step, out_dir_ckpt, "final")
+        if args.eval_ckpt:
+            with open(os.path.join(out_dir_run, "metrics.json"), "w") as f:
+                json.dump({"ckpt": args.eval_ckpt, "step": step,
+                           "n_steps": cfg.validation.get("final_n_steps", cfg.validation.n_steps),
+                           "n_avg": cfg.validation.get("final_n_avg", cfg.validation.get("n_avg", 1)),
+                           **{k: float(v) for k, v in final_metrics.items()}}, f, indent=2)
+            logging.info(f"Eval-only done → {out_dir_run}/metrics.json")
+        else:
+            save_checkpoint(fm_refiner, sr_module, optimizer_fm, optimizer_sr,
+                            lr_scheduler_fm, lr_scheduler_sr,
+                            step, out_dir_ckpt, "final")
         logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
 
     if is_distributed:
