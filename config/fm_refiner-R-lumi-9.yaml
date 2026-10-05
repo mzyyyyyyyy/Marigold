@@ -1,0 +1,181 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: fm_refiner-R-lumi-9
+
+# Dataset config – identical to fm_refiner-R-lumi.yaml/-3.yaml. This config
+# is fm_refiner-R-lumi-3.yaml's noise mechanism retargeted to match RFMSR
+# (github.com/Faze-Hsw/RFMSR) instead of InDI's own paper defaults — same
+# asymmetric noise schedule shape (both are linear-in-t, zero at the clean
+# end, max at the coarse end; RFMSR's t*sigma is InDI's own Eq.7 verbatim,
+# ours is the (1-t)*sigma mirror of it because this codebase's t=1 is the
+# clean end instead of InDI/RFMSR's t=0 — see fm_refiner-R-lumi-3.yaml's
+# comments), but two things changed to match RFMSR specifically rather than
+# InDI's paper:
+#   1. noise_sigma/sample_sigma: 0.01 -> 1.0, matching RFMSR's config
+#      (configs/train_rfmsr.yaml: "sigma: 1.0"). Confirmed RFMSR encodes
+#      through the same pretrained SD2.1 VAE with the same 0.18215 scaling
+#      factor we use (models/rfmsr.py's vae_encode()), so this is now a
+#      directly comparable number in the same latent units — modulo RFMSR
+#      encoding natural photos (what that VAE/scale was calibrated for) vs
+#      this project encoding canopy-height maps, which may have different
+#      latent statistics; not verified empirically here.
+#   2. sample_noise_mode: "init_only" — RFMSR's infer_rfmsr.py injects noise
+#      exactly ONCE (x = z_lr + sigma*randn(...)) before a purely
+#      deterministic Euler ODE loop, unlike InDI's own Eq.10 (and this
+#      project's fm_refiner-R-lumi-3.yaml / sr_finer_lumi's bridge_noise),
+#      which inject fresh noise at every step (Euler-Maruyama SDE). RFMSR
+#      does NOT reproduce InDI's per-step noisy sampling — this is RFMSR's
+#      own simplification, not something inherited from InDI's paper.
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# fm_refiner-R-lumi-9: RFMSR-style residual flow matching (same data / CHMv2 coarse model / noise
+# mechanism sigma=1.0 init_only / budget as fm_refiner-R-lumi-5.yaml) with a small DiT instead of
+# a SD2.1 UNet+ControlNet or a LoRA-tuned FLUX (depthfm/dit_refiner.py, depthfm/lightningdit.py):
+#   * backbone: LightningDiT-0.5B (486M params, all trained) initialised from the public VOSR_0.5B_ms
+#     checkpoint (github.com/cswry/VOSR, Apache-2.0) -- the same pretrained model RFMSR starts from.
+#   * latent space: the SD2.1 VAE (frozen; verified identical to VOSR's), so latents are compatible.
+#   * conditions: coarse latent y0 (VOSR's LQ slot) + PlanetScope latent (zero-initialised extra input
+#     channels; dropped for ps_dropout_p of the samples, always absent at inference). NO Landsat latent.
+#   * semantic condition: tokens of the frozen CHMv2 (DINOv3-sat) backbone for the Landsat patch,
+#     replacing VOSR's DINOv2 features, via the DiT's cross-attention.
+#   * EMA weights are what validation/inference use.
+# Model paths
+model:
+  refiner_type: "dit"
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"   # only the frozen VAE is used
+  vosr_ckpt: "/flash/project_465002934/model/VOSR_0.5B_ms/checkpoints/ema_model.safetensors"
+  dit_z_dims: 1024              # width of the CHMv2 backbone tokens (VOSR: 768 DINOv2-B features)
+  grad_checkpointing: False
+
+  # Coarse model: the CHMv2 baseline (also provides the semantic tokens).
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+  coarse_model: "chmv2"
+  chmv2_model_id: "/flash/project_465002934/model/models--facebook--dinov3-vitl16-chmv2-dpt-head/snapshots/37130c851a3cf6720f974490707059f5edaeed4e"
+  chmv2_ckpt_path: "/flash/project_465002934/Marigold_output/baseline_chmv2-lumi/checkpoint/best.pth"
+  chmv2_out_in_scale_factor: 4   # must match baseline_chmv2-lumi.yaml
+  chmv2_feature_layer: 2         # backbone stage (0..3 = blocks 6/12/18/24) feeding the cross-attention
+
+
+# Optimizer – unchanged from fm_refiner-R-lumi.yaml
+optimizer:
+  # RFMSR/VOSR fine-tune at 5e-5 with batch 32; here real batch 128 (64 GPUs x 2) -> x sqrt(4), the
+  # same rule as the other lumi configs. AdamW(0.9, 0.95), wd 1e-2, grad-clip 1.0 (VOSR recipe).
+  lr_dit: 1.0e-04
+  weight_decay: 1.0e-02
+
+
+# LR scheduler (cosine annealing)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader – unchanged from fm_refiner-R-lumi.yaml
+dataloader:
+  effective_batch_size: 2
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  use_controlnet: False   # unused by refiner_type=dit
+  ema_decay: 0.998        # RFMSR uses 0.999 over 10k steps; 3125 steps here -> ~500-step horizon
+  ps_dropout_p: 0.3       # probability of replacing PS with null token
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # velocity_parameterization left at its default "fixed" (not set here) —
+  # noise_sigma/sample_sigma are only implemented for "fixed".
+
+  # RFMSR's noise strength (configs/train_rfmsr.yaml: sigma: 1.0), not
+  # InDI's own paper's 0.01 (see fm_refiner-R-lumi-3.yaml). Same schedule
+  # shape as -3.yaml, just a different magnitude:
+  #   z_t = (1-t)*z_coarse + t*z_gt + (1-t)*noise_sigma*eps
+  #   v_target = (z_gt - z_coarse) - noise_sigma*eps
+  noise_sigma: 1.0
+
+  # Matches RFMSR's flow_sigma (also defaults to 1.0, same as training).
+  sample_sigma: 1.0
+
+  # RFMSR-style: inject sample_sigma*eps once before integration starts,
+  # then a pure deterministic ODE for the rest of refine() — NOT the
+  # per-step SDE noise fm_refiner-R-lumi-3.yaml uses (see module docstring
+  # in depthfm/fm_refiner.py for both modes).
+  sample_noise_mode: init_only
+
+
+# Validation / inference
+validation:
+  # Periodic (rotating 10% subset): 4 steps x 1 draw. Final full pass: -5's protocol (10 steps x 5 draws).
+  n_steps: 4
+  ensemble_size: 1
+  final_n_steps: 10
+  final_ensemble_size: 5
+
+
+# Training budget – unchanged from fm_refiner-R-lumi.yaml
+max_epoch: 1000
+max_iter: 50000
+
+
+# Eval metrics logged during validation
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

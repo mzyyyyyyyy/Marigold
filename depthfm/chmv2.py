@@ -129,6 +129,24 @@ class CHMv2Height(nn.Module):
         return depth
 
     @torch.no_grad()
+    def forward_with_features(self, x01: torch.Tensor, target_size: tuple = None, feature_layer: int = 2):
+        """forward() plus the frozen DINOv3 backbone's intermediate features, from the SAME pass.
+
+        Returns (depth (B,1,*target_size), tokens (B, h*w, C)) where tokens are the flattened
+        spatial feature map of backbone stage `feature_layer` (0..3 = DINOv3 blocks 6/12/18/24 for
+        the CHMv2 ViT-L; the grid is the padded input / 16, e.g. 60x60 px -> 4x4 tokens).
+        Used as the "semantic" cross-attention condition of the DiT refiner (DINOv2 features in VOSR).
+        """
+        store = {}
+        hook = self.model.backbone.register_forward_hook(lambda m, i, o: store.__setitem__("out", o))
+        try:
+            depth = self.forward(x01, target_size=target_size)
+        finally:
+            hook.remove()
+        fmap = store["out"].feature_maps[feature_layer]          # (B, C, h, w)
+        return depth, fmap.flatten(2).transpose(1, 2).contiguous()
+
+    @torch.no_grad()
     def find_unused_trainable_params(self, size: int = 64) -> list:
         """Dummy fwd/bwd; returns names of trainable params that receive no
         gradient (e.g. HF DPT-style fusion's first-layer residual conv)."""

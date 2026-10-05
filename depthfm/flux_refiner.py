@@ -23,6 +23,17 @@ FLUX runs data (s=0) -> noise (s=1) and predicts dz/ds. With s = 1 - t the
 coarse latent plays the role of the noise end, gt the data end, and
 v_flux = -v. forward()/refine() hide this; the training target and sampling
 match FMRefiner ("fixed" velocity parameterization only).
+
+Single-step mode (single_step=True; Marigold-V2-style, config fm_refiner-R-lumi-7):
+no trajectory, no noise. The transformer is always fed the coarse latent with a
+fixed noise-level label s = single_step_t (V2: 0.5) plus the condition tokens and
+regresses the full displacement v = z_coarse - z_gt (FLUX convention), so
+    z_fine = z_coarse - v_hat           (one forward pass at inference)
+Loss = w_latent * MSE(v_hat, z_coarse - z_gt)
+     + w_pixel  * masked-L1(decode(z_fine), h_gt)   (normalised [-1,1] space,
+       gradient through the frozen VAE decoder; invalid = non-finite GT pixels
+       and, if pixel_loss_zero_value is set, GT pixels equal to that value, i.e.
+       zero canopy height, which this dataset's tifs declare as nodata)
 """
 
 import math
@@ -56,9 +67,15 @@ class LoRALinear(nn.Module):
         return out + lora * self.scale
 
 
-def inject_lora(transformer: nn.Module, rank: int, alpha: float) -> int:
+def inject_lora(transformer: nn.Module, rank: int, alpha: float, first_frac: float = 0.0) -> int:
     """Wrap every Linear inside the double/single transformer blocks with LoRA,
     except AdaLN modulation ('norm*') linears and the input/output embedders.
+
+    first_frac: LoRA is only added to blocks at depth >= first_frac (blocks are
+    ordered double blocks then single blocks, 19 + 38 = 57 for FLUX.1). Earlier
+    blocks stay fully frozen; since nothing upstream of the first LoRA layer
+    requires grad, autograd never builds/back-propagates through them (they run
+    like inference), which is the point: it cuts backward compute.
     Returns the number of wrapped layers."""
     n = 0
 
@@ -72,8 +89,11 @@ def inject_lora(transformer: nn.Module, rank: int, alpha: float) -> int:
             else:
                 _recurse(child, child_path)
 
-    for blocks in (transformer.transformer_blocks, transformer.single_transformer_blocks):
-        _recurse(blocks, "")
+    all_blocks = list(transformer.transformer_blocks) + list(transformer.single_transformer_blocks)
+    start = int(round(first_frac * len(all_blocks)))
+    for k, block in enumerate(all_blocks):
+        if k >= start:
+            _recurse(block, "")
     return n
 
 
@@ -93,6 +113,18 @@ def _unpack(t: torch.Tensor, h: int, w: int) -> torch.Tensor:
     C = D // 4
     t = t.view(B, h // 2, w // 2, C, 2, 2).permute(0, 3, 1, 4, 2, 5)
     return t.reshape(B, C, h, w)
+
+
+def _img_ids_scaled(h2: int, w2: int, first: int, sy: float, sx: float, device) -> torch.Tensor:
+    """Like _img_ids, but for a token grid that is (sy, sx)x coarser than the main
+    token grid: token (i, j) centred at s*(i+0.5)-0.5 in main-token units, so
+    e.g. a native-resolution Landsat token lines up with the main tokens it covers
+    (RoPE positions are floats, so fractional ids are fine)."""
+    ids = torch.zeros(h2, w2, 3, device=device)
+    ids[..., 0] = first
+    ids[..., 1] = (sy * (torch.arange(h2, device=device) + 0.5) - 0.5)[:, None]
+    ids[..., 2] = (sx * (torch.arange(w2, device=device) + 0.5) - 0.5)[None, :]
+    return ids.reshape(-1, 3)
 
 
 def _img_ids(h2: int, w2: int, first: int, device) -> torch.Tensor:
@@ -117,8 +149,24 @@ class FluxRefiner(nn.Module):
         sample_sigma: Optional[float] = None,
         sample_noise_mode: str = "sde",
         guidance_scale: float = 1.0,
+        native_landsat_tokens: bool = False,
+        single_step: bool = False,
+        single_step_t: float = 0.5,
+        loss_latent_weight: float = 1.0,
+        loss_pixel_weight: float = 1.0,
+        pixel_loss_zero_value: Optional[float] = None,
     ):
         super().__init__()
+        self.pixel_loss_zero_value = pixel_loss_zero_value
+        self.single_step = single_step
+        self.single_step_t = single_step_t
+        self.loss_latent_weight = loss_latent_weight
+        self.loss_pixel_weight = loss_pixel_weight
+        self.last_loss_parts: dict = {}   # per-component losses of the latest forward (for logging)
+        # native_landsat_tokens: encode Landsat at its native resolution (e.g. 60x60,
+        # padded to a multiple of 16) instead of the bilinearly upsampled target-size
+        # copy -> ~16x fewer Landsat tokens; needs landsat_native= in forward/refine.
+        self.native_landsat_tokens = native_landsat_tokens
         self.vae = vae
         self.transformer = transformer
         self.register_buffer("prompt_embeds", prompt_embeds, persistent=False)
@@ -181,23 +229,43 @@ class FluxRefiner(nn.Module):
         """Height map (B, 1, H, W) -> latent (B, 16, H/8, W/8)."""
         return self._encode_rgb(h.repeat(1, 3, 1, 1))
 
-    @torch.no_grad()
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode_grad(self, z: torch.Tensor) -> torch.Tensor:
+        """decode() with autograd enabled (frozen VAE, gradient flows to z)."""
         z = z / self.scale + self.shift
         out = self.vae.decode(z.to(self.vae.dtype)).sample
         return out.float().mean(dim=1, keepdim=True)
 
+    @torch.no_grad()
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decode_grad(z)
+
     # ----- transformer call -----
 
-    def _cond_tokens(self, landsat_lr: torch.Tensor, ps_hr: Optional[torch.Tensor]):
+    def _cond_tokens(self, landsat_lr: torch.Tensor, ps_hr: Optional[torch.Tensor],
+                     landsat_native: Optional[torch.Tensor] = None):
         """Pack the Landsat (and optional PS) latents into tokens + position ids."""
         toks, ids = [], []
-        for k, img in enumerate([landsat_lr, ps_hr]):
+        if self.native_landsat_tokens:
+            if landsat_native is None:
+                raise ValueError("native_landsat_tokens=True requires landsat_native=")
+            x = landsat_native[:, :3]
+            Hn, Wn = x.shape[-2:]
+            ph, pw = (-Hn) % 16, (-Wn) % 16   # latent (/8) must be even to pack 2x2
+            if ph or pw:
+                x = F.pad(x, (0, pw, 0, ph), mode="replicate")
+            z = self._encode_rgb(x)
+            toks.append(_pack(z))
+            sy, sx = landsat_lr.shape[-2] / Hn, landsat_lr.shape[-1] / Wn   # target px per native px
+            ids.append(_img_ids_scaled(z.shape[2] // 2, z.shape[3] // 2, 1, sy, sx, z.device))
+            streams = [(2, ps_hr)]
+        else:
+            streams = [(1, landsat_lr), (2, ps_hr)]
+        for k, img in streams:
             if img is None:
                 continue
             z = self._encode_rgb(img[:, :3])
             toks.append(_pack(z))
-            ids.append(_img_ids(z.shape[2] // 2, z.shape[3] // 2, k + 1, z.device))
+            ids.append(_img_ids(z.shape[2] // 2, z.shape[3] // 2, k, z.device))
         return toks, ids
 
     def _predict(self, z: torch.Tensor, s: torch.Tensor, cond_toks: list, cond_ids: list) -> torch.Tensor:
@@ -224,7 +292,7 @@ class FluxRefiner(nn.Module):
 
     # ----- training -----
 
-    def forward(self, landsat_lr, ps_hr, h_coarse, h_gt) -> torch.Tensor:
+    def forward(self, landsat_lr, ps_hr, h_coarse, h_gt, landsat_native=None) -> torch.Tensor:
         B = h_gt.shape[0]
         device = h_gt.device
 
@@ -235,7 +303,10 @@ class FluxRefiner(nn.Module):
             # are simply absent from the sequence (that is also the inference
             # condition, replacing FMRefiner's learned null-PS token).
             drop_ps = self.training and (torch.rand(1).item() < self.ps_dropout_p)
-            cond_toks, cond_ids = self._cond_tokens(landsat_lr, None if drop_ps else ps_hr)
+            cond_toks, cond_ids = self._cond_tokens(landsat_lr, None if drop_ps else ps_hr, landsat_native)
+
+        if self.single_step:
+            return self._single_step_loss(z_coarse, z_gt, h_gt, cond_toks, cond_ids)
 
         t = torch.rand(B, device=device)
         t4 = t.view(B, 1, 1, 1)
@@ -249,6 +320,26 @@ class FluxRefiner(nn.Module):
         v_flux = self._predict(z_t, 1.0 - t, cond_toks, cond_ids)   # = dz/ds = -v
         return F.mse_loss(v_flux, -v_target)
 
+    def _single_step_loss(self, z_coarse, z_gt, h_gt, cond_toks, cond_ids) -> torch.Tensor:
+        B = z_coarse.shape[0]
+        s = torch.full((B,), self.single_step_t, device=z_coarse.device)   # constant label, not a noise level
+        v_hat = self._predict(z_coarse, s, cond_toks, cond_ids)            # dz/ds = z_coarse - z_gt
+        loss_latent = F.mse_loss(v_hat, z_coarse - z_gt)
+        loss = self.loss_latent_weight * loss_latent
+        parts = {"latent": loss_latent.detach()}
+        if self.loss_pixel_weight > 0.0:
+            h_hat = self.decode_grad(z_coarse - v_hat)                     # (B, 1, H, W), normalised space
+            valid = torch.isfinite(h_gt)                                    # standard validity mask
+            if self.pixel_loss_zero_value is not None:                      # exclude zero-height (nodata) pixels
+                valid = valid & (h_gt > self.pixel_loss_zero_value + 1e-6)
+            valid = valid.float()
+            err = (h_hat - torch.nan_to_num(h_gt)).abs() * valid
+            loss_pixel = err.sum() / valid.sum().clamp(min=1.0)
+            loss = loss + self.loss_pixel_weight * loss_pixel
+            parts["pixel"] = loss_pixel.detach()
+        self.last_loss_parts = parts
+        return loss
+
     # ----- inference -----
 
     def _vel(self, z, t_val: float, cond_toks, cond_ids) -> torch.Tensor:
@@ -257,13 +348,19 @@ class FluxRefiner(nn.Module):
 
     @torch.no_grad()
     def refine(self, landsat_lr, h_coarse, n_steps: int = 1, method: str = "euler",
-               sampling_fn: str = "uniform") -> torch.Tensor:
+               sampling_fn: str = "uniform", landsat_native=None) -> torch.Tensor:
         if sampling_fn != "uniform":
             raise ValueError("FluxRefiner supports only sampling_fn='uniform' ('fixed' velocity).")
         z = self.encode(h_coarse)
+        if self.single_step:
+            if n_steps != 1:
+                raise ValueError(f"single_step refiner: n_steps must be 1 (got {n_steps}); set validation.n_steps=1.")
+            cond_toks, cond_ids = self._cond_tokens(landsat_lr, None, landsat_native)   # null PS = no PS tokens
+            s = torch.full((z.shape[0],), self.single_step_t, device=z.device)
+            return self.decode(z - self._predict(z, s, cond_toks, cond_ids))
         if self.sample_sigma > 0.0 and self.sample_noise_mode == "init_only":
             z = z + self.sample_sigma * torch.randn_like(z)
-        cond_toks, cond_ids = self._cond_tokens(landsat_lr, None)   # null PS = no PS tokens
+        cond_toks, cond_ids = self._cond_tokens(landsat_lr, None, landsat_native)   # null PS = no PS tokens
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
@@ -295,6 +392,13 @@ def build_flux_refiner(
     sample_noise_mode: str = "sde",
     guidance_scale: float = 1.0,
     grad_checkpointing: bool = True,
+    lora_first_frac: float = 0.0,
+    native_landsat_tokens: bool = False,
+    single_step: bool = False,
+    single_step_t: float = 0.5,
+    loss_latent_weight: float = 1.0,
+    loss_pixel_weight: float = 1.0,
+    pixel_loss_zero_value: Optional[float] = None,
     device: str = "cpu",
 ) -> FluxRefiner:
     """model_id: hub id (resolved from the local HF cache, HF_HUB_OFFLINE-safe) or a
@@ -308,7 +412,7 @@ def build_flux_refiner(
     transformer = FluxTransformer2DModel.from_pretrained(
         model_id, subfolder="transformer", torch_dtype=torch.bfloat16)
     transformer.requires_grad_(False)
-    n_wrapped = inject_lora(transformer, lora_rank, lora_alpha)
+    n_wrapped = inject_lora(transformer, lora_rank, lora_alpha, lora_first_frac)
     if grad_checkpointing:
         transformer.enable_gradient_checkpointing()
     transformer.train()
@@ -319,6 +423,14 @@ def build_flux_refiner(
         prompt_embeds=cache["prompt_embeds"].float(), pooled_embeds=cache["pooled_embeds"].float(),
         ps_dropout_p=ps_dropout_p, noise_sigma=noise_sigma, sample_sigma=sample_sigma,
         sample_noise_mode=sample_noise_mode, guidance_scale=guidance_scale,
+        native_landsat_tokens=native_landsat_tokens,
+        single_step=single_step, single_step_t=single_step_t,
+        loss_latent_weight=loss_latent_weight, loss_pixel_weight=loss_pixel_weight,
+        pixel_loss_zero_value=pixel_loss_zero_value,
     )
+    if single_step and loss_pixel_weight > 0.0:
+        # the pixel loss backpropagates through the VAE decoder: recompute its
+        # activations instead of storing them (cheap next to the 12B transformer)
+        vae.enable_gradient_checkpointing()
     refiner.n_lora_layers = n_wrapped
     return refiner

@@ -50,6 +50,7 @@ from tqdm import tqdm
 from depthfm.fm_refiner import FMRefiner, build_fm_refiner, load_dav2, run_dav2
 from depthfm.chmv2 import CHMv2Height, load_chmv2_baseline
 from depthfm.flux_refiner import FluxRefiner, build_flux_refiner
+from depthfm.dit_refiner import DiTRefiner, build_dit_refiner
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import config_logging, init_wandb, tb_logger
 from src.util.ps_lazydataset import LazyPatchDataset
@@ -181,6 +182,7 @@ def validate(
     world_size: int = 1,
     is_distributed: bool = False,
     num_workers: int = 0,
+    report_nonzero: bool = False,   # also report r2/mae/rmse (suffix _nz) on pixels with GT height > 0
 ) -> tuple:
     """
     Runs validation in parallel across all ranks: every rank forwards its own
@@ -196,7 +198,8 @@ def validate(
     # hooks assume every rank calls it in lockstep for gradient sync, which
     # doesn't apply here (no backward pass, independent per-rank shards).
     is_flux = isinstance(fm_refiner, FluxRefiner)   # LoRA refiner: no DDP-wrapped modules
-    if not is_flux:
+    is_dit = isinstance(fm_refiner, DiTRefiner)     # refine() uses the (never-DDP-wrapped) EMA copy
+    if not (is_flux or is_dit):
         orig_unet, orig_controlnet = fm_refiner.unet, fm_refiner.controlnet
         fm_refiner.unet = _raw(orig_unet)
         if orig_controlnet is not None:
@@ -243,7 +246,11 @@ def validate(
         landsat_hr = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
 
         landsat_for_dav2 = (landsat + 1.0) / 2.0
-        h_coarse = _run_coarse(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+        coarse_feats = None
+        if is_dit and getattr(fm_refiner, "semantic_mode", "chmv2") == "chmv2":
+            h_coarse, coarse_feats = _run_coarse_feats(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+        else:
+            h_coarse = _run_coarse(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
         h_coarse = _normalize_coarse(h_coarse, target_stats)
 
         # Each call is an independent stochastic draw when sample_sigma>0
@@ -251,7 +258,9 @@ def validate(
         # ensemble_size x the inference cost. A stack+mean of a single
         # element (ensemble_size=1, the default) is a no-op.
         h_fine_draws = [
-            fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method, sampling_fn=sampling_fn)
+            fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method, sampling_fn=sampling_fn,
+                              **({"landsat_native": landsat} if is_flux else {}),
+                              **({"coarse_feats": coarse_feats} if is_dit else {}))
             for _ in range(ensemble_size)
         ]
         h_fine = torch.stack(h_fine_draws, dim=0).mean(dim=0)
@@ -276,7 +285,7 @@ def validate(
 
     fm_refiner.train()
     # Restore the (possibly DDP-wrapped) modules used for training.
-    if not is_flux:
+    if not (is_flux or is_dit):
         fm_refiner.unet, fm_refiner.controlnet = orig_unet, orig_controlnet
 
     if is_distributed:
@@ -300,6 +309,10 @@ def validate(
         pred_cat, gt_cat = pred_local, gt_local
 
     metrics = compute_metrics(pred_cat, gt_cat)
+    if report_nonzero:
+        nz = gt_cat > 1e-4   # zero-height pixels are exactly 0.0 after inverse normalisation
+        if nz.any():
+            metrics.update({f"{k}_nz": v for k, v in compute_metrics(pred_cat[nz], gt_cat[nz]).items()})
     fig = _make_vis_figure(vis_samples) if vis_samples else None
     return metrics, fig
 
@@ -311,6 +324,13 @@ def _run_coarse(coarse_model, landsat_01: torch.Tensor, target_size: tuple) -> t
         with torch.no_grad():
             return coarse_model(landsat_01, target_size=target_size)
     return run_dav2(coarse_model, landsat_01, target_size=target_size)
+
+
+def _run_coarse_feats(coarse_model, landsat_01: torch.Tensor, target_size: tuple):
+    """(coarse height in metres, CHMv2 backbone tokens (B, N, C)) from one CHMv2 pass -- the
+    DiT refiner's coarse start state and its cross-attention (semantic) condition."""
+    return coarse_model.forward_with_features(
+        landsat_01, target_size=target_size, feature_layer=getattr(coarse_model, "feature_layer", 2))
 
 
 def _normalize_coarse(h_coarse: torch.Tensor, target_stats: dict) -> torch.Tensor:
@@ -354,6 +374,18 @@ def _raw(module: nn.Module) -> nn.Module:
 def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_dir, name="latest"):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.pth")
+    if isinstance(fm_refiner, DiTRefiner):
+        torch.save({
+            "step": step,
+            "refiner_type": "dit",
+            "dit_state": _raw(fm_refiner.dit).state_dict(),
+            "ema_state": fm_refiner.ema.state_dict(),
+            "ema_updates": fm_refiner.ema_updates,
+            "optimizer_state": optimizer.state_dict(),
+            "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
+        }, path)
+        logging.info(f"Checkpoint saved to {path}")
+        return
     if isinstance(fm_refiner, FluxRefiner):
         # LoRA-only checkpoint (the 12B base is never modified).
         torch.save({
@@ -379,6 +411,14 @@ def save_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, step, out_di
 
 def load_checkpoint(fm_refiner: FMRefiner, optimizer, lr_scheduler, path):
     ckpt = torch.load(path, map_location="cpu")
+    if isinstance(fm_refiner, DiTRefiner):
+        _raw(fm_refiner.dit).load_state_dict(ckpt["dit_state"])
+        fm_refiner.ema.load_state_dict(ckpt["ema_state"])
+        fm_refiner.ema_updates = ckpt.get("ema_updates", 0)
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        if lr_scheduler and ckpt.get("lr_scheduler_state"):
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler_state"])
+        return ckpt["step"]
     if isinstance(fm_refiner, FluxRefiner):
         fm_refiner.load_lora_state_dict(ckpt["lora_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -708,10 +748,23 @@ if __name__ == "__main__":
     # refiner_type: "sd" (default: SD2.1 UNet + ControlNet, FMRefiner) or
     # "flux" (FLUX.1 transformer + LoRA + token-concat conditioning, FluxRefiner).
     is_flux = cfg.model.get("refiner_type", "sd") == "flux"
+    # "dit": VOSR-pretrained LightningDiT-0.5B, all weights trained (depthfm/dit_refiner.py).
+    is_dit = cfg.model.get("refiner_type", "sd") == "dit"
+    # DiT only: does the cross-attention use CHMv2 backbone tokens (else a zero "null" token)?
+    use_sem_feats = is_dit and cfg.model.get("dit_semantic", "chmv2") == "chmv2"
     if is_flux:
         if velocity_parameterization != "fixed":
             raise NotImplementedError("refiner_type='flux' supports only velocity_parameterization='fixed'.")
         use_controlnet = False   # conditioning is token concatenation, no ControlNet
+        # Value that zero canopy height takes in the normalised target space (None = keep zeros).
+        _zero_value = None
+        if cfg.trainer.get("pixel_loss_exclude_zero", False):
+            if not (cfg_data.use_target_minmax and cfg_data.get("scale_target_to_neg1_1", False)):
+                raise ValueError("pixel_loss_exclude_zero needs use_target_minmax and scale_target_to_neg1_1.")
+            _st = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
+            _p1, _p99 = float(_st["p1"][0]), float(_st["p99"][0])
+            # same transform as src/util/ps_data_transform.MinMaxScale
+            _zero_value = float(np.clip((0.0 - _p1) / (_p99 - _p1 + 1e-8), 0.0, 1.0) * 2.0 - 1.0)
         fm_refiner = build_flux_refiner(
             model_id=cfg.model.flux_model_id,
             text_cache_path=cfg.model.flux_text_cache,
@@ -723,6 +776,13 @@ if __name__ == "__main__":
             sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
             guidance_scale=cfg.model.get("flux_guidance", 1.0),
             grad_checkpointing=cfg.model.get("grad_checkpointing", True),
+            lora_first_frac=cfg.model.get("lora_first_frac", 0.0),
+            native_landsat_tokens=cfg.model.get("native_landsat_tokens", False),
+            single_step=cfg.trainer.get("single_step", False),
+            single_step_t=cfg.trainer.get("single_step_t", 0.5),
+            loss_latent_weight=cfg.trainer.get("loss_latent_weight", 1.0),
+            loss_pixel_weight=cfg.trainer.get("loss_pixel_weight", 1.0),
+            pixel_loss_zero_value=_zero_value,
         )
         fm_refiner = fm_refiner.to(device)
         if is_distributed:
@@ -732,6 +792,32 @@ if __name__ == "__main__":
             logging.info(f"FLUX refiner: {fm_refiner.n_lora_layers} LoRA-wrapped linears, "
                          f"{n_lora / 1e6:.1f}M trainable LoRA params "
                          f"(rank {cfg.model.get('lora_rank', 64)}); base transformer frozen.")
+    elif is_dit:
+        if velocity_parameterization != "fixed":
+            raise NotImplementedError("refiner_type='dit' supports only velocity_parameterization='fixed'.")
+        use_controlnet = False
+        # identical (re-)initialisation of the few new layers on every rank, so the EMA copies
+        # taken inside build_dit_refiner agree across ranks (DDP only syncs the live weights)
+        torch.manual_seed(base_seed)
+        fm_refiner = build_dit_refiner(
+            sd_pretrained_path=cfg.model.sd_pretrained_path,
+            vosr_ckpt=cfg.model.get("vosr_ckpt", None),
+            z_dims=cfg.model.get("dit_z_dims", 1024),
+            use_landsat=cfg.model.get("dit_use_landsat", False),
+            semantic=cfg.model.get("dit_semantic", "chmv2"),
+            ps_dropout_p=cfg.trainer.get("ps_dropout_p", 0.0),
+            noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
+            sample_sigma=cfg.trainer.get("sample_sigma", None),
+            sample_noise_mode=cfg.trainer.get("sample_noise_mode", "init_only"),
+            ema_decay=cfg.trainer.get("ema_decay", 0.998),
+            grad_checkpointing=cfg.model.get("grad_checkpointing", False),
+        ).to(device)
+        if is_main_process:
+            rep_ = fm_refiner.load_report
+            logging.info(
+                f"DiT refiner: {sum(p.numel() for p in fm_refiner.dit.parameters()) / 1e6:.1f}M params, all trainable; "
+                f"VOSR checkpoint: {rep_['loaded'] if rep_ else 'none (random init)'} tensors loaded"
+                + (f", re-initialised {rep_['reinitialised']}" if rep_ else ""))
     else:
         fm_refiner = build_fm_refiner(
             sd_pretrained_path=cfg.model.sd_pretrained_path,
@@ -745,6 +831,11 @@ if __name__ == "__main__":
             sample_sigma=cfg.trainer.get("sample_sigma", None),
             sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
             device=str(device),
+            pretrained_unet=cfg.model.get("pretrained_unet", True),
+            backbone=cfg.model.get("backbone", "unet"),
+            dit_kwargs=dict(cfg.model.get("dit", {}) or {}),
+            loss_pixel_weight=cfg.trainer.get("loss_pixel_weight", 0.0),
+            pixel_loss_t_min=cfg.trainer.get("pixel_loss_t_min", 0.5),
         )
         fm_refiner = fm_refiner.to(device)
 
@@ -767,6 +858,8 @@ if __name__ == "__main__":
             out_in_scale_factor=cfg.model.dav2_out_in_scale_factor,
         )
     dav2_model = dav2_model.to(device)
+    if use_sem_feats:
+        dav2_model.feature_layer = cfg.model.get("chmv2_feature_layer", 2)
 
     # Load target stats for coarse normalization (same p1/p99 as dataloader)
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
@@ -774,9 +867,13 @@ if __name__ == "__main__":
     # ---- DDP wrapping ----
     # (FLUX/LoRA path: no DDP -- the frozen 12B base would be broadcast to all
     # ranks for nothing; only the small LoRA grads are all-reduced by hand.)
-    unet_raw       = None if is_flux else fm_refiner.unet
-    controlnet_raw = fm_refiner.controlnet if (use_controlnet and not is_flux) else None
-    if is_distributed and not is_flux:
+    unet_raw       = None if (is_flux or is_dit) else fm_refiner.unet
+    controlnet_raw = fm_refiner.controlnet if (use_controlnet and not (is_flux or is_dit)) else None
+    dit_raw        = fm_refiner.dit if is_dit else None
+    if is_dit and is_distributed:
+        ddp_ids = [device.index] if device.type == "cuda" else None
+        fm_refiner.dit = DDP(dit_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+    if is_distributed and not (is_flux or is_dit):
         ddp_ids = [device.index] if device.type == "cuda" else None
         fm_refiner.unet = DDP(unet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
         if use_controlnet:
@@ -785,19 +882,29 @@ if __name__ == "__main__":
     # ---- Optimizer ----
     if is_flux:
         param_groups = [{"params": fm_refiner.lora_parameters(), "lr": cfg.optimizer.lr_lora}]
+    elif is_dit:
+        param_groups = [{"params": dit_raw.parameters(), "lr": cfg.optimizer.lr_dit}]
     else:
         param_groups = [{"params": unet_raw.parameters(), "lr": cfg.optimizer.lr_unet}]
-    if use_controlnet and not is_flux:
+    if use_controlnet and not (is_flux or is_dit):
         param_groups.append({"params": controlnet_raw.parameters(), "lr": cfg.optimizer.lr_controlnet})
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.optimizer.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.optimizer.weight_decay,
+                                  betas=(0.9, cfg.optimizer.get("adam_beta2", 0.95)) if is_dit else (0.9, 0.999))
 
     lr_scheduler = None
     if cfg.get("lr_scheduler") is not None:
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-        lr_scheduler = CosineAnnealingLR(
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        # warmup_steps counts optimizer steps AFTER the [scale] adjustment of max_iter above
+        warmup_steps = int(cfg.lr_scheduler.get("warmup_steps", 0))
+        cosine = CosineAnnealingLR(
             optimizer,
-            T_max=cfg.max_iter,
+            T_max=cfg.max_iter - warmup_steps,
             eta_min=cfg.lr_scheduler.eta_min,
+        )
+        lr_scheduler = cosine if warmup_steps <= 0 else SequentialLR(
+            optimizer,
+            [LinearLR(optimizer, start_factor=1e-3, total_iters=warmup_steps), cosine],
+            milestones=[warmup_steps],
         )
 
     # ---- Resume ----
@@ -867,7 +974,11 @@ if __name__ == "__main__":
             # DAv2 expects [0,1] input; dataloader gives [-1,1] → convert back
             with torch.no_grad():
                 landsat_for_dav2 = (landsat + 1.0) / 2.0
-                h_coarse = _run_coarse(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+                coarse_feats = None
+                if use_sem_feats:
+                    h_coarse, coarse_feats = _run_coarse_feats(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
+                else:
+                    h_coarse = _run_coarse(dav2_model, landsat_for_dav2, target_size=(H_hr, W_hr))
                 h_coarse = _normalize_coarse(h_coarse, target_stats)
 
             # Only the final micro-batch of a window should let DDP all-reduce
@@ -879,12 +990,18 @@ if __name__ == "__main__":
             if is_first_micro:
                 optimizer.zero_grad()
 
-            ddp_modules = [] if is_flux else [
-                m for m in (fm_refiner.unet, fm_refiner.controlnet if use_controlnet else None)
-                if isinstance(m, DDP)]
+            if is_flux:
+                ddp_modules = []
+            elif is_dit:
+                ddp_modules = [fm_refiner.dit] if isinstance(fm_refiner.dit, DDP) else []
+            else:
+                ddp_modules = [m for m in (fm_refiner.unet, fm_refiner.controlnet if use_controlnet else None)
+                               if isinstance(m, DDP)]
             with _maybe_no_sync(ddp_modules, skip_sync):
                 # FM loss
                 loss = fm_refiner(
+                    **({"landsat_native": landsat} if is_flux else {}),
+                    **({"coarse_feats": coarse_feats} if is_dit else {}),
                     landsat_lr=landsat_hr,  # ControlNet sees HR-resolution Landsat
                     ps_hr=inputs_hr,
                     h_coarse=h_coarse,
@@ -897,6 +1014,8 @@ if __name__ == "__main__":
                     if is_distributed:
                         fm_refiner.all_reduce_grads(world_size)
                     all_params = fm_refiner.lora_parameters()
+                elif is_dit:
+                    all_params = list(dit_raw.parameters())
                 else:
                     all_params = list(unet_raw.parameters())
                     if use_controlnet:
@@ -905,6 +1024,8 @@ if __name__ == "__main__":
                 optimizer.step()
                 if lr_scheduler is not None:
                     lr_scheduler.step()
+                if is_dit:
+                    fm_refiner.update_ema()
 
             if not is_last_micro:
                 micro_step += 1
@@ -920,12 +1041,20 @@ if __name__ == "__main__":
                 lr_unet = optimizer.param_groups[0]["lr"]
                 pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
                 log_dict = {"train/loss": loss_val, "lr/unet": lr_unet}
+                if is_flux:
+                    for _k, _v in getattr(fm_refiner, "last_loss_parts", {}).items():
+                        log_dict[f"train/loss_{_k}"] = _v.item()
+                if getattr(fm_refiner, "last_pixel_loss", None) is not None:
+                    log_dict["train/loss_pixel_l1"] = fm_refiner.last_pixel_loss.item()
                 if use_controlnet:
                     lr_cn = optimizer.param_groups[1]["lr"]
                     log_dict["lr/controlnet"] = lr_cn
                     logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e} lr_cn={lr_cn:.2e}")
                 else:
-                    logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e}")
+                    logging.info(f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e} "
+                                 f"size={H_hr} peak_mem={torch.cuda.max_memory_allocated() / 2**30:.1f}GB"
+                                 if device.type == "cuda" else
+                                 f"[step {step}] loss={loss_val:.5f} lr_unet={lr_unet:.2e}")
                 wandb.log(log_dict, step=step)
                 tb_logger.log_dict({"train/loss": loss_val}, global_step=step)
 
@@ -942,6 +1071,7 @@ if __name__ == "__main__":
                     method=cfg.validation.get("method", "euler"),
                     sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
                     ensemble_size=cfg.validation.get("ensemble_size", 1),
+                    report_nonzero=cfg.eval.get("report_nonzero_gt", False),
                     global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
                 )
                 # Deterministic given val_offset/val_subset_size/len(val_dataset),
@@ -1006,6 +1136,7 @@ if __name__ == "__main__":
         method=cfg.validation.get("method", "euler"),
         sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
         ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
+        report_nonzero=cfg.eval.get("report_nonzero_gt", False),
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
         num_workers=cfg_data.workers,  # full=True shards the whole val set,
         # worth the worker-process cost here (unlike the periodic call above).

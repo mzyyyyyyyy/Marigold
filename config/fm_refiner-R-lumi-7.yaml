@@ -1,0 +1,189 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: fm_refiner-R-lumi-7
+
+# Dataset config – identical to fm_refiner-R-lumi.yaml/-3.yaml. This config
+# is fm_refiner-R-lumi-3.yaml's noise mechanism retargeted to match RFMSR
+# (github.com/Faze-Hsw/RFMSR) instead of InDI's own paper defaults — same
+# asymmetric noise schedule shape (both are linear-in-t, zero at the clean
+# end, max at the coarse end; RFMSR's t*sigma is InDI's own Eq.7 verbatim,
+# ours is the (1-t)*sigma mirror of it because this codebase's t=1 is the
+# clean end instead of InDI/RFMSR's t=0 — see fm_refiner-R-lumi-3.yaml's
+# comments), but two things changed to match RFMSR specifically rather than
+# InDI's paper:
+#   1. noise_sigma/sample_sigma: 0.01 -> 1.0, matching RFMSR's config
+#      (configs/train_rfmsr.yaml: "sigma: 1.0"). Confirmed RFMSR encodes
+#      through the same pretrained SD2.1 VAE with the same 0.18215 scaling
+#      factor we use (models/rfmsr.py's vae_encode()), so this is now a
+#      directly comparable number in the same latent units — modulo RFMSR
+#      encoding natural photos (what that VAE/scale was calibrated for) vs
+#      this project encoding canopy-height maps, which may have different
+#      latent statistics; not verified empirically here.
+#   2. sample_noise_mode: "init_only" — RFMSR's infer_rfmsr.py injects noise
+#      exactly ONCE (x = z_lr + sigma*randn(...)) before a purely
+#      deterministic Euler ODE loop, unlike InDI's own Eq.10 (and this
+#      project's fm_refiner-R-lumi-3.yaml / sr_finer_lumi's bridge_noise),
+#      which inject fresh noise at every step (Euler-Maruyama SDE). RFMSR
+#      does NOT reproduce InDI's per-step noisy sampling — this is RFMSR's
+#      own simplification, not something inherited from InDI's paper.
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+
+  workers: 6
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# fm_refiner-R-lumi-7: Marigold-V2-style single-step training/inference on the
+# FLUX.1-dev + LoRA refiner of fm_refiner-R-lumi-6.yaml (same data, coarse model,
+# conditioning tokens, LoRA rank/lr, budget). Differences from -6:
+#   * trainer.single_step: no flow trajectory and no noise -- the transformer
+#     always sees the coarse latent with a fixed label t=single_step_t (0.5, as in
+#     Marigold V2), regresses v = z_coarse - z_gt, and z_fine = z_coarse - v_hat.
+#   * loss = latent MSE + pixel L1 (normalised [-1,1] space, through the frozen
+#     VAE decoder, non-finite GT pixels masked).
+#   * inference = 1 forward pass (validation.n_steps must be 1).
+#   * speed levers: LoRA only on the last blocks (lora_first_frac), gradient
+#     checkpointing off, Landsat tokens at native resolution.
+# Model paths
+model:
+  refiner_type: "flux"
+  # Local diffusers-format copy of black-forest-labs/FLUX.1-dev (transformer/, vae/, ...),
+  # downloaded once with huggingface_hub (gated model; needs HF login on a login node).
+  flux_model_id: "/flash/project_465002934/model/FLUX.1-dev"
+  # Empty-prompt T5(L tokens)+CLIP-pooled embedding, from
+  # script/depth/precompute_flux_text.py --seq_len 32
+  flux_text_cache: "/flash/project_465002934/model/flux1_empty_text_L32.pt"
+  lora_rank: 64
+  lora_alpha: 64
+  flux_guidance: 1.0            # FLUX.1-dev is guidance-distilled; fixed scalar fed to its guidance embedder
+  # Speed levers (measured on 8 GPUs, see git history): with these three together
+  # ~1.8 s/step vs ~5.1 s/step for -6, peak ~36 GB on 64 GB GPUs at 240 and 480 px.
+  grad_checkpointing: False
+  # LoRA only on blocks with index >= round(frac * 57): 0.5 -> the last 29 single-stream
+  # blocks; all 19 double-stream blocks and the first 9 single blocks stay frozen and
+  # run like inference (no backward through them). 0.0 = LoRA on every block (-6).
+  lora_first_frac: 0.5
+  # Landsat tokens from the native-resolution image (~16x fewer tokens) instead of
+  # the bilinearly upsampled target-size copy.
+  native_landsat_tokens: True
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+  # Coarse model switch: "dav2" (dav2_* keys above) or "chmv2" (keys below).
+  coarse_model: "chmv2"
+  chmv2_model_id: "/flash/project_465002934/model/models--facebook--dinov3-vitl16-chmv2-dpt-head/snapshots/37130c851a3cf6720f974490707059f5edaeed4e"
+  chmv2_ckpt_path: "/flash/project_465002934/Marigold_output/baseline_chmv2-lumi/checkpoint/best.pth"
+  chmv2_out_in_scale_factor: 4   # must match baseline_chmv2-lumi.yaml
+
+
+# Optimizer – unchanged from fm_refiner-R-lumi.yaml
+optimizer:
+  lr_lora: 1.0e-04        # common LoRA default; only LoRA params are trained
+  weight_decay: 1.0e-02
+
+
+# LR scheduler (cosine annealing)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader – unchanged from fm_refiner-R-lumi.yaml
+dataloader:
+  effective_batch_size: 2
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  use_controlnet: False   # unused by refiner_type=flux (token concatenation instead)
+  ps_dropout_p: 0.3       # probability of replacing PS with null token
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # ---- single-step (Marigold V2) ----
+  single_step: True
+  single_step_t: 0.5          # constant timestep label fed to FLUX (V2 uses 0.5)
+  loss_latent_weight: 1.0     # MSE(v_hat, z_coarse - z_gt)
+  loss_pixel_weight: 1.0      # L1(decode(z_coarse - v_hat), h_gt) in normalised space; 0 disables
+  # Option: exclude zero-canopy-height GT pixels (the target tifs declare nodata=0;
+  # ~42% of pixels are exactly 0) from the PIXEL loss. OFF: zeros are treated as valid
+  # 0 m, consistent with every earlier run (the latent MSE is never masked anyway).
+  pixel_loss_exclude_zero: False
+  # No noise anywhere in single-step mode.
+  noise_sigma: 0.0
+  sample_sigma: 0.0
+
+
+# Validation / inference
+validation:
+  # single-step: exactly one forward pass, no ensemble (n_steps != 1 raises).
+  n_steps: 1
+  ensemble_size: 1
+  final_n_steps: 1
+  final_ensemble_size: 1
+
+
+# Training budget – unchanged from fm_refiner-R-lumi.yaml
+max_epoch: 1000
+max_iter: 50000
+
+
+# Eval metrics logged during validation
+eval:
+  # Metrics include zero-height pixels, like -4/-5/baseline. Option: True additionally
+  # logs r2_nz/mae_nz/rmse_nz over pixels with GT height > 0 ("best" is still chosen by r2).
+  report_nonzero_gt: False
+  eval_metrics:
+  - r2
+  - mae
+  - rmse

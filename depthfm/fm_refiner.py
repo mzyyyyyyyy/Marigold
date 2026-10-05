@@ -75,6 +75,8 @@ class FMRefiner(nn.Module):
         noise_sigma: float = 0.0,
         sample_sigma: Optional[float] = None,
         sample_noise_mode: str = "sde",
+        loss_pixel_weight: float = 0.0,
+        pixel_loss_t_min: float = 0.5,
     ):
         super().__init__()
         self.vae = vae
@@ -112,6 +114,12 @@ class FMRefiner(nn.Module):
                 "velocity_parameterization='fixed' — the InDI-target v_target "
                 "correction for noise has not been derived for 'indi'."
             )
+
+        # Auxiliary pixel-space L1 (see forward()): weight 0 disables it; only samples with
+        # t >= pixel_loss_t_min contribute (at small t the clean-latent estimate is a blurry mean).
+        self.loss_pixel_weight = loss_pixel_weight
+        self.pixel_loss_t_min = pixel_loss_t_min
+        self.last_pixel_loss = None
 
         # Fixed empty text embedding (not a parameter)
         self.register_buffer("empty_text_embed", empty_text_embed)
@@ -160,6 +168,11 @@ class FMRefiner(nn.Module):
         z = self.vae.post_quant_conv(z)
         out = self.vae.decoder(z)               # (B, 3, H, W)
         return out.mean(dim=1, keepdim=True)    # (B, 1, H, W)
+
+    def decode_grad(self, z: torch.Tensor) -> torch.Tensor:
+        """decode() with gradients flowing to z (VAE weights stay frozen)."""
+        z = self.vae.post_quant_conv(z / VAE_SCALE_FACTOR)
+        return self.vae.decoder(z).mean(dim=1, keepdim=True)
 
     # ------------------------------------------------------------------
     # Forward (training step)
@@ -265,6 +278,22 @@ class FMRefiner(nn.Module):
 
         v_pred = unet_out.sample                # (B, 4, h, w)
         loss = F.mse_loss(v_pred, v_target)
+
+        # Auxiliary pixel-space L1 on the low-noise samples. z_t + (1-t)*v equals z_gt exactly when
+        # v = v_target (both the noise-free and the bridge-noise parameterisations), so
+        # z1_hat = z_t + (1-t)*v_pred is the network's clean-latent estimate; decode it and compare
+        # with h_gt. Gradients flow through the frozen decoder into v_pred.
+        self.last_pixel_loss = None
+        if self.loss_pixel_weight > 0.0 and self.velocity_parameterization == "fixed":
+            sel = t >= self.pixel_loss_t_min
+            if sel.any():
+                z1_hat = z_t[sel] + (1.0 - t4[sel]) * v_pred[sel]
+                gt = h_gt[sel]
+                valid = torch.isfinite(gt).float()
+                err = (self.decode_grad(z1_hat) - torch.nan_to_num(gt)).abs() * valid
+                pix = err.sum() / valid.sum().clamp(min=1.0)
+                self.last_pixel_loss = pix.detach()
+                loss = loss + self.loss_pixel_weight * pix * (sel.sum() / B)
         return loss
 
     # ------------------------------------------------------------------
@@ -425,6 +454,11 @@ def build_fm_refiner(
     sample_sigma: Optional[float] = None,
     sample_noise_mode: str = "sde",
     device: str = "cuda",
+    pretrained_unet: bool = True,
+    backbone: str = "unet",
+    dit_kwargs: Optional[dict] = None,
+    loss_pixel_weight: float = 0.0,
+    pixel_loss_t_min: float = 0.5,
 ) -> FMRefiner:
     """
     Build FMRefiner from a SD2.1 pretrained checkpoint directory.
@@ -435,6 +469,10 @@ def build_fm_refiner(
         n_ps_bands: number of PlanetScope input channels
         ps_dropout_p: dropout probability for PS conditioning
         use_controlnet: if False, ControlNet is not built and UNet runs unconditionally
+        pretrained_unet: if False, the UNet is built from SD2.1's architecture config with
+            RANDOM weights (ControlNet.from_unet then copies those random weights): the
+            "no pretrained generative prior" control experiment. VAE and the empty-prompt
+            text embedding are still taken from the SD2.1 checkpoint (frozen / constant).
         velocity_parameterization: "fixed" (constant flow-matching velocity, default)
             or "indi" (InDI-style (1-t)-scaled velocity, see module docstring)
         noise_sigma: InDI-style asymmetric bridge noise strength (training), 0.0 disables.
@@ -445,6 +483,11 @@ def build_fm_refiner(
         sample_noise_mode: "sde" (default; noise injected every step, bridge_noise-style)
             or "init_only" (RFMSR-style; noise injected once before integration starts,
             then a pure deterministic ODE) — see refine()/module docstring.
+        backbone: "unet" (SD2.1 UNet + ControlNet, default) or "dit" (randomly initialised DiT +
+            DiT-ControlNet analogue from depthfm/dit_control.py; drop-in replacements exposed as
+            `.unet` / `.controlnet`, so everything else -- noise, PS dropout/null token, sampling,
+            training script -- is unchanged). `dit_kwargs`: patch_size, hidden_size, depth,
+            num_heads, mlp_ratio, n_control.
         device: device string
     """
     from transformers import CLIPTextModel, CLIPTokenizer
@@ -454,8 +497,24 @@ def build_fm_refiner(
     vae.requires_grad_(False)
     vae.eval()
 
+    if backbone in ("dit", "dit_concat", "dit_token"):
+        return _build_dit_fm_refiner(
+            vae, n_landsat_bands, n_ps_bands, ps_dropout_p, use_controlnet, controlnet_cond_mode,
+            velocity_parameterization, noise_sigma, sample_sigma, sample_noise_mode, dit_kwargs or {},
+            variant=backbone, loss_pixel_weight=loss_pixel_weight, pixel_loss_t_min=pixel_loss_t_min)
+    if backbone != "unet":
+        raise ValueError(f"backbone must be 'unet', 'dit', 'dit_concat' or 'dit_token', got {backbone!r}")
+
     # Load UNet (standard 4-channel in)
-    unet = UNet2DConditionModel.from_pretrained(sd_pretrained_path, subfolder="unet")
+    if pretrained_unet:
+        unet = UNet2DConditionModel.from_pretrained(sd_pretrained_path, subfolder="unet")
+    else:
+        unet = UNet2DConditionModel.from_config(
+            UNet2DConditionModel.load_config(sd_pretrained_path, subfolder="unet"))
+        # as in the original LDM UNet (zero_module on the output conv): start by predicting
+        # zero velocity instead of a random one
+        nn.init.zeros_(unet.conv_out.weight)
+        nn.init.zeros_(unet.conv_out.bias)
     unet.requires_grad_(True)
     unet.train()
 
@@ -495,6 +554,47 @@ def build_fm_refiner(
         noise_sigma=noise_sigma,
         sample_sigma=sample_sigma,
         sample_noise_mode=sample_noise_mode,
+        loss_pixel_weight=loss_pixel_weight,
+        pixel_loss_t_min=pixel_loss_t_min,
+    )
+    model.controlnet_cond_mode = controlnet_cond_mode
+    return model
+
+
+def _build_dit_fm_refiner(vae, n_landsat_bands, n_ps_bands, ps_dropout_p, use_controlnet, controlnet_cond_mode,
+                          velocity_parameterization, noise_sigma, sample_sigma, sample_noise_mode, dit_kwargs,
+                          variant="dit", loss_pixel_weight=0.0, pixel_loss_t_min=0.5):
+    from depthfm.dit_control import (
+        DiTBackbone, DiTConcatBackbone, DiTControl, DiTCondEncoder, DiTTokenBackbone)
+    kw = dict(patch_size=2, hidden_size=1024, depth=28, num_heads=16, mlp_ratio=4.0, n_control=14,
+              cond_latent_channels=16)
+    kw.update(dit_kwargs)
+    n_control = kw.pop("n_control")
+    cond_latent_channels = kw.pop("cond_latent_channels")
+    if variant != "dit" and not use_controlnet:
+        raise ValueError(f"backbone={variant!r} needs trainer.use_controlnet: True (it enables the condition path)")
+    n_cond = {"landsat_only": n_landsat_bands, "ps_only": n_ps_bands}.get(
+        controlnet_cond_mode, n_landsat_bands + n_ps_bands)
+    controlnet = None
+    if variant == "dit":
+        unet = DiTBackbone(**kw)
+        if use_controlnet:
+            controlnet = DiTControl(n_cond, patch_size=kw["patch_size"], hidden_size=kw["hidden_size"],
+                                    n_control=n_control, num_heads=kw["num_heads"], mlp_ratio=kw["mlp_ratio"])
+    elif variant == "dit_concat":
+        unet = DiTConcatBackbone(cond_latent_channels=cond_latent_channels, **kw)
+        controlnet = DiTCondEncoder(n_cond, "concat", patch_size=kw["patch_size"], hidden_size=kw["hidden_size"],
+                                    cond_latent_channels=cond_latent_channels)
+    else:
+        unet = DiTTokenBackbone(**kw)
+        controlnet = DiTCondEncoder(n_cond, "token", patch_size=kw["patch_size"], hidden_size=kw["hidden_size"])
+    model = FMRefiner(
+        vae=vae, unet=unet, controlnet=controlnet,
+        empty_text_embed=torch.zeros(1, 1, 1),     # unused by the DiT (no cross-attention)
+        ps_dropout_p=ps_dropout_p, use_controlnet=use_controlnet,
+        velocity_parameterization=velocity_parameterization, noise_sigma=noise_sigma,
+        sample_sigma=sample_sigma, sample_noise_mode=sample_noise_mode,
+        loss_pixel_weight=loss_pixel_weight, pixel_loss_t_min=pixel_loss_t_min,
     )
     model.controlnet_cond_mode = controlnet_cond_mode
     return model
