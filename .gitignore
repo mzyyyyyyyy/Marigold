@@ -16,6 +16,7 @@
 # ignore these types
 *.pyc
 *.out
+*.err
 *.log
 *.mexa64
 *.pdf

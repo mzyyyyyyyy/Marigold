@@ -580,6 +580,10 @@ if __name__ == "__main__":
         _eff_bs = cfg.dataloader.get("effective_batch_size", cfg.dataloader.max_train_batch_size)
         _accum_steps = max(1, _eff_bs // cfg.dataloader.max_train_batch_size)
         total_scale = max(1, (_accum_steps * (world_size if is_distributed else 1)) // _REFERENCE_ACCUM_STEPS)
+        if not cfg.get("scale_steps_by_batch", True):
+            # step counts in this config are REAL optimizer steps (from-scratch DiT needs far more
+            # steps than the ~3k the batch-anchored rule above leaves after dividing by 16)
+            total_scale = 1
         if total_scale > 1:
             cfg.max_iter = max(1, cfg.max_iter // total_scale)
             cfg.trainer.validation_period = max(1, cfg.trainer.validation_period // total_scale)

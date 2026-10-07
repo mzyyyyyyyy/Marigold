@@ -288,3 +288,114 @@ class DiTTokenBackbone(DiTBackbone):
                 x = blk(x, c0, None, rope)
             out = self.unpatchify(self.final_layer(x[:, :n], c)).float()
         return _Out(sample=out)
+
+
+# ---------------------------------------------------------------------------------------------
+# fm_refiner-D-lumi-0: OminiControl-style condition injection into a from-scratch DiT.
+#
+# OminiControl (arXiv 2411.15098) encodes the condition image with the SAME VAE as the generation
+# target, turns it into tokens, concatenates them to the noisy-latent tokens ([X; C]) and lets every
+# transformer block attend over the joint sequence; for spatially aligned conditions the condition
+# tokens reuse the position ids of the latent tokens. This is that, with the conditions
+# [Landsat, PS-or-null]:
+#   * each condition image is encoded by the frozen SD2.1 VAE (posterior MEAN, scaled by 0.18215 --
+#     exactly FMRefiner.encode), giving a 4-channel latent on the same grid as z_t;
+#   * a (trainable) patch embedding per condition + a learned type embedding makes the tokens;
+#   * the backbone runs full self-attention over [X; C_landsat; C_ps] with weights SHARED between
+#     latent and condition tokens, condition token i has the 2D RoPE position of latent token i,
+#     and only the latent tokens feed the output head.
+# Differences from OminiControl, forced by training from scratch: no LoRA (all weights train), a
+# separate patch embedding per condition instead of FLUX's shared one, and learned type embeddings.
+# Everything FMRefiner does around the backbone (PS dropout + null PS, noise, sampling) is unchanged.
+# ---------------------------------------------------------------------------------------------
+
+class DiTVAECondEncoder(nn.Module):
+    """Stands in for ControlNetModel: VAE-encodes each condition image and returns condition tokens
+    as `down_block_res_samples=(tokens_cond_0, tokens_cond_1, ...)`, each (B, N, hidden)."""
+
+    def __init__(self, vae, cond_channels, patch_size=2, hidden_size=768, vae_scale=0.18215,
+                 latent_channels=4):
+        super().__init__()
+        assert all(c == 3 for c in cond_channels), \
+            f"the SD2.1 VAE takes 3-channel images; got condition channel groups {cond_channels}"
+        # Plain list: the (frozen, shared) VAE must NOT be registered here, or it would be duplicated
+        # in this module's state_dict / DDP bucket. FMRefiner owns it and moves it between devices.
+        self._vae = [vae]
+        self.cond_channels = tuple(cond_channels)
+        self.vae_scale = vae_scale
+        self.embedders = nn.ModuleList([PatchEmbed(patch_size, latent_channels, hidden_size)
+                                        for _ in cond_channels])
+        self.type_embed = nn.Parameter(torch.randn(len(cond_channels), 1, hidden_size) * 0.02)
+        for e in self.embedders:
+            w = e.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.zeros_(e.proj.bias)
+        # eval-time cache: the condition is t-independent, but FMRefiner.refine() calls this once per
+        # Euler step with the same tensor. Holding a reference to the input makes the identity check safe.
+        self._cache_in, self._cache_ver, self._cache_out = None, None, None
+
+    @torch.no_grad()
+    def _encode(self, x):
+        vae = self._vae[0]
+        x = x.to(dtype=next(vae.parameters()).dtype)
+        mean, _ = torch.chunk(vae.quant_conv(vae.encoder(x)), 2, dim=1)
+        return mean * self.vae_scale
+
+    def forward(self, sample, timestep, encoder_hidden_states=None, controlnet_cond=None, return_dict=True):
+        assert controlnet_cond is not None and controlnet_cond.shape[1] == sum(self.cond_channels), \
+            f"expected {sum(self.cond_channels)} condition channels, got {tuple(controlnet_cond.shape)}"
+        if (not self.training and self._cache_in is controlnet_cond
+                and self._cache_ver == controlnet_cond._version):
+            lat = self._cache_out
+        else:
+            lat = [self._encode(c) for c in torch.split(controlnet_cond, list(self.cond_channels), dim=1)]
+            if not self.training:
+                self._cache_in, self._cache_ver, self._cache_out = controlnet_cond, controlnet_cond._version, lat
+        assert lat[0].shape[-2:] == sample.shape[-2:], \
+            f"condition latent {tuple(lat[0].shape[-2:])} must be on the z_t grid {tuple(sample.shape[-2:])}"
+        with _autocast(sample.device):
+            toks = tuple((emb(z.to(self.type_embed.dtype)) + self.type_embed[i]).float()
+                         for i, (emb, z) in enumerate(zip(self.embedders, lat)))
+        return _Out(down_block_res_samples=toks, mid_block_res_sample=None)
+
+
+class DiTOminiBackbone(DiTBackbone):
+    """[X; C_1; ...; C_K] joint self-attention in every block, aligned positions, output from X only.
+
+    Init: Xavier for the linear layers / patch embedding (DiT), and true adaLN-Zero -- the gate
+    chunks of the (shared) adaLN projection and of every block's scale_shift_table start at exactly
+    zero, so each block is the identity at initialisation (as are the zero-init output layer)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        d = self.hidden_size
+        lin = self.embed.t_block[1]
+        with torch.no_grad():
+            for k in (2, 5):                                  # gate_msa, gate_mlp
+                lin.weight[k * d:(k + 1) * d].zero_()
+                lin.bias[k * d:(k + 1) * d].zero_()
+            for blk in self.blocks:
+                blk.scale_shift_table[2].zero_()
+                blk.scale_shift_table[5].zero_()
+
+    def forward(self, sample, timestep, encoder_hidden_states=None, down_block_additional_residuals=None,
+                mid_block_additional_residual=None, return_dict=True):
+        B, _, H, W = sample.shape
+        assert H == W and H % self.patch_size == 0, "square latents with side divisible by patch_size only"
+        grid = H // self.patch_size
+        n = grid * grid
+        ctoks = tuple(down_block_additional_residuals or ())
+        for c in ctoks:
+            assert c.shape[1] == n, f"condition tokens {c.shape[1]} != latent tokens {n}"
+        k = 1 + len(ctoks)
+
+        def rope(q):   # q: (B, heads, k*n, head_dim); condition token i shares latent token i's position
+            return torch.cat([self.rope(q[:, :, j * n:(j + 1) * n], grid) for j in range(k)], dim=2)
+
+        with _autocast(sample.device):
+            x, c, c0 = self.embed(sample, timestep)
+            x = torch.cat([x] + [t.to(x.dtype) for t in ctoks], dim=1)
+            for blk in self.blocks:
+                x = blk(x, c0, None, rope)
+            out = self.unpatchify(self.final_layer(x[:, :n], c)).float()
+        return _Out(sample=out)

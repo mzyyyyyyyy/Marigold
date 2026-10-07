@@ -497,13 +497,14 @@ def build_fm_refiner(
     vae.requires_grad_(False)
     vae.eval()
 
-    if backbone in ("dit", "dit_concat", "dit_token"):
+    if backbone in ("dit", "dit_concat", "dit_token", "dit_omini"):
         return _build_dit_fm_refiner(
             vae, n_landsat_bands, n_ps_bands, ps_dropout_p, use_controlnet, controlnet_cond_mode,
             velocity_parameterization, noise_sigma, sample_sigma, sample_noise_mode, dit_kwargs or {},
             variant=backbone, loss_pixel_weight=loss_pixel_weight, pixel_loss_t_min=pixel_loss_t_min)
     if backbone != "unet":
-        raise ValueError(f"backbone must be 'unet', 'dit', 'dit_concat' or 'dit_token', got {backbone!r}")
+        raise ValueError(
+            f"backbone must be 'unet', 'dit', 'dit_concat', 'dit_token' or 'dit_omini', got {backbone!r}")
 
     # Load UNet (standard 4-channel in)
     if pretrained_unet:
@@ -565,13 +566,14 @@ def _build_dit_fm_refiner(vae, n_landsat_bands, n_ps_bands, ps_dropout_p, use_co
                           velocity_parameterization, noise_sigma, sample_sigma, sample_noise_mode, dit_kwargs,
                           variant="dit", loss_pixel_weight=0.0, pixel_loss_t_min=0.5):
     from depthfm.dit_control import (
-        DiTBackbone, DiTConcatBackbone, DiTControl, DiTCondEncoder, DiTTokenBackbone)
+        DiTBackbone, DiTConcatBackbone, DiTControl, DiTCondEncoder, DiTOminiBackbone, DiTTokenBackbone,
+        DiTVAECondEncoder)
     kw = dict(patch_size=2, hidden_size=1024, depth=28, num_heads=16, mlp_ratio=4.0, n_control=14,
               cond_latent_channels=16)
     kw.update(dit_kwargs)
     n_control = kw.pop("n_control")
     cond_latent_channels = kw.pop("cond_latent_channels")
-    if variant != "dit" and not use_controlnet:
+    if variant not in ("dit", "dit_omini") and not use_controlnet:
         raise ValueError(f"backbone={variant!r} needs trainer.use_controlnet: True (it enables the condition path)")
     n_cond = {"landsat_only": n_landsat_bands, "ps_only": n_ps_bands}.get(
         controlnet_cond_mode, n_landsat_bands + n_ps_bands)
@@ -585,6 +587,16 @@ def _build_dit_fm_refiner(vae, n_landsat_bands, n_ps_bands, ps_dropout_p, use_co
         unet = DiTConcatBackbone(cond_latent_channels=cond_latent_channels, **kw)
         controlnet = DiTCondEncoder(n_cond, "concat", patch_size=kw["patch_size"], hidden_size=kw["hidden_size"],
                                     cond_latent_channels=cond_latent_channels)
+    elif variant == "dit_omini":
+        # OminiControl-style: frozen-VAE-encoded [Landsat, PS] condition tokens + joint attention.
+        # With use_controlnet=False there is no condition encoder and the backbone sees z_t only
+        # (a plain DiT: the sequence is just the latent tokens).
+        unet = DiTOminiBackbone(**kw)
+        if use_controlnet:
+            if controlnet_cond_mode != "landsat_ps":
+                raise ValueError("backbone='dit_omini' needs trainer.controlnet_cond_mode: 'landsat_ps'")
+            controlnet = DiTVAECondEncoder(vae, (n_landsat_bands, n_ps_bands), patch_size=kw["patch_size"],
+                                           hidden_size=kw["hidden_size"], vae_scale=VAE_SCALE_FACTOR)
     else:
         unet = DiTTokenBackbone(**kw)
         controlnet = DiTCondEncoder(n_cond, "token", patch_size=kw["patch_size"], hidden_size=kw["hidden_size"])

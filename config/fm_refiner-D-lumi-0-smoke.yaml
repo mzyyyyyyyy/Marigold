@@ -1,0 +1,19 @@
+# Smoke-test variant of fm_refiner-D-lumi-0 (script/depth/test_dit_omini.sh): identical model/data/
+# optimiser, but short step counts so a few minutes of 4-node DDP training exercise the training
+# loop, periodic validation, best/latest checkpointing and the loss, without being a real run.
+base_config:
+- config/fm_refiner-D-lumi-0.yaml
+
+wandb:
+  name: fm_refiner-D-lumi-0-smoke
+
+lr_scheduler:
+  warmup_steps: 20
+
+trainer:
+  log_period: 5
+  save_period: 50
+  validation_period: 50
+
+scale_steps_by_batch: False   # real steps (the parent config uses the default batch-anchored rescaling)
+max_iter: 300

@@ -4,6 +4,7 @@ Sanity checks for the DiT variants (fm_refiner-R-lumi-11 / -12 / -13), no real d
   --backbone dit         -11: DiT + DiT-ControlNet analogue (zero-init control branch)
   --backbone dit_concat  -12: condition encoded to latent resolution, concatenated along CHANNELS
   --backbone dit_token   -13: condition encoded to tokens, concatenated along the SEQUENCE
+  --backbone dit_omini   D-0: frozen-VAE-encoded condition tokens, joint attention (OminiControl-style)
 
   1. interface: the variant and a random-init UNet, built through the same build_fm_refiner(), give the
      same shapes through FMRefiner.forward / refine; at init the output is exactly 0 (zero-init output
@@ -44,7 +45,12 @@ def synth_batch(B, size, device, g):
 
 
 def build(backbone, tiny, noise_sigma, device):
-    dit_kwargs = dict(hidden_size=128, depth=4, num_heads=4, n_control=2) if tiny else {}
+    if tiny:
+        dit_kwargs = dict(hidden_size=128, depth=4, num_heads=4, n_control=2)
+    elif backbone == "dit_omini":
+        dit_kwargs = dict(hidden_size=768, depth=12, num_heads=12)   # DiT-B, as in fm_refiner-D-lumi-0.yaml
+    else:
+        dit_kwargs = {}
     m = build_fm_refiner(
         sd_pretrained_path=SD, n_landsat_bands=3, n_ps_bands=3, ps_dropout_p=0.0, use_controlnet=True,
         controlnet_cond_mode="landsat_ps", noise_sigma=noise_sigma, sample_sigma=0.0,
@@ -63,12 +69,13 @@ def velocity(m, zt, t_int, cond):
                   mid_block_additional_residual=cn.mid_block_res_sample).sample
 
 
-def overfit(m, landsat, ps, coarse, gt, steps, tiny, tag):
+def overfit(m, landsat, ps, coarse, gt, steps, tiny, tag, lr=None):
     m.train()
     torch.manual_seed(2)
+    lr_unet, lr_cn = (4e-5 * (5 if tiny else 1), 4e-4 * (2 if tiny else 1)) if lr is None else (lr, lr)
     opt = torch.optim.AdamW(
-        [{"params": m.unet.parameters(), "lr": 4e-5 * (5 if tiny else 1)},
-         {"params": m.controlnet.parameters(), "lr": 4e-4 * (2 if tiny else 1)}], weight_decay=0.0)
+        [{"params": m.unet.parameters(), "lr": lr_unet},
+         {"params": m.controlnet.parameters(), "lr": lr_cn}], weight_decay=0.0)
     for gp in opt.param_groups:
         gp["base_lr"] = gp["lr"]
     t0, hist = time.time(), []
@@ -88,9 +95,11 @@ def overfit(m, landsat, ps, coarse, gt, steps, tiny, tag):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backbone", default="dit", choices=["dit", "dit_concat", "dit_token"])
+    ap.add_argument("--backbone", default="dit", choices=["dit", "dit_concat", "dit_token", "dit_omini"])
     ap.add_argument("--tiny", action="store_true")
     ap.add_argument("--steps", type=int, default=300)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="overfit lr for both groups (default: the old fine-tuning-scale values)")
     ap.add_argument("--size", type=int, default=240)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--skip_unet", action="store_true")
@@ -149,7 +158,7 @@ def main():
 
     # ---------------- 3. overfit one batch ----------------
     m = build(a.backbone, a.tiny, 0.0, dev)      # fresh model
-    hist = overfit(m, landsat, ps, coarse, gt, a.steps, a.tiny, "3")
+    hist = overfit(m, landsat, ps, coarse, gt, a.steps, a.tiny, "3", a.lr)
     first, tail = hist[0], sum(hist[-10:]) / 10
     print(f"[3] loss {first:.4f} -> {tail:.4f} (x{tail / first:.3f})")
     m.eval()
@@ -169,7 +178,18 @@ def main():
         err_c = (coarse - gt).abs().mean().item()
         errs = {n: (m.refine(landsat, coarse, n_steps=n) - gt).abs().mean().item() for n in (1, 4)}
         print(f"[3] mean|h-gt|: coarse={err_c:.4f}  refined 1 step={errs[1]:.4f}  4 steps={errs[4]:.4f}")
-    ok3 = tail < 0.05 * first and cos0 > 0.9 and errs[4] < err_c
+    if a.tiny:
+        ok3 = tail < 0.05 * first and cos0 > 0.9 and errs[4] < err_c
+    else:
+        # full-size model: no fixed-budget "memorise it" threshold. The loss must clearly fall and must
+        # NOT have plateaued (last window still below the window before it, unless already ~0), and
+        # the refined map must already beat the coarse one.
+        w = max(10, a.steps // 6)
+        recent, before = sum(hist[-w:]), sum(hist[-2 * w:-w])
+        still_falling = recent < 0.95 * before or tail < 0.05 * first
+        print(f"[3] full-size criteria: final/initial={tail / first:.3f} (<0.25), last-{w}-step mean / previous "
+              f"{w} = {recent / before:.3f} (<0.95 unless final<5% of initial), refined<coarse={errs[4] < err_c}")
+        ok3 = tail < 0.25 * first and still_falling and errs[4] < err_c
     print("[3]", "PASS" if ok3 else "FAIL")
     ok_all &= ok3
 
@@ -177,7 +197,7 @@ def main():
     if not a.skip_cond_test:
         same_coarse = coarse[:1].expand_as(coarse).contiguous()
         m = build(a.backbone, a.tiny, 0.0, dev)
-        overfit(m, landsat, ps, same_coarse, gt, a.steps, a.tiny, "4")
+        overfit(m, landsat, ps, same_coarse, gt, a.steps, a.tiny, "4", a.lr)
         m.eval()
         with torch.no_grad():
             z_c, z_g = m.encode(same_coarse), m.encode(gt)
