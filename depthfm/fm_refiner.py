@@ -424,6 +424,8 @@ def build_fm_refiner(
     noise_sigma: float = 0.0,
     sample_sigma: Optional[float] = None,
     sample_noise_mode: str = "sde",
+    unet_init: str = "pretrained",
+    unet_config: Optional[dict] = None,
     device: str = "cuda",
 ) -> FMRefiner:
     """
@@ -445,6 +447,12 @@ def build_fm_refiner(
         sample_noise_mode: "sde" (default; noise injected every step, bridge_noise-style)
             or "init_only" (RFMSR-style; noise injected once before integration starts,
             then a pure deterministic ODE) — see refine()/module docstring.
+        unet_init: "pretrained" (default; SD2.1 UNet weights) or "scratch" (same SD2.1
+            config, randomly initialized, with unet_config overrides applied). The VAE
+            and text encoder are always loaded from sd_pretrained_path. ControlNet is
+            always built via from_unet(), so it follows whatever UNet is built here.
+        unet_config: diffusers UNet2DConditionModel config overrides (dict); only valid
+            with unet_init="scratch".
         device: device string
     """
     from transformers import CLIPTextModel, CLIPTokenizer
@@ -455,7 +463,16 @@ def build_fm_refiner(
     vae.eval()
 
     # Load UNet (standard 4-channel in)
-    unet = UNet2DConditionModel.from_pretrained(sd_pretrained_path, subfolder="unet")
+    if unet_init == "pretrained":
+        if unet_config:
+            raise ValueError("unet_config overrides require unet_init='scratch'")
+        unet = UNet2DConditionModel.from_pretrained(sd_pretrained_path, subfolder="unet")
+    elif unet_init == "scratch":
+        cfg_dict = dict(UNet2DConditionModel.load_config(sd_pretrained_path, subfolder="unet"))
+        cfg_dict.update(unet_config or {})
+        unet = UNet2DConditionModel.from_config(cfg_dict)
+    else:
+        raise ValueError(f"unet_init must be 'pretrained' or 'scratch', got {unet_init!r}")
     unet.requires_grad_(True)
     unet.train()
 

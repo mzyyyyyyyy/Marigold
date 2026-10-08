@@ -695,6 +695,9 @@ if __name__ == "__main__":
         noise_sigma=cfg.trainer.get("noise_sigma", 0.0),
         sample_sigma=cfg.trainer.get("sample_sigma", None),
         sample_noise_mode=cfg.trainer.get("sample_noise_mode", "sde"),
+        unet_init=cfg.model.get("unet_init", "pretrained"),
+        unet_config=(OmegaConf.to_container(cfg.model.unet_config, resolve=True)
+                     if cfg.model.get("unet_config") is not None else None),
         device=str(device),
     )
     fm_refiner = fm_refiner.to(device)
@@ -936,13 +939,13 @@ if __name__ == "__main__":
         logging.info("Running full validation on entire val set...")
     final_metrics, final_fig = validate(
         fm_refiner, dav2_model, val_dataset, device,
-        n_steps=cfg.validation.n_steps,
+        n_steps=cfg.validation.get("final_n_steps", cfg.validation.n_steps),
         target_stats=target_stats,
         n_landsat_bands=n_landsat_bands,
         full=True,
         method=cfg.validation.get("method", "euler"),
         sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
-        ensemble_size=cfg.validation.get("ensemble_size", 1),
+        ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
         num_workers=cfg_data.workers,  # full=True shards the whole val set,
         # worth the worker-process cost here (unlike the periodic call above).
