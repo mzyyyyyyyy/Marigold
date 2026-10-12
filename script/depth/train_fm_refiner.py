@@ -183,6 +183,7 @@ def validate(
     is_distributed: bool = False,
     num_workers: int = 0,
     report_nonzero: bool = False,   # also report r2/mae/rmse (suffix _nz) on pixels with GT height > 0
+    use_ps: bool = False,           # feed the real PlanetScope as condition (FMRefiner only) instead of the null PS
 ) -> tuple:
     """
     Runs validation in parallel across all ranks: every rank forwards its own
@@ -260,7 +261,8 @@ def validate(
         h_fine_draws = [
             fm_refiner.refine(landsat_hr, h_coarse, n_steps=n_steps, method=method, sampling_fn=sampling_fn,
                               **({"landsat_native": landsat} if is_flux else {}),
-                              **({"coarse_feats": coarse_feats} if is_dit else {}))
+                              **({"coarse_feats": coarse_feats} if is_dit else {}),
+                              **({"ps_hr": inputs_hr} if use_ps else {}))
             for _ in range(ensemble_size)
         ]
         h_fine = torch.stack(h_fine_draws, dim=0).mean(dim=0)
@@ -1076,6 +1078,7 @@ if __name__ == "__main__":
                     sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
                     ensemble_size=cfg.validation.get("ensemble_size", 1),
                     report_nonzero=cfg.eval.get("report_nonzero_gt", False),
+        use_ps=cfg.validation.get("use_ps", False),
                     global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
                 )
                 # Deterministic given val_offset/val_subset_size/len(val_dataset),
@@ -1141,6 +1144,7 @@ if __name__ == "__main__":
         sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
         ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
         report_nonzero=cfg.eval.get("report_nonzero_gt", False),
+                    use_ps=cfg.validation.get("use_ps", False),
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
         num_workers=cfg_data.workers,  # full=True shards the whole val set,
         # worth the worker-process cost here (unlike the periodic call above).

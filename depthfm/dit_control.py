@@ -333,12 +333,16 @@ class DiTVAECondEncoder(nn.Module):
         # eval-time cache: the condition is t-independent, but FMRefiner.refine() calls this once per
         # Euler step with the same tensor. Holding a reference to the input makes the identity check safe.
         self._cache_in, self._cache_ver, self._cache_out = None, None, None
+        self.cond_grad = False
 
-    @torch.no_grad()
     def _encode(self, x):
+        # No graph by default (frozen VAE, conditions are inputs). `cond_grad=True` lets gradients flow
+        # THROUGH the frozen VAE encoder to the condition image (sr_fm_refiner_d_v0: the TDP loss
+        # back-propagates from DiT features to the SR module's pseudo-PS); VAE weights stay frozen.
         vae = self._vae[0]
         x = x.to(dtype=next(vae.parameters()).dtype)
-        mean, _ = torch.chunk(vae.quant_conv(vae.encoder(x)), 2, dim=1)
+        with torch.set_grad_enabled(self.cond_grad and torch.is_grad_enabled()):
+            mean, _ = torch.chunk(vae.quant_conv(vae.encoder(x)), 2, dim=1)
         return mean * self.vae_scale
 
     def forward(self, sample, timestep, encoder_hidden_states=None, controlnet_cond=None, return_dict=True):

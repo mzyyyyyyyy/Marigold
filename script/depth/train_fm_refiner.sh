@@ -60,7 +60,7 @@ SIF=/flash/project_465002934/env/marigold_env.sif
 # (+ matching tokenizers/safetensors), prepended to PYTHONPATH for this job
 # only; fm_refiner/diffusers 0.37 build fine with it (checked on CPU).
 OVERLAY=/flash/project_465002934/env/py_overlay_tf517
-SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_fm_refiner.py
+SCRIPT=${SCRIPT:-/users/mazhanyu/Projects/Marigold/script/depth/train_fm_refiner.py}
 CONFIG=${CONFIG:-config/fm_refiner-R-lumi-5.yaml}
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run

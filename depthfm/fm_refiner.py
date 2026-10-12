@@ -346,11 +346,14 @@ class FMRefiner(nn.Module):
         n_steps: int = 1,
         method: str = "euler",       # "euler" or "heun" (heun only supported with velocity_parameterization="fixed")
         sampling_fn: str = "uniform",  # "uniform"/"sqrt"/"square" step warp (only used with velocity_parameterization="indi")
+        ps_hr: Optional[torch.Tensor] = None,  # (B, C_ps, H_hr, W_hr) real PlanetScope; None -> null PS token
     ) -> torch.Tensor:
         """
         Refine coarse prediction via ODE integration.
 
-        When use_controlnet=True, uses null PS token at inference time.
+        When use_controlnet=True, uses the null PS token at inference time unless ps_hr is
+        given (then the real PS is fed as the condition, e.g. for models trained with
+        ps_dropout_p=0, see fm_refiner-D-lumi-0-ps.yaml).
         When use_controlnet=False, runs UNet only.
 
         velocity_parameterization="fixed" (this model's setting, fixed at construction):
@@ -384,14 +387,16 @@ class FMRefiner(nn.Module):
                 control_input = landsat_lr
             else:
                 H_hr, W_hr = landsat_lr.shape[2], landsat_lr.shape[3]
-                if self._null_ps is None:
-                    raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
-                c_ps = self._null_ps.shape[1]
-                null_ps = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
-                if self.controlnet_cond_mode == "ps_only":
-                    control_input = null_ps
+                if ps_hr is not None:
+                    ps_cond = ps_hr.to(device, dtype)
                 else:
-                    control_input = torch.cat([landsat_lr, null_ps], dim=1)
+                    if self._null_ps is None:
+                        raise RuntimeError("null_ps not initialized. Run a training forward pass first.")
+                    ps_cond = self._null_ps.expand(B, -1, H_hr, W_hr).to(device, dtype)
+                if self.controlnet_cond_mode == "ps_only":
+                    control_input = ps_cond
+                else:
+                    control_input = torch.cat([landsat_lr, ps_cond], dim=1)
         else:
             control_input = None
 
