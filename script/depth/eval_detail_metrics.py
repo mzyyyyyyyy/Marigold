@@ -69,7 +69,9 @@ def _split_coords(all_coords, train_split, val_split, seed):
     return indices[train_size:train_size + val_size], all_coords
 
 
-def _make_val_dataset(cfg_data):
+def _make_val_dataset(cfg_data, split="val", mode="val"):
+    """split: "val" (default, used by the detail eval) or "train"; mode: dataset mode ("train" = with the
+    training-time brightness/contrast/gamma augmentation of the inputs)."""
     base = LazyPatchDataset({
         'input_dir': cfg_data.input_dir,
         'input_dir_hr': cfg_data.input_dir_hr,
@@ -88,7 +90,7 @@ def _make_val_dataset(cfg_data):
         'selected_percentile': cfg_data.selected_percentile,
         'year': cfg_data.year,
         'batch_size': 1,
-        'mode': 'val',
+        'mode': mode,
         'use_input_minmax': cfg_data.use_input_minmax,
         'use_input_norm': cfg_data.use_input_norm,
         'input_stats_file': cfg_data.input_stats_file,
@@ -105,10 +107,14 @@ def _make_val_dataset(cfg_data):
     })
     all_coords = base.patch_coords
     idx, _ = _split_coords(all_coords, cfg_data.train_split, cfg_data.val_split, cfg_data.split_seed)
+    if split == "train":
+        n = len(all_coords)
+        perm = torch.randperm(n, generator=torch.Generator().manual_seed(cfg_data.split_seed)).tolist()
+        idx = perm[:int(cfg_data.train_split * n)]
     coords = [all_coords[i] for i in idx]
     ds = copy.copy(base)
     ds.batch_size = 1
-    ds.mode = 'val'
+    ds.mode = mode
     ds.patch_coords = coords
     ds.patches_by_size = {}
     for ps in ds.patch_sizes:
