@@ -31,6 +31,7 @@ import copy
 import json
 import logging
 import os
+import pickle
 import random
 import sys
 
@@ -78,11 +79,26 @@ def _split_coords(all_coords, train_split, val_split, seed):
     )
 
 
-def _make_dataset(base_dataset, coords, mode, batch_size):
+def _load_coords(path):
+    """Patch-coordinate list from script/depth/make_spatial_split.py."""
+    with open(path, "rb") as f:
+        coords = pickle.load(f)
+    missing = [k for k in ("input_path", "input_path_hr", "output_path") if not os.path.exists(coords[0][k])]
+    assert not missing, f"{path}: source files for {missing} do not exist (paths stale?)"
+    return coords
+
+
+def _make_dataset(base_dataset, coords, mode, batch_size, deterministic_eval=False):
     dataset = copy.copy(base_dataset)
     dataset.batch_size = batch_size
     dataset.mode = mode
     dataset.patch_coords = coords
+    if deterministic_eval:
+        # base_dataset built its transforms with mode='train' (random
+        # brightness/contrast/gamma); rebuild them for eval, and make item idx
+        # return exactly patch_coords[idx] (every patch evaluated once).
+        dataset.transform_input, dataset.transform_input_hr, dataset.transform_output = dataset._transform()
+        dataset.deterministic_eval = True
     dataset.patches_by_size = {}
     for patch_size in dataset.patch_sizes:
         dataset.patches_by_size[patch_size] = [
@@ -191,6 +207,7 @@ def validate(
     world_size: int = 1,
     is_distributed: bool = False,
     num_workers: int = 0,
+    range_edges=None,
 ) -> tuple:
     """
     Runs validation in parallel across all ranks: every rank forwards its own
@@ -198,7 +215,9 @@ def validate(
     modules — no gradients, so no DDP participation is needed — and the
     R²/MAE/RMSE sufficient statistics are all-reduced (exact, and tiny compared
     to gathering every per-pixel prediction). Every rank gets the metrics back;
-    only rank0 gets a figure (None elsewhere).
+    only rank0 gets a figure (None elsewhere). With range_edges, the metrics
+    also include per-height-range entries: a patch belongs to the range of its
+    GT 75th percentile (same grouping as the training pool's quota).
     """
     # Raw (non-DDP) modules: DDP's forward hooks assume every rank calls it in
     # lockstep for gradient sync, which doesn't apply here (no backward pass,
@@ -224,6 +243,9 @@ def validate(
 
     # Sufficient statistics: [n, sum(gt), sum(gt^2), sum(res^2), sum(|res|)]
     stats = torch.zeros(5, dtype=torch.float64, device=device)
+    # Same statistics (+ patch count in column 5) per height range.
+    n_groups = len(range_edges) - 1 if range_edges is not None else 0
+    stats_g = torch.zeros(n_groups, 6, dtype=torch.float64, device=device)
     # Only the first n_vis_samples ranks keep one sample each, so the gather
     # below moves at most n_vis_samples images instead of one set per rank.
     collect_vis = global_rank < n_vis_samples
@@ -254,10 +276,16 @@ def validate(
         mask = torch.isfinite(g) & torch.isfinite(p)
         p, g = p[mask], g[mask]
         res = g - p
-        stats += torch.stack([
+        s5 = torch.stack([
             torch.tensor(float(g.numel()), dtype=torch.float64, device=device),
             g.sum(), (g * g).sum(), (res * res).sum(), res.abs().sum(),
         ])
+        stats += s5
+        if range_edges is not None:
+            p75 = float(np.percentile(targets.cpu().numpy(), 75))
+            gi = int(np.digitize([p75], range_edges[1:-1])[0])
+            stats_g[gi, :5] += s5
+            stats_g[gi, 5] += 1
 
         if collect_vis and len(vis_samples) < 1:
             landsat_vis = F.interpolate(landsat, size=(H_hr, W_hr), mode="bilinear", align_corners=False)
@@ -274,19 +302,30 @@ def validate(
 
     if is_distributed:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(stats_g, op=dist.ReduceOp.SUM)
         # NCCL has no point-to-point gather, so use all_gather_object (backed
         # by all_gather) even though only rank0 uses the result.
         gathered = [None] * world_size
         dist.all_gather_object(gathered, vis_samples)
         vis_samples = [s for g in gathered for s in g][:n_vis_samples]
 
-    n, sum_g, sum_gg, ss_res, sum_abs = stats.tolist()
-    ss_tot = sum_gg - sum_g ** 2 / max(n, 1.0)
-    metrics = {
-        "r2": 1.0 - ss_res / (ss_tot + 1e-8),
-        "mae": sum_abs / max(n, 1.0),
-        "rmse": (ss_res / max(n, 1.0)) ** 0.5,
-    }
+    def _metrics(st):
+        n, sum_g, sum_gg, ss_res, sum_abs = st
+        ss_tot = sum_gg - sum_g ** 2 / max(n, 1.0)
+        return {
+            "r2": 1.0 - ss_res / (ss_tot + 1e-8),
+            "mae": sum_abs / max(n, 1.0),
+            "rmse": (ss_res / max(n, 1.0)) ** 0.5,
+        }
+
+    metrics = _metrics(stats.tolist())
+    for gi, row in enumerate(stats_g.tolist()):
+        if row[5] == 0:
+            continue
+        # np.digitize(edges[1:-1]) puts everything >= edges[-2] in the last group
+        tag = f"h{range_edges[gi]}+m" if gi == n_groups - 1 else f"h{range_edges[gi]}-{range_edges[gi + 1]}m"
+        metrics.update({f"{k}_{tag}": v for k, v in _metrics(row[:5]).items()})
+        metrics[f"n_patches_{tag}"] = int(row[5])
     fig = _make_vis_figure(vis_samples, target_vmax) if (vis_samples and global_rank == 0) else None
     return metrics, fig
 
@@ -545,12 +584,31 @@ if __name__ == "__main__":
         'scale_target_to_neg1_1': cfg_data.get('scale_target_to_neg1_1', False),
     })
 
-    all_coords = base_dataset.patch_coords
-    train_coords, val_coords, _ = _split_coords(
-        all_coords, cfg_data.train_split, cfg_data.val_split, cfg_data.split_seed
-    )
+    # Spatial split (make_spatial_split.py, on finer_lumi_nd): patch_coord_path
+    # is the *train* list, val/test lists are given separately; they are
+    # disjoint from each other in space, and val/test are non-overlapping,
+    # non-augmented grids. Without val_coord_path: legacy random patch-level
+    # split of one pool.
+    spatial_split = cfg_data.get("val_coord_path") is not None
+    test_dataset, range_edges = None, None
+    if spatial_split:
+        train_coords = base_dataset.patch_coords
+        val_coords = _load_coords(cfg_data.val_coord_path)
+        test_coords = _load_coords(cfg_data.test_coord_path)
+        # Fixed shuffle so the rotating 10% val window during training mixes
+        # tiles/blocks (the list is otherwise ordered by block).
+        random.Random(cfg_data.split_seed).shuffle(val_coords)
+        range_edges = list(cfg_data.target_range_edges)
+        if is_main_process:
+            logging.info(f"Patches: train={len(train_coords)} val={len(val_coords)} test={len(test_coords)}")
+        test_dataset = _make_dataset(base_dataset, test_coords, 'test', 1, deterministic_eval=True)
+    else:
+        all_coords = base_dataset.patch_coords
+        train_coords, val_coords, _ = _split_coords(
+            all_coords, cfg_data.train_split, cfg_data.val_split, cfg_data.split_seed
+        )
     train_dataset = _make_dataset(base_dataset, train_coords, 'train', cfg.dataloader.max_train_batch_size)
-    val_dataset = _make_dataset(base_dataset, val_coords, 'val', 1)
+    val_dataset = _make_dataset(base_dataset, val_coords, 'val', 1, deterministic_eval=spatial_split)
 
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank,
@@ -863,6 +921,30 @@ if __name__ == "__main__":
         save_checkpoint(net_sr, net_reg, optimizer_sr, optimizer_reg,
                         lr_scheduler_sr, lr_scheduler_reg, step, out_dir_ckpt, "final")
         logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
+
+    # Held-out test set: the number to report. Never used for model selection
+    # (best.pth is picked by val R2). validate() returns metrics on every rank.
+    if test_dataset is not None:
+        if is_main_process:
+            logging.info("Running full evaluation on the test set...")
+        test_metrics, test_fig = validate(
+            net_sr, net_reg, test_dataset, device,
+            n_landsat_bands=n_landsat_bands,
+            target_vmax=target_vmax,
+            full=True,
+            global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
+            num_workers=cfg_data.workers,
+            range_edges=range_edges,
+        )
+        if is_main_process:
+            logging.info(f"Final TEST metrics: {test_metrics}")
+            tlog = {f"test_final/{k}": v for k, v in test_metrics.items()}
+            if test_fig is not None:
+                tlog["test_final/samples"] = wandb.Image(test_fig)
+                plt.close(test_fig)
+            wandb.log(tlog, step=step)
+            with open(os.path.join(out_dir_run, "test_metrics.json"), "w") as f:
+                json.dump({"step": step, "n_test_patches": len(test_dataset), "metrics": test_metrics}, f, indent=1)
 
     if is_distributed:
         _barrier()

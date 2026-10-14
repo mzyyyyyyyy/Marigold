@@ -44,7 +44,7 @@ SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_baseline_swt_reg.py
 # overlay holds transformers 5.17.0, prepended to PYTHONPATH for this job only
 # (same as train_baseline_chmv2.sh / train_sr_fm_refiner.sh).
 OVERLAY=/flash/project_465002934/env/py_overlay_tf517
-CONFIG=config/baseline_swt-lumi.yaml
+CONFIG=config/baseline_swt-lumi-nd.yaml
 # Checkpoints are large and the home filesystem (20G quota) fills up; write
 # outputs to the project's Flash storage instead.
 OUTPUT_DIR=/flash/project_465002934/Marigold_output
