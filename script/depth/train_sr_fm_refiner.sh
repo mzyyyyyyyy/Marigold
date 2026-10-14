@@ -69,7 +69,7 @@ SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_sr_fm_refiner.py
 # model). This overlay holds transformers 5.17.0, prepended to PYTHONPATH for
 # this job only (same as finer_lumi's train_fm_refiner.sh).
 OVERLAY=/flash/project_465002934/env/py_overlay_tf517
-CONFIG=config/sr_fm_refiner_v12-lumi.yaml
+CONFIG=config/sr_fm_refiner_v12-lumi-nd.yaml
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write. Write outputs to the project's Flash storage

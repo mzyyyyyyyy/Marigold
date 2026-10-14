@@ -86,6 +86,10 @@ class ConvertDtype(A.ImageOnlyTransform):
 
 
 class LazyPatchDataset(Dataset):
+    # When True (set on eval copies), __getitem__ returns patch_coords[idx]
+    # instead of a random patch of a random size.
+    deterministic_eval = False
+
     def __init__(self, config):
         # 读取多模态文件地址，输出patch信息成pkl文件；如果pkl文件已经存在，则直接读取
         self.input_dir = config['input_dir']
@@ -713,19 +717,26 @@ class LazyPatchDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        # Randomly choose a patch size for this batch
-        patch_size = random.choice(self.patch_sizes)
-        patches = self.patches_by_size[patch_size]
-        
-        # Get batch_size patches of this size
-        start_idx = (idx * self.batch_size) % len(patches)
-        end_idx = min(start_idx + self.batch_size, len(patches))
-        batch_patches = patches[start_idx:end_idx]
-        
-        # If we don't have enough patches, wrap around
-        if len(batch_patches) < self.batch_size:
-            remaining = self.batch_size - len(batch_patches)
-            batch_patches.extend(patches[:remaining])
+        if self.deterministic_eval:
+            # Evaluation: item idx is exactly patch_coords[idx] (batch_size 1),
+            # so a full pass visits every patch once, in a fixed order.
+            assert self.batch_size == 1, "deterministic_eval requires batch_size=1"
+            patches = self.patch_coords
+            batch_patches = [patches[idx]]
+        else:
+            # Randomly choose a patch size for this batch
+            patch_size = random.choice(self.patch_sizes)
+            patches = self.patches_by_size[patch_size]
+
+            # Get batch_size patches of this size
+            start_idx = (idx * self.batch_size) % len(patches)
+            end_idx = min(start_idx + self.batch_size, len(patches))
+            batch_patches = patches[start_idx:end_idx]
+
+            # If we don't have enough patches, wrap around
+            if len(batch_patches) < self.batch_size:
+                remaining = self.batch_size - len(batch_patches)
+                batch_patches.extend(patches[:remaining])
         
         # Load all patches in the batch
         inputs_lr = []
