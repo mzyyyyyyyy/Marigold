@@ -25,6 +25,7 @@ import copy
 import json
 import logging
 import os
+import pickle
 import random
 import sys
 
@@ -72,11 +73,26 @@ def _split_coords(all_coords, train_split, val_split, seed):
     )
 
 
-def _make_dataset(base_dataset, coords, mode, batch_size):
+def _load_coords(path):
+    """Patch-coordinate list from script/depth/make_spatial_split.py."""
+    with open(path, "rb") as f:
+        coords = pickle.load(f)
+    missing = [k for k in ("input_path", "input_path_hr", "output_path") if not os.path.exists(coords[0][k])]
+    assert not missing, f"{path}: source files for {missing} do not exist (paths stale?)"
+    return coords
+
+
+def _make_dataset(base_dataset, coords, mode, batch_size, deterministic_eval=False):
     dataset = copy.copy(base_dataset)
     dataset.batch_size = batch_size
     dataset.mode = mode
     dataset.patch_coords = coords
+    if deterministic_eval:
+        # base_dataset built its transforms with mode='train' (random
+        # brightness/contrast/gamma); rebuild them for eval, and make item idx
+        # return exactly patch_coords[idx] (every patch evaluated once).
+        dataset.transform_input, dataset.transform_input_hr, dataset.transform_output = dataset._transform()
+        dataset.deterministic_eval = True
     dataset.patches_by_size = {}
     for patch_size in dataset.patch_sizes:
         dataset.patches_by_size[patch_size] = [
@@ -110,6 +126,22 @@ def compute_metrics(pred: torch.Tensor, gt: torch.Tensor):
     mae = (gt - pred).abs().mean()
     rmse = ((gt - pred) ** 2).mean().sqrt()
     return {"r2": r2.item(), "mae": mae.item(), "rmse": rmse.item()}
+
+
+def compute_metrics_by_range(preds, gts, groups, edges):
+    """Metrics per height range. A patch belongs to the range of its GT 75th
+    percentile (same grouping as the training pool's quota)."""
+    out = {}
+    for g in range(len(edges) - 1):
+        sel = [i for i, gi in enumerate(groups) if gi == g]
+        if not sel:
+            continue
+        m = compute_metrics(torch.cat([preds[i] for i in sel]), torch.cat([gts[i] for i in sel]))
+        # np.digitize(edges[1:-1]) puts everything >= edges[-2] in the last group
+        tag = f"h{edges[g]}+m" if g == len(edges) - 2 else f"h{edges[g]}-{edges[g + 1]}m"
+        out.update({f"{k}_{tag}": v for k, v in m.items()})
+        out[f"n_patches_{tag}"] = len(sel)
+    return out
 
 
 # -------------------------------------------------------------------------
@@ -180,6 +212,7 @@ def validate(
     world_size: int = 1,
     is_distributed: bool = False,
     num_workers: int = 0,
+    range_edges=None,              # if set, metrics also include per-height-range entries
 ) -> tuple:
     """
     Runs validation in parallel across all ranks: every rank forwards its own
@@ -200,7 +233,7 @@ def validate(
         fm_refiner.controlnet = _raw(orig_controlnet)
 
     fm_refiner.eval()
-    all_preds, all_gts = [], []
+    all_preds, all_gts, all_groups = [], [], []
     vis_samples = []
 
     # Every rank computes the identical (deterministic) index window, then
@@ -257,6 +290,9 @@ def validate(
         gt_m = _denormalize_target(targets, target_stats)
         all_preds.append(pred_m.cpu().flatten())
         all_gts.append(gt_m.cpu().flatten())
+        if range_edges is not None:
+            p75 = float(np.percentile(gt_m.cpu().numpy(), 75))
+            all_groups.append(int(np.digitize([p75], range_edges[1:-1])[0]))
 
         # Collect vis samples from the first image of this batch
         if len(vis_samples) < n_vis_samples:
@@ -268,9 +304,6 @@ def validate(
                 "gt":      _to_vis_depth(targets[0]),
             })
 
-    pred_local = torch.cat(all_preds, dim=0) if all_preds else torch.empty(0)
-    gt_local   = torch.cat(all_gts, dim=0)   if all_gts   else torch.empty(0)
-
     fm_refiner.train()
     # Restore the (possibly DDP-wrapped) modules used for training.
     fm_refiner.unet, fm_refiner.controlnet = orig_unet, orig_controlnet
@@ -281,21 +314,22 @@ def validate(
         # even though only rank0 ends up using the result — every rank must
         # still pre-allocate the output list and call this collectively.
         gathered = [None] * world_size
-        dist.all_gather_object(gathered, (pred_local, gt_local, vis_samples))
+        dist.all_gather_object(gathered, (all_preds, all_gts, all_groups, vis_samples))
         if global_rank != 0:
             return None, None
-        pred_cat = torch.cat([g[0] for g in gathered if g[0].numel() > 0], dim=0)
-        gt_cat   = torch.cat([g[1] for g in gathered if g[1].numel() > 0], dim=0)
+        all_preds = [t for g in gathered for t in g[0]]
+        all_gts = [t for g in gathered for t in g[1]]
+        all_groups = [t for g in gathered for t in g[2]]
         vis_samples = []
         for g in gathered:
-            vis_samples.extend(g[2])
+            vis_samples.extend(g[3])
             if len(vis_samples) >= n_vis_samples:
                 break
         vis_samples = vis_samples[:n_vis_samples]
-    else:
-        pred_cat, gt_cat = pred_local, gt_local
 
-    metrics = compute_metrics(pred_cat, gt_cat)
+    metrics = compute_metrics(torch.cat(all_preds, dim=0), torch.cat(all_gts, dim=0))
+    if range_edges is not None:
+        metrics.update(compute_metrics_by_range(all_preds, all_gts, all_groups, range_edges))
     fig = _make_vis_figure(vis_samples) if vis_samples else None
     return metrics, fig
 
@@ -651,13 +685,31 @@ if __name__ == "__main__":
         'scale_target_to_neg1_1': cfg_data.get('scale_target_to_neg1_1', False),
     })
 
-    all_coords = base_dataset.patch_coords
-    train_coords, val_coords, _ = _split_coords(
-        all_coords, cfg_data.train_split, cfg_data.val_split, cfg_data.split_seed
-    )
+    # Spatial split (script/depth/make_spatial_split.py): patch_coord_path is the
+    # *train* list, val/test lists are given separately; they are disjoint from
+    # each other in space, and val/test are non-overlapping, non-augmented grids.
+    # Without val_coord_path: legacy random patch-level split of one pool.
+    spatial_split = cfg_data.get("val_coord_path") is not None
+    test_dataset, range_edges = None, None
+    if spatial_split:
+        train_coords = base_dataset.patch_coords
+        val_coords = _load_coords(cfg_data.val_coord_path)
+        test_coords = _load_coords(cfg_data.test_coord_path)
+        # Fixed shuffle so the rotating 10% val window during training mixes
+        # tiles/blocks (the list is otherwise ordered by block).
+        random.Random(cfg_data.split_seed).shuffle(val_coords)
+        range_edges = list(cfg_data.target_range_edges)
+        if is_main_process:
+            logging.info(f"Patches: train={len(train_coords)} val={len(val_coords)} test={len(test_coords)}")
+        test_dataset = _make_dataset(base_dataset, test_coords, 'test', 1, deterministic_eval=True)
+    else:
+        all_coords = base_dataset.patch_coords
+        train_coords, val_coords, _ = _split_coords(
+            all_coords, cfg_data.train_split, cfg_data.val_split, cfg_data.split_seed
+        )
 
     train_dataset = _make_dataset(base_dataset, train_coords, 'train', cfg.dataloader.max_train_batch_size)
-    val_dataset = _make_dataset(base_dataset, val_coords, 'val', 1)
+    val_dataset = _make_dataset(base_dataset, val_coords, 'val', 1, deterministic_eval=spatial_split)
 
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank,
@@ -958,6 +1010,36 @@ if __name__ == "__main__":
             plt.close(final_fig)
         wandb.log(final_log, step=step)
 
+    # Held-out test set: the number to report. Never used for model selection
+    # (best.pth is picked by val R2 above). Same inference settings as the
+    # final val pass.
+    if test_dataset is not None:
+        if is_main_process:
+            logging.info("Running full evaluation on the test set...")
+        test_metrics, test_fig = validate(
+            fm_refiner, dav2_model, test_dataset, device,
+            n_steps=cfg.validation.get("final_n_steps", cfg.validation.n_steps),
+            target_stats=target_stats,
+            n_landsat_bands=n_landsat_bands,
+            full=True,
+            method=cfg.validation.get("method", "euler"),
+            sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
+            ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
+            global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
+            num_workers=cfg_data.workers,
+            range_edges=range_edges,
+        )
+        if is_main_process:
+            logging.info(f"Final TEST metrics: {test_metrics}")
+            test_log = {f"test_final/{k}": v for k, v in test_metrics.items()}
+            if test_fig is not None:
+                test_log["test_final/samples"] = wandb.Image(test_fig)
+                plt.close(test_fig)
+            wandb.log(test_log, step=step)
+            with open(os.path.join(out_dir_run, "test_metrics.json"), "w") as f:
+                json.dump({"step": step, "n_test_patches": len(test_dataset), "metrics": test_metrics}, f, indent=1)
+
+    if is_main_process:
         save_checkpoint(fm_refiner, optimizer, lr_scheduler, step, out_dir_ckpt, "final")
         logging.info(f"Training finished at step {step}. Best val R²={best_r2:.4f}")
 
