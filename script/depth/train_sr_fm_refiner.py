@@ -10,6 +10,7 @@ Phase 2 (train FM, freeze SR):
   PS source per sample is drawn from three exclusive outcomes:
     p_null_drop  → null PS token (modality dropout)
     p_pseudo_ps  → SR-generated pseudo-PS (train-test alignment)
+    p_cqmix      → CQMix of real/pseudo PS (SR4IR; optional, default 0)
     remainder    → real PS
   FM training identical to train_fm_refiner.py.
 
@@ -641,6 +642,28 @@ def _sr_step(
 # Phase-2 training step
 # -------------------------------------------------------------------------
 
+def _cqmix(
+    real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
+    pseudo_ps: torch.Tensor,     # (B, C_ps, H_hr, W_hr)
+    grid: int,
+) -> torch.Tensor:
+    """
+    Cross-Quality patch Mix (SR4IR, Kim et al. CVPR 2024): split each image
+    into a grid x grid layout and take every cell from real or pseudo PS with
+    probability 0.5. The cell mask is drawn at VAE-latent resolution (/8) and
+    then upsampled, so cell borders fall on latent-pixel boundaries (e.g. a
+    240px patch with grid=4 gives 7- or 8-latent-px cells, not 60px = 7.5).
+    """
+    B, _, H, W = real_ps.shape
+    cells = (torch.rand(B, 1, grid, grid, device=real_ps.device) < 0.5).float()
+    if H % 8 == 0 and W % 8 == 0:
+        mask = F.interpolate(cells, size=(H // 8, W // 8), mode="nearest")
+        mask = F.interpolate(mask, size=(H, W), mode="nearest")
+    else:
+        mask = F.interpolate(cells, size=(H, W), mode="nearest")
+    return mask * real_ps + (1.0 - mask) * pseudo_ps
+
+
 def _task_step(
     fm_refiner: FMRefiner,
     real_ps: torch.Tensor,       # (B, C_ps, H_hr, W_hr)
@@ -651,14 +674,19 @@ def _task_step(
     p_null_drop: float,
     p_pseudo_ps: float,
     device: torch.device,
+    p_cqmix: float = 0.0,
+    cqmix_grid: int = 4,
 ) -> torch.Tensor:
     """
     Compute FM training loss (flow matching MSE on velocities).
 
-    PS source is sampled per-sample from three exclusive outcomes:
+    PS source is sampled per-sample from four exclusive outcomes:
       p_null_drop  → null PS token
       p_pseudo_ps  → SR pseudo-PS (passed in detached, no second SR forward)
+      p_cqmix      → CQMix of real and pseudo PS (see _cqmix)
       remainder    → real PS
+    p_cqmix defaults to 0, which reproduces the original three-way split
+    exactly (including RNG consumption).
     """
     B = real_ps.shape[0]
     H_hr, W_hr = real_ps.shape[2], real_ps.shape[3]
@@ -667,6 +695,7 @@ def _task_step(
     r = torch.rand(B, device=device)
     null_mask = r < p_null_drop
     pseudo_mask = (r >= p_null_drop) & (r < p_null_drop + p_pseudo_ps)
+    cqmix_mask = (r >= p_null_drop + p_pseudo_ps) & (r < p_null_drop + p_pseudo_ps + p_cqmix)
 
     # Assemble ps_cond
     ps_cond = real_ps.clone()
@@ -683,6 +712,13 @@ def _task_step(
         for i in range(B):
             if pseudo_mask[i]:
                 ps_cond[i] = pseudo_ps_detached[i]
+
+    # CQMix — the extra torch.rand inside _cqmix only runs when p_cqmix > 0
+    if p_cqmix > 0.0 and cqmix_mask.any():
+        mixed = _cqmix(real_ps, pseudo_ps_detached, cqmix_grid)
+        for i in range(B):
+            if cqmix_mask[i]:
+                ps_cond[i] = mixed[i]
 
     loss = fm_refiner(
         landsat_hr=landsat_hr,
@@ -1153,6 +1189,19 @@ if __name__ == "__main__":
     # ---- Training config ----
     p_null_drop     = float(cfg.trainer.p_null_drop)
     p_pseudo_ps     = float(cfg.trainer.p_pseudo_ps)
+    p_cqmix         = float(cfg.trainer.get("p_cqmix", 0.0))
+    cqmix_grid      = int(cfg.trainer.get("cqmix_grid", 4))
+    # p_real_ps is optional and purely a consistency check: real PS is always
+    # the remainder after null/pseudo/cqmix.
+    _p_real_implied = 1.0 - p_null_drop - p_pseudo_ps - p_cqmix
+    assert _p_real_implied > -1e-6, (
+        f"p_null_drop + p_pseudo_ps + p_cqmix = {1.0 - _p_real_implied:.4f} > 1")
+    if cfg.trainer.get("p_real_ps") is not None:
+        assert abs(float(cfg.trainer.p_real_ps) - _p_real_implied) < 1e-6, (
+            f"p_real_ps={cfg.trainer.p_real_ps} but 1 - p_null_drop - p_pseudo_ps - "
+            f"p_cqmix = {_p_real_implied:.4f}")
+    if p_cqmix > 0.0 and cfg.trainer.get("skip_sr_training", False):
+        raise ValueError("p_cqmix > 0 needs pseudo-PS, incompatible with skip_sr_training")
     warmup_sr_steps = int(cfg.trainer.warmup_sr_steps)
     pixel_weight    = float(cfg.sr_loss.pixel_weight)
     tdp_weight      = float(cfg.sr_loss.tdp_weight)
@@ -1297,6 +1346,7 @@ if __name__ == "__main__":
                     inputs_hr, landsat_hr, h_coarse, targets,
                     pseudo_ps_detached,
                     p_null_drop, p_pseudo_ps, device,
+                    p_cqmix=p_cqmix, cqmix_grid=cqmix_grid,
                 )
                 (loss_fm / accumulation_steps).backward()
 
