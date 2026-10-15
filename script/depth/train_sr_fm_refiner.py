@@ -1112,6 +1112,26 @@ if __name__ == "__main__":
     elif is_main_process:
         logging.info("No SwinIR pretrained weights found; training from scratch.")
 
+    # Optional: start from a trained run's network weights (unet/controlnet/
+    # null_ps/sr; no optimizer/scheduler/step, unlike --resume_run), e.g. to
+    # fine-tune only the SR module against a frozen FM (trainer.freeze_fm).
+    # Every rank loads it (mmap, model tensors only), overriding the SwinIR
+    # pretrained weights above before DDP broadcasts rank0's parameters.
+    init_ckpt = cfg.model.get("init_ckpt", None)
+    if init_ckpt and args.resume_run is None and args.eval_ckpt is None:
+        try:
+            _ck = torch.load(init_ckpt, map_location="cpu", mmap=True, weights_only=False)
+        except TypeError:
+            _ck = torch.load(init_ckpt, map_location="cpu")
+        fm_refiner.unet.load_state_dict(_ck["unet_state"])
+        fm_refiner.controlnet.load_state_dict(_ck["controlnet_state"])
+        if _ck.get("null_ps_state") is not None:
+            fm_refiner._null_ps = _ck["null_ps_state"]
+        sr_module.load_state_dict(_ck["sr_state"])
+        if is_main_process:
+            logging.info(f"init_ckpt: network weights loaded from {init_ckpt} (its step={_ck.get('step')})")
+        del _ck
+
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
 
     # ---- DDP wrapping ----
@@ -1202,6 +1222,13 @@ if __name__ == "__main__":
             f"p_cqmix = {_p_real_implied:.4f}")
     if p_cqmix > 0.0 and cfg.trainer.get("skip_sr_training", False):
         raise ValueError("p_cqmix > 0 needs pseudo-PS, incompatible with skip_sr_training")
+    # freeze_fm: train the SR module only (FM step skipped entirely); meant
+    # together with model.init_ckpt pointing at a trained FM.
+    freeze_fm = bool(cfg.trainer.get("freeze_fm", False))
+    if freeze_fm and cfg.trainer.get("skip_sr_training", False):
+        raise ValueError("freeze_fm and skip_sr_training together would train nothing")
+    if freeze_fm and is_main_process:
+        logging.info("freeze_fm=True: FM (unet/controlnet) is not updated; only the SR module trains.")
     warmup_sr_steps = int(cfg.trainer.warmup_sr_steps)
     pixel_weight    = float(cfg.sr_loss.pixel_weight)
     tdp_weight      = float(cfg.sr_loss.tdp_weight)
@@ -1333,32 +1360,33 @@ if __name__ == "__main__":
             # ================================================================
             # Step 2: update FM  (SR output detached, no second SR forward)
             # ================================================================
-            _unfreeze(fm_refiner.unet)
-            _unfreeze(fm_refiner.controlnet)
+            if not freeze_fm:
+                _unfreeze(fm_refiner.unet)
+                _unfreeze(fm_refiner.controlnet)
 
-            if is_first_micro:
-                optimizer_fm.zero_grad()
+                if is_first_micro:
+                    optimizer_fm.zero_grad()
 
-            fm_modules = [fm_refiner.unet, fm_refiner.controlnet] if is_distributed else []
-            with _maybe_no_sync(fm_modules, skip_sync):
-                loss_fm = _task_step(
-                    fm_refiner,
-                    inputs_hr, landsat_hr, h_coarse, targets,
-                    pseudo_ps_detached,
-                    p_null_drop, p_pseudo_ps, device,
-                    p_cqmix=p_cqmix, cqmix_grid=cqmix_grid,
-                )
-                (loss_fm / accumulation_steps).backward()
+                fm_modules = [fm_refiner.unet, fm_refiner.controlnet] if is_distributed else []
+                with _maybe_no_sync(fm_modules, skip_sync):
+                    loss_fm = _task_step(
+                        fm_refiner,
+                        inputs_hr, landsat_hr, h_coarse, targets,
+                        pseudo_ps_detached,
+                        p_null_drop, p_pseudo_ps, device,
+                        p_cqmix=p_cqmix, cqmix_grid=cqmix_grid,
+                    )
+                    (loss_fm / accumulation_steps).backward()
 
-            if is_last_micro:
-                torch.nn.utils.clip_grad_norm_(
-                    list(unet_raw.parameters()) +
-                    list(controlnet_raw.parameters()),
-                    max_norm=1.0,
-                )
-                optimizer_fm.step()
+                if is_last_micro:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(unet_raw.parameters()) +
+                        list(controlnet_raw.parameters()),
+                        max_norm=1.0,
+                    )
+                    optimizer_fm.step()
 
-            loss_fm_accum += loss_fm.item()
+                loss_fm_accum += loss_fm.item()
 
             if not is_last_micro:
                 micro_step += 1

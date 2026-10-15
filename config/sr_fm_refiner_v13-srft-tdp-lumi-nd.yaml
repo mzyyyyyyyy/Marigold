@@ -1,0 +1,264 @@
+base_config:
+- config/logging.yaml
+
+wandb:
+  project: marigold
+  name: sr_fm_refiner_v13-srft-tdp-lumi-nd
+
+# sr_fm_refiner_v13-srft-tdp-lumi-nd: low-cost check "how much of the TDP
+# target can an SR that only sees Landsat learn?". Starts from v13-nd best.pth
+# (model.init_ckpt), FM frozen (trainer.freeze_fm), SR fine-tuned with a
+# TDP-dominated loss (tdp_weight 5, t in [0, 0.6]). Control run:
+# sr_fm_refiner_v13-srft-pix-lumi-nd (same, tdp_weight 0). Motivation:
+# _diag_tdp/sr_fm_refiner_v13-lumi-nd (TDP-optimised input matches real-PS R2).
+#
+# sr_fm_refiner_v13-lumi-nd: identical to sr_fm_refiner_v12-lumi-nd except the
+# FM step's PS source mix (trainer: block). v12 trained the FM on pseudo-PS
+# only, so the "real PS" branch of the TDP loss queried a network never
+# trained on real PS. v13 follows SR4IR's phase-2 input I_cat: the FM also
+# sees real PS and CQMix(real, pseudo), so its up_blocks.3 features respond to
+# PS detail and the TDP target becomes meaningful. Validation/test still use
+# pseudo-PS only (unchanged).
+#
+# (v12 header follows)
+# sr_fm_refiner_v12-lumi-nd: v12 on the leak-free spatial train/val/test split
+# (built on finer_lumi_nd by script/depth/make_spatial_split.py; same pkls as
+# baseline_chmv2-lumi-nd / fm_refiner-R-lumi-5-nd), with the frozen coarse
+# CHMv2 being that split's baseline (baseline_chmv2-lumi-nd), NOT
+# baseline_chmv2-lumi (trained on patches overlapping this split's val/test
+# areas). Everything else is identical to v12. Number to report =
+# test_final/* (test_metrics.json).
+# Dataset config – same as sr_fm_refiner_v5-R3-lumi.yaml
+dataset:
+  input_dir: "/flash/project_465002934/data/Landsat/eur_test2/2019"
+  input_dir_hr: "/flash/project_465002934/data/EUR_crop_area_test2_ResizeMultimodal"
+  output_dir: "/flash/project_465002934/dataset/CHM_EUR_3m_area_test2_ls"
+
+  file_type_input: "jp2"
+  file_type_output: "tif"
+  target_name: "canopy_height_"
+  year: 2019
+
+  selected_bands: [0, 1, 2]
+  selected_percentile: ["p50"]
+
+  selected_bands_hr: [2, 1, 0]
+
+  use_input_minmax: True
+  use_input_norm: False
+  input_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/LS_test2_statistics.json"
+
+  use_input_hr_minmax: True
+  use_input_hr_norm: False
+  input_hr_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/PS_test2_statistics.json"
+
+  use_target_minmax: True
+  use_target_norm: False
+  target_stats_file: "/flash/project_465002934/dataset/CHM_EUR_marigold/EUR_CHM_test_statistics.json"
+
+  scale_input_to_neg1_1: True
+  scale_input_hr_to_neg1_1: True
+  scale_target_to_neg1_1: True
+
+  patch_sizes: [240, 480]
+  num_patches_per_tile: 300000
+
+  target_range_edges: [0, 5, 10, 15, 20, 25, 30]
+  num_patches_per_target_range: 500
+
+  tile_emphasis: []
+  min_valid_ratio: 0.1
+  # Spatial split: whole block_size x block_size blocks (output px) per tile go
+  # to train/val/test; patches lie inside a block shrunk by block_margin px.
+  # train = random crops of the old pool; val/test = non-overlapping eval_patch
+  # grids (natural height distribution). Parameters below are those the pkls
+  # were built with (pool_coord_path is only read by make_spatial_split.py).
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  split_seed: 42
+  block_size: 3000
+  block_margin: 120
+  eval_patch: 480
+
+  workers: 6
+  pool_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/save_20260609_resolved.pkl"
+  patch_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/split_spatial_v1_train.pkl"
+  val_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/split_spatial_v1_val.pkl"
+  test_coord_path: "/flash/project_465002934/dataset/CHM_EUR_marigold/train_patch_coord_marigold/split_spatial_v1_test.pkl"
+
+  correlation_cleaning: False
+  unit_scale_ratio: 1
+
+
+# Model paths
+model:
+  sd_pretrained_path: "/flash/project_465002934/model/stable-diffusion-2"
+  dav2_pretrained_path: "/flash/project_465002934/model/ls_da_model_r2.pth"
+  dav2_backbone: "depth-anything/Depth-Anything-V2-Base-hf"
+  dav2_out_in_scale_factor: 4
+
+  # v12: frozen coarse model is the CHMv2 baseline trained by
+  # script/depth/train_baseline_chmv2.py (config/baseline_chmv2-lumi-nd.yaml on
+  # finer_lumi_nd) instead of the fine-tuned DAv2 — same swap as
+  # fm_refiner-R-lumi-5 vs -4. Everything else is identical to v11.
+  coarse_model: "chmv2_baseline"
+  chmv2_model_id: "/flash/project_465002934/model/models--facebook--dinov3-vitl16-chmv2-dpt-head/snapshots/37130c851a3cf6720f974490707059f5edaeed4e"
+  chmv2_ckpt_path: "/flash/project_465002934/Marigold_output/baseline_chmv2-lumi-nd/checkpoint/best.pth"
+  chmv2_out_in_scale_factor: 4   # must match baseline_chmv2-lumi-nd.yaml
+
+  # SwinIR pretrained weights (DIV2K classical SR, 4× upscale).
+  # Set to null to train SR from scratch.
+  sr_pretrained_path: "/flash/project_465002934/model/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth"
+  sr_pretrained_key: "params"   # key inside the .pth dict
+  # srft: start from v13-nd (all network weights), see trainer.freeze_fm
+  init_ckpt: "/flash/project_465002934/Marigold_output/sr_fm_refiner_v13-lumi-nd/checkpoint/best.pth"
+
+
+# SR module architecture – mirrors SR4IR options/reg/base1_v2.yaml network_sr block
+sr_module:
+  in_chans: 3
+  out_chans: 3
+  upscale: 4
+  img_size: 48
+  window_size: 8
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2.0
+  upsampler: pixelshuffle
+  resi_connection: 1conv
+
+
+# SR training losses (Phase 1)
+#
+# tdp_hook/tdp_weight ported from config/sr_fm_refiner_v2-R2.yaml (sr_finer
+# branch), NOT this file's own lineage (v5-R3-lumi used
+# "controlnet.cond_embedding"). "unet.up_blocks.3" requires a full
+# ControlNet+UNet forward with a properly t-sampled, interpolated z_t (see
+# script/depth/train_sr_fm_refiner.py::_sr_step, which was ported from the
+# sr_finer branch's version — this lumi branch's own copy previously used a
+# fixed t=0.5 + z_coarse-as-sample shortcut that fed the network an
+# (sample, t) pair it never sees during real training/inference).
+sr_loss:
+  pixel_weight: 1.0   # L1(pseudo_ps, real_ps)
+  tdp_weight: 5.0      # srft: x5 so the TDP grad on SR params (~0.24x pixel at 1.0, diag_tdp) is comparable to pixel
+  tdp_hook: "unet.up_blocks.3"
+  tdp_t_min: 0.0
+  tdp_t_max: 0.6      # srft: real-vs-pseudo advantage is at t<=0.5, ~0 for t>=0.8 (diag_tdp exp 2)
+  # tdp_t_min/tdp_t_max left at their code defaults (0.0/1.0, full range) —
+  # not overridden here, matching v2-R2.
+
+
+# Alternate training schedule
+
+
+# Optimizers – lr_unet/lr_controlnet/weight_decay matched to
+# fm_refiner-R-lumi-4.yaml (finer_lumi branch) exactly, per its own
+# real-batch-128 scaling rationale (see that file's optimizer: comment) —
+# NOT this branch's own sr_fm_refiner_v5-R3-lumi.yaml lineage (which was
+# tuned for real-batch-64, 2e-05 base x4). lr_sr/weight_decay_sr have no
+# equivalent in fm_refiner-R-lumi-4 (no SR module there) — left unchanged.
+optimizer:
+  lr_unet: 4.0e-05        # matches fm_refiner-R-lumi-4.yaml
+  lr_controlnet: 4.0e-04  # matches fm_refiner-R-lumi-4.yaml
+  weight_decay: 1.0e-02
+
+  lr_sr: 2.0e-04           # srft: fine-tuning an already trained SR
+  weight_decay_sr: 0.0
+
+
+# LR scheduler (cosine annealing, shared T_max = max_iter)
+lr_scheduler:
+  eta_min: 1.0e-07
+
+
+# Dataloader – batch size matched to fm_refiner-R-lumi-4.yaml (real batch
+# max_train_batch_size x 64 ranks = 128, same as that config — NOT this
+# branch's own v5-R3-lumi lineage, which used max_train_batch_size=1 (real
+# batch 64) to match the LR scaling above).
+dataloader:
+  effective_batch_size: 2
+  max_train_batch_size: 2
+  seed: 2024
+
+
+# Trainer
+trainer:
+  log_period: 10
+  save_period: 1000
+  validation_period: 1000
+
+  # PS source probabilities per batch (mutually exclusive) — matches
+  # config/sr_fm_refiner_v2-R2.yaml: main FM step always uses pseudo-PS,
+  # never drops to null, never uses real PS (real PS is only seen by the
+  # TDP loss's "real" branch in _sr_step).
+  #
+  # v13: SR4IR-style mix (pseudo / CQMix / real). Pseudo-PS keeps half the
+  # samples to limit the train-test gap (inference sees pseudo-PS only).
+  # Real PS is the remainder; p_real_ps is only a consistency check.
+  p_null_drop: 0.0
+  p_pseudo_ps: 0.5
+  p_cqmix: 0.25
+  p_real_ps: 0.25
+  cqmix_grid: 4    # 4x4 cells, borders snapped to latent (/8) pixels
+
+  # InDI-style asymmetric noise, ported from fm_refiner-R-lumi-4 on the
+  # finer_lumi branch (NOT this branch's own bridge_sigma mechanism — the
+  # two are mutually exclusive, see depthfm/fm_refiner.py FMRefiner.__init__).
+  # h(t) = (1-t)*noise_sigma, zero at the clean z_gt end (t=1), max at the
+  # coarse z_coarse end (t=0):
+  #   z_t = (1-t)*z_coarse + t*z_gt + (1-t)*noise_sigma*eps
+  #   v_target = (z_gt - z_coarse) - noise_sigma*eps
+  # The same noise is now also mirrored into the TDP step's z_t (see
+  # _sr_step's noise_sigma correction) so the shared UNet/ControlNet isn't
+  # fed an out-of-distribution clean z_t during the TDP forward passes.
+  bridge_sigma: 0.0   # disabled — mutually exclusive with noise_sigma below
+  noise_sigma: 1.0
+  sample_sigma: 1.0
+  sample_noise_mode: init_only   # RFMSR-style: noise injected once, then pure ODE
+
+  # Steps before TDP loss is activated (pixel-only warmup)
+  warmup_sr_steps: 0    # srft: FM already trained, TDP from step 0
+
+  concat_landsat_hr: True
+
+  # srft: SR-only fine-tuning against the frozen v13-nd FM (model.init_ckpt)
+  freeze_fm: true
+
+
+# Validation / inference
+validation:
+  # Periodic validation (every validation_period steps) is cheap: 4 Euler
+  # steps, no averaging. Only the final full validation (on best.pth) uses
+  # the expensive 10 steps x 5-draw average (final_n_steps/final_n_avg),
+  # following the periodic-cheap / final-expensive split of finer_lumi's
+  # fm_refiner-R-lumi-11 setup. sample_noise_mode=init_only injects noise
+  # once regardless of step count, so 4 vs 10 steps only changes ODE
+  # discretization accuracy.
+  n_steps: 4
+  n_avg: 1
+  final_n_steps: 10
+  final_n_avg: 5
+  method: euler
+  # True  → validation uses SR pseudo-PS via refine_with_ps()
+  # False → validation uses null PS via refine() (baseline comparison)
+  use_sr_pseudo_ps: True
+
+
+
+# Training budget – max_iter matched to fm_refiner-R-lumi-4.yaml (both this
+# script's total_scale block and train_fm_refiner.py's use the same
+# accumulation_steps x world_size / reference_accum_steps scaling, and batch
+# settings above now match -4 exactly, so this keeps the same total training
+# data volume as -4 — NOT this branch's own v5-R3-lumi lineage, which used
+# 100000 at half the real batch size).
+max_epoch: 1000
+max_iter: 16000   # srft: -> 1000 real steps at 64 ranks
+
+
+eval:
+  eval_metrics:
+  - r2
+  - mae
+  - rmse
