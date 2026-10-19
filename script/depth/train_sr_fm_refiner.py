@@ -487,6 +487,7 @@ def _sr_step(
     device: torch.device,
     tdp_t_min: float = 0.0,
     tdp_t_max: float = 1.0,
+    tdp_kind: str = "plain",
 ) -> dict:
     """
     Compute SR Phase-1 loss and return a dict with loss tensors.
@@ -632,7 +633,17 @@ def _sr_step(
 
             hook.remove()
 
-        l_tdp = F.l1_loss(feat_fake, feat_real.detach()) * tdp_weight
+        if tdp_kind == "plain":
+            l_tdp = F.l1_loss(feat_fake, feat_real.detach()) * tdp_weight
+        elif tdp_kind.startswith("pool"):
+            # poolK: compare K x K average-pooled features (diag_tdp_overfit grid
+            # "tol": the plain real-vs-pseudo difference is fine-scale and does
+            # not generalise; pooled versions are learnable and lift val R2).
+            k = int(tdp_kind[4:])
+            l_tdp = F.l1_loss(F.avg_pool2d(feat_fake, k, ceil_mode=True),
+                              F.avg_pool2d(feat_real.detach(), k, ceil_mode=True)) * tdp_weight
+        else:
+            raise ValueError(f"unknown sr_loss.tdp_kind {tdp_kind!r} (plain / poolK)")
 
     return {"l_pix": l_pix, "l_tdp": l_tdp, "l_total": l_pix + l_tdp,
             "pseudo_ps": pseudo_ps}
@@ -1235,6 +1246,7 @@ if __name__ == "__main__":
     tdp_hook        = str(cfg.sr_loss.get("tdp_hook", "unet.up_blocks.2"))
     tdp_t_min       = float(cfg.sr_loss.get("tdp_t_min", 0.0))
     tdp_t_max       = float(cfg.sr_loss.get("tdp_t_max", 1.0))
+    tdp_kind        = str(cfg.sr_loss.get("tdp_kind", "plain"))
 
     # SR trains every batch; FM trains every batch with detached SR output.
     # Both modules stay in train mode throughout.
@@ -1335,7 +1347,7 @@ if __name__ == "__main__":
                         fm_refiner, sr_module,
                         landsat, landsat_hr, inputs_hr, h_coarse, targets,
                         pixel_weight, tdp_weight, use_tdp, tdp_hook, device,
-                        tdp_t_min=tdp_t_min, tdp_t_max=tdp_t_max,
+                        tdp_t_min=tdp_t_min, tdp_t_max=tdp_t_max, tdp_kind=tdp_kind,
                     )
                     # Scale down so accumulation_steps backward() calls (summed
                     # into .grad by autograd) land on the *average* gradient
