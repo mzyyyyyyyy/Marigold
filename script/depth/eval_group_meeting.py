@@ -22,6 +22,8 @@ n_steps Euler steps, mean of n_avg stochastic draws (seeded per patch).
 Metrics are those of eval_detail_metrics(_nd).py, pixel-pooled over the split:
 GT and predictions clipped to the target range [p1, p99] = [0, 28] m (as in the
 earlier detail evals); an unclipped R2 / MAE / RMSE is reported as a sanity check.
+Image-quality metrics on the same clipped maps, data range R = p99 - p1: PSNR (mean of
+per-patch PSNR, and from the pooled MSE) and SSIM (see PsnrSsimAccumulator).
 
 Output (<out_dir>, one PNG per test patch, same file name <id>.png in every folder):
   landsat/                    Landsat RGB input (nearest x4 to the 480 px grid)
@@ -202,6 +204,61 @@ class RawAccumulator:
 
 
 # -------------------------------------------------------------------------
+# PSNR / SSIM (image-quality metrics on the clipped height maps)
+# -------------------------------------------------------------------------
+
+class PsnrSsimAccumulator:
+    """PSNR and SSIM with data range R = p99 - p1 (the clipped height range), as for images.
+
+    PSNR = 10 log10(R^2 / MSE): reported as the mean over patches of the per-patch PSNR
+    (the usual super-resolution convention) and from the pooled MSE ("global", a monotone
+    function of RMSE). SSIM: Wang et al. 2004 with an 11x11 Gaussian window (sigma 1.5),
+    K1 = 0.01, K2 = 0.03, valid filtering (no padding); mean over patches of the mean SSIM
+    map (all test patches have the same size, so this is also the pixel-pooled mean)."""
+
+    def __init__(self, device, data_range, win=11, sigma=1.5, k1=0.01, k2=0.03):
+        x = torch.arange(win, dtype=torch.float32) - (win - 1) / 2
+        g = torch.exp(-x ** 2 / (2 * sigma ** 2))
+        g = g / g.sum()
+        self.gh, self.gv = g.view(1, 1, 1, -1).to(device), g.view(1, 1, -1, 1).to(device)
+        self.R = float(data_range)
+        self.c1, self.c2 = (k1 * self.R) ** 2, (k2 * self.R) ** 2
+        self.s = {"n_patches": 0.0, "sum_psnr": 0.0, "n_px": 0.0, "sum_sq": 0.0, "sum_ssim": 0.0}
+
+    def _blur(self, x):
+        return F.conv2d(F.conv2d(x, self.gh), self.gv)
+
+    @torch.no_grad()
+    def update(self, pred, gt):
+        """pred, gt: (1, 1, H, W) metres, already clipped to the range. Returns (psnr, ssim) of the patch."""
+        p, g = pred.double(), gt.double()
+        sq = ((p - g) ** 2).sum().item()
+        mse = sq / g.numel()
+        psnr = 10.0 * math.log10(self.R ** 2 / max(mse, 1e-12))
+        p, g = pred.float(), gt.float()
+        mp, mg = self._blur(p), self._blur(g)
+        vp = self._blur(p * p) - mp ** 2
+        vg = self._blur(g * g) - mg ** 2
+        cpg = self._blur(p * g) - mp * mg
+        smap = ((2 * mp * mg + self.c1) * (2 * cpg + self.c2)) / ((mp ** 2 + mg ** 2 + self.c1) * (vp + vg + self.c2))
+        ssim = smap.double().mean().item()
+        s = self.s
+        s["n_patches"] += 1
+        s["sum_psnr"] += psnr
+        s["n_px"] += g.numel()
+        s["sum_sq"] += sq
+        s["sum_ssim"] += ssim
+        return psnr, ssim
+
+    @staticmethod
+    def finalize(states, data_range):
+        s = {k: sum(st[k] for st in states) for k in states[0]}
+        return {"psnr": s["sum_psnr"] / s["n_patches"],
+                "psnr_global": 10.0 * math.log10(data_range ** 2 / (s["sum_sq"] / s["n_px"])),
+                "ssim": s["sum_ssim"] / s["n_patches"]}
+
+
+# -------------------------------------------------------------------------
 # Images
 # -------------------------------------------------------------------------
 
@@ -250,6 +307,9 @@ if __name__ == "__main__":
     ap.add_argument("--hf_sigma", type=float, default=2.0)
     ap.add_argument("--limit", type=int, default=0, help="debug: only first N test samples")
     ap.add_argument("--no_vis", action="store_true", help="metrics only, no images")
+    ap.add_argument("--save_dir", default=None,
+                    help="also save <id>.npz per patch: raw GT and each model's raw prediction (float32 metres), "
+                         "for offline metrics (script/depth/eval_std_metrics.py)")
     ap.add_argument("--no_cuda", action="store_true")
     args = ap.parse_args()
 
@@ -318,6 +378,7 @@ if __name__ == "__main__":
     tols = (args.edge_tol, 2 * args.edge_tol)
     edge_acc = {n: nd.EdgeAccumulator(device, args.edge_thrs, tols) for n in NAMES}
     raw_acc = {n: RawAccumulator() for n in NAMES}
+    iq_acc = {n: PsnrSsimAccumulator(device, p99 - p1) for n in NAMES}
     n_ls = M["n_ls"]
     index_rows = []
 
@@ -371,12 +432,13 @@ if __name__ == "__main__":
 
             raws = dict(zip(NAMES, (raw_dav2, raw_sr4ir, raw_r4, raw_v11)))
             preds = {n: r.float().clamp(p1, p99) for n, r in raws.items()}
-            maes = {}
+            maes, psnrs, ssims = {}, {}, {}
             for n in NAMES:
                 acc[n].update(preds[n], gt_m)
                 edge_acc[n].update(preds[n], gt_m)
                 raw_acc[n].update(raws[n].float(), gt_raw)
                 maes[n] = (preds[n] - gt_m).abs().mean().item()
+                psnrs[n], ssims[n] = iq_acc[n].update(preds[n], gt_m)
 
         c = test_coords[sample_i]
         pid = f"{sample_i:05d}_{c['tile_id'].replace(',', '-')}_y{c['output_crop_y']}_x{c['output_crop_x']}"
@@ -385,7 +447,15 @@ if __name__ == "__main__":
             "y": c["output_crop_y"], "x": c["output_crop_x"], "size": c["output_patch_height"],
             "gt_p75_m": float(np.percentile(gt_m.cpu().numpy(), 75)),
             **{f"mae_{n}": maes[n] for n in NAMES},
+            **{f"psnr_{n}": psnrs[n] for n in NAMES},
+            **{f"ssim_{n}": ssims[n] for n in NAMES},
         })
+        if args.save_dir:
+            os.makedirs(args.save_dir, exist_ok=True)
+            tmp = os.path.join(args.save_dir, pid + ".tmp.npz")
+            np.savez_compressed(tmp, gt=gt_raw[0, 0].cpu().numpy().astype(np.float32),
+                                **{n: raws[n][0, 0].float().cpu().numpy() for n in NAMES})
+            os.replace(tmp, os.path.join(args.save_dir, pid + ".npz"))
         if not args.no_vis:
             landsat_nn = F.interpolate(landsat, size=(H, W), mode="nearest")
             imgs = {"landsat": nd._rgb_u8(landsat_nn[0]), "ps": nd._rgb_u8(inputs_hr[0]),
@@ -401,7 +471,8 @@ if __name__ == "__main__":
                        maes=maes, title=f"{pid}   (GT p75 = {index_rows[-1]['gt_p75_m']:.1f} m)", vmax=p99)
 
     payload = ({n: acc[n].state() for n in NAMES}, index_rows,
-               {n: edge_acc[n].state() for n in NAMES}, {n: raw_acc[n].s for n in NAMES})
+               {n: edge_acc[n].state() for n in NAMES}, {n: raw_acc[n].s for n in NAMES},
+               {n: iq_acc[n].s for n in NAMES})
     if dist_on:
         gathered = [None] * world
         dist.all_gather_object(gathered, payload)
@@ -414,6 +485,7 @@ if __name__ == "__main__":
             results[n]["edge_multi_thr"] = nd.EdgeAccumulator.finalize([g[2][n] for g in gathered],
                                                                        args.edge_thrs, tols)
             results[n]["unclipped"] = RawAccumulator.finalize([g[3][n] for g in gathered])
+            results[n].update(PsnrSsimAccumulator.finalize([g[4][n] for g in gathered], p99 - p1))
         os.makedirs(args.out_dir, exist_ok=True)
         meta = {"split": f"test ({cfg_d.test_coord_path})", "n_test_samples": n_total,
                 "n_steps": args.n_steps, "n_avg": args.n_avg,
@@ -444,6 +516,9 @@ if __name__ == "__main__":
             (f"Edge F1 tol{t2}px (higher)", f"edge_f1_tol{t2}", "{:.4f}"),
             ("HF energy ratio (->1)", "hf_energy_ratio", "{:.4f}"),
             ("HF correlation (higher)", "hf_corr", "{:.4f}"),
+            (f"PSNR dB, mean over patches (higher; R = {p99 - p1:g} m)", "psnr", "{:.2f}"),
+            ("PSNR dB, from pooled MSE (higher)", "psnr_global", "{:.2f}"),
+            ("SSIM (higher)", "ssim", "{:.4f}"),
         ]
         lines = [f"Test split: {n_total} patches of 480 px; GT and predictions clipped to [{p1:g}, {p99:g}] m", "",
                  "| metric | " + " | ".join(NAMES) + " |", "|---|" + "---|" * len(NAMES)]

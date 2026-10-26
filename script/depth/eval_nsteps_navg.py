@@ -314,6 +314,8 @@ if __name__ == "__main__":
     ap.add_argument("--vis_seed", type=int, default=0)
     ap.add_argument("--vis_all", action="store_true", help="draw every test patch")
     ap.add_argument("--no_vis", action="store_true")
+    ap.add_argument("--save_npz", action="store_true",
+                    help="also save GT and every (n_steps, n_avg) prediction of drawn patches to images/<pid>.npz")
     ap.add_argument("--limit", type=int, default=0, help="debug: only first N test samples")
     ap.add_argument("--no_cuda", action="store_true")
     args = ap.parse_args()
@@ -429,6 +431,9 @@ if __name__ == "__main__":
                    ("GT height (m)", gt_np, True)]
             save_grid_image(os.path.join(args.out_dir, "images", pid + ".png"), ref, preds_vis, gt_np,
                             steps, avgs, pid, f"(GT p75 = {c.get('p75', float('nan')):.1f} m)", p99)
+            if args.save_npz:
+                np.savez_compressed(os.path.join(args.out_dir, "images", pid + ".npz"), gt=gt_np,
+                                    **{f"s{s}_k{k}": p for (s, k), p in preds_vis.items()})
 
     states = {k: (v[0].state(), v[1].state()) for k, v in acc.items()}
     if dist_on:
