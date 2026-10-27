@@ -1,0 +1,33 @@
+base_config:
+- config/fm_refiner-R-lumi-5-nd.yaml
+
+wandb:
+  name: fm_refiner-R-lumi-5-nd-up8
+
+# Run A of the generative-refiner plan: fm_refiner-R-lumi-5-nd with
+#   1. the frozen coarse model mu = baseline_chmv2-lumi-nd-up8-h120 (Landsat
+#      bilinearly upsampled 8x before the frozen DINOv3, MSE; test R2 0.8716)
+#      instead of baseline_chmv2-lumi-nd (native-res input, test R2 0.8403);
+#   2. ControlNet conditioned on Landsat only (no PS in training either), so
+#      the refiner never sees anything that is unavailable at inference.
+# roughness_probe-lumi-nd-up8 showed the amount of detail is mostly a function
+# of mu, so no extra detail latent. Everything else (noise, optimizer,
+# schedule, data, validation sampling) is inherited unchanged.
+model:
+  chmv2_ckpt_path: "/flash/project_465002934/Marigold_output/baseline_chmv2-lumi-nd-up8-h120/checkpoint/best.pth"
+  # must match baseline_chmv2-lumi-nd-up8-h120.yaml
+  chmv2_out_in_scale_factor: 1
+  chmv2_upsample_input: True
+  chmv2_input_scale: 2
+
+trainer:
+  controlnet_cond_mode: "landsat_only"
+  ps_dropout_p: 0.0
+
+# Periodic validation (model selection): 4 steps, single draw. Final test:
+# 10 steps, mean of 5 draws (the reported numbers).
+validation:
+  n_steps: 4
+  ensemble_size: 1
+  final_n_steps: 10
+  final_ensemble_size: 5

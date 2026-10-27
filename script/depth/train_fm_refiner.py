@@ -720,6 +720,10 @@ if __name__ == "__main__":
                               sampler=train_sampler,
                               num_workers=cfg_data.workers, pin_memory=True,
                               worker_init_fn=_worker_init_fn,
+                              # Fork the workers once, before this process reads any raster
+                              # itself in validate(): workers forked after that segfaulted in
+                              # JP2 decoding (train_roughness_probe.py smoke runs).
+                              persistent_workers=True,
                               generator=torch.Generator().manual_seed(base_seed))
     # validate() builds its own small on-demand DataLoader per call, over a
     # Subset of just the sample indices it actually needs (see validate()) —
@@ -765,6 +769,9 @@ if __name__ == "__main__":
             ckpt_path=cfg.model.chmv2_ckpt_path,
             mean=_in_stats["mean"], std=_in_stats["std"],
             out_in_scale_factor=cfg.model.chmv2_out_in_scale_factor,
+            # must match the baseline's upsample_input_to_target / input_scale
+            upsample_input=cfg.model.get("chmv2_upsample_input", False),
+            input_scale=cfg.model.get("chmv2_input_scale", 1),
         )
     else:
         dav2_model = load_dav2(
@@ -975,44 +982,19 @@ if __name__ == "__main__":
 
     pbar.close()
 
-    # Final full validation on entire val set — every rank must load the
-    # same best checkpoint (not just rank0) since the sharded validate()
-    # call below combines predictions across ranks — mixing a stale-weight
-    # rank into that would corrupt the aggregate metric.
+    # Every rank must load the same best checkpoint (not just rank0) since the
+    # sharded validate() call below combines predictions across ranks —
+    # mixing a stale-weight rank into that would corrupt the aggregate metric.
     best_ckpt_path = os.path.join(out_dir_ckpt, "best.pth")
     if os.path.exists(best_ckpt_path):
         load_checkpoint(fm_refiner, optimizer, lr_scheduler, best_ckpt_path)
         if is_main_process:
-            logging.info(f"Loaded best checkpoint from {best_ckpt_path} for final validation")
+            logging.info(f"Loaded best checkpoint from {best_ckpt_path} for the final test evaluation")
     elif is_main_process:
-        logging.warning("Best checkpoint not found, using final model weights for full validation")
-
-    if is_main_process:
-        logging.info("Running full validation on entire val set...")
-    final_metrics, final_fig = validate(
-        fm_refiner, dav2_model, val_dataset, device,
-        n_steps=cfg.validation.get("final_n_steps", cfg.validation.n_steps),
-        target_stats=target_stats,
-        n_landsat_bands=n_landsat_bands,
-        full=True,
-        method=cfg.validation.get("method", "euler"),
-        sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
-        ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
-        global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
-        num_workers=cfg_data.workers,  # full=True shards the whole val set,
-        # worth the worker-process cost here (unlike the periodic call above).
-    )
-    if is_main_process:
-        logging.info(f"Final val metrics: {final_metrics}")
-        final_log = {f"val_final/{k}": v for k, v in final_metrics.items()}
-        if final_fig is not None:
-            final_log["val_final/samples"] = wandb.Image(final_fig)
-            plt.close(final_fig)
-        wandb.log(final_log, step=step)
+        logging.warning("Best checkpoint not found, using final model weights for the final test evaluation")
 
     # Held-out test set: the number to report. Never used for model selection
-    # (best.pth is picked by val R2 above). Same inference settings as the
-    # final val pass.
+    # (best.pth is picked by the periodic val R2 above). No extra full-val pass.
     if test_dataset is not None:
         if is_main_process:
             logging.info("Running full evaluation on the test set...")
@@ -1026,7 +1008,7 @@ if __name__ == "__main__":
             sampling_fn=cfg.validation.get("sampling_fn", "uniform"),
             ensemble_size=cfg.validation.get("final_ensemble_size", cfg.validation.get("ensemble_size", 1)),
             global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
-            num_workers=cfg_data.workers,
+            # num_workers=0: no fork after this process has read rasters (see train_loader).
             range_edges=range_edges,
         )
         if is_main_process:
