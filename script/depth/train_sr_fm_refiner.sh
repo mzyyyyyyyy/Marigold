@@ -71,7 +71,7 @@ SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_sr_fm_refiner.py
 OVERLAY=/flash/project_465002934/env/py_overlay_tf517
 # Override per job without editing this file, e.g.
 #   sbatch --export=ALL,CONFIG=config/sr_fm_refiner_v13-lumi-nd.yaml script/depth/train_sr_fm_refiner.sh
-CONFIG=${CONFIG:-config/sr_fm_refiner_v12-lumi-nd.yaml}
+CONFIG=${CONFIG:-config/sr_fm_refiner_v15-lumi-nd.yaml}
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write. Write outputs to the project's Flash storage

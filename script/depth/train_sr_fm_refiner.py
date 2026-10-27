@@ -1138,9 +1138,13 @@ if __name__ == "__main__":
         fm_refiner.controlnet.load_state_dict(_ck["controlnet_state"])
         if _ck.get("null_ps_state") is not None:
             fm_refiner._null_ps = _ck["null_ps_state"]
-        sr_module.load_state_dict(_ck["sr_state"])
+        # A plain FM run (finer_lumi_nd train_fm_refiner.py, e.g. fm_refiner-R-lumi-5-nd)
+        # has no sr_state: keep the SwinIR pretrained SR (rank0's, broadcast by DDP).
+        if _ck.get("sr_state") is not None:
+            sr_module.load_state_dict(_ck["sr_state"])
         if is_main_process:
-            logging.info(f"init_ckpt: network weights loaded from {init_ckpt} (its step={_ck.get('step')})")
+            logging.info(f"init_ckpt: network weights loaded from {init_ckpt} (its step={_ck.get('step')}; "
+                         f"sr_state {'loaded' if _ck.get('sr_state') is not None else 'absent, SR kept as initialised'})")
         del _ck
 
     target_stats = _load_target_stats(cfg_data.target_stats_file, cfg_data.year)
@@ -1157,20 +1161,28 @@ if __name__ == "__main__":
     unet_raw       = fm_refiner.unet
     controlnet_raw = fm_refiner.controlnet
     sr_module_raw  = sr_module
+    # freeze_controlnet: the ControlNet (e.g. loaded via model.init_ckpt from a
+    # run trained on real PS) stays frozen for the whole run, playing the role
+    # of SR4IR's frozen pretrained backbone; the FM step trains the UNet only.
+    # It is then neither DDP-wrapped (DDP rejects modules without trainable
+    # parameters) nor in optimizer_fm, and is never unfrozen below.
+    freeze_controlnet = bool(cfg.trainer.get("freeze_controlnet", False))
+    if freeze_controlnet:
+        controlnet_raw.requires_grad_(False)
+        if is_main_process:
+            logging.info("freeze_controlnet=True: ControlNet frozen for the whole run (FM step trains the UNet only).")
     if is_distributed:
         ddp_ids = [device.index] if device.type == "cuda" else None
         fm_refiner.unet       = DDP(unet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
-        fm_refiner.controlnet = DDP(controlnet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
+        if not freeze_controlnet:
+            fm_refiner.controlnet = DDP(controlnet_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
         sr_module              = DDP(sr_module_raw, device_ids=ddp_ids, output_device=ddp_ids[0] if ddp_ids else None)
 
     # ---- Optimizers ----
-    optimizer_fm = torch.optim.AdamW(
-        [
-            {"params": unet_raw.parameters(),       "lr": cfg.optimizer.lr_unet},
-            {"params": controlnet_raw.parameters(), "lr": cfg.optimizer.lr_controlnet},
-        ],
-        weight_decay=cfg.optimizer.weight_decay,
-    )
+    fm_param_groups = [{"params": unet_raw.parameters(), "lr": cfg.optimizer.lr_unet}]
+    if not freeze_controlnet:
+        fm_param_groups.append({"params": controlnet_raw.parameters(), "lr": cfg.optimizer.lr_controlnet})
+    optimizer_fm = torch.optim.AdamW(fm_param_groups, weight_decay=cfg.optimizer.weight_decay)
     optimizer_sr = torch.optim.AdamW(
         sr_module_raw.parameters(),
         lr=cfg.optimizer.lr_sr,
@@ -1252,7 +1264,8 @@ if __name__ == "__main__":
     # Both modules stay in train mode throughout.
     _unfreeze(sr_module)
     _unfreeze(fm_refiner.unet)
-    _unfreeze(fm_refiner.controlnet)
+    if not freeze_controlnet:
+        _unfreeze(fm_refiner.controlnet)
     fm_refiner.train()
     sr_module.train()
 
@@ -1374,12 +1387,13 @@ if __name__ == "__main__":
             # ================================================================
             if not freeze_fm:
                 _unfreeze(fm_refiner.unet)
-                _unfreeze(fm_refiner.controlnet)
+                if not freeze_controlnet:
+                    _unfreeze(fm_refiner.controlnet)
 
                 if is_first_micro:
                     optimizer_fm.zero_grad()
 
-                fm_modules = [fm_refiner.unet, fm_refiner.controlnet] if is_distributed else []
+                fm_modules = [m for m in (fm_refiner.unet, fm_refiner.controlnet) if isinstance(m, DDP)]
                 with _maybe_no_sync(fm_modules, skip_sync):
                     loss_fm = _task_step(
                         fm_refiner,
@@ -1393,7 +1407,7 @@ if __name__ == "__main__":
                 if is_last_micro:
                     torch.nn.utils.clip_grad_norm_(
                         list(unet_raw.parameters()) +
-                        list(controlnet_raw.parameters()),
+                        ([] if freeze_controlnet else list(controlnet_raw.parameters())),
                         max_norm=1.0,
                     )
                     optimizer_fm.step()
@@ -1488,7 +1502,8 @@ if __name__ == "__main__":
                 fm_refiner.train()
                 sr_module.train()
                 _unfreeze(fm_refiner.unet)
-                _unfreeze(fm_refiner.controlnet)
+                if not freeze_controlnet:
+                    _unfreeze(fm_refiner.controlnet)
                 _unfreeze(sr_module)
 
                 if is_distributed:
