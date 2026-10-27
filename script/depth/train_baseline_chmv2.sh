@@ -61,7 +61,8 @@ SIF=/flash/project_465002934/env/marigold_env.sif
 # PYTHONPATH for this job only, so the sif itself (and other jobs) are untouched.
 OVERLAY=/flash/project_465002934/env/py_overlay_tf517
 # This worktree's own copy (the main checkout may be on another branch).
-SCRIPT=$(pwd)/script/depth/train_baseline_chmv2.py
+# Overridable like CONFIG, e.g. SCRIPT=$(pwd)/script/depth/train_roughness_probe.py.
+SCRIPT=${SCRIPT:-$(pwd)/script/depth/train_baseline_chmv2.py}
 # Override per job without editing this file, e.g.
 #   sbatch --export=ALL,CONFIG=config/baseline_chmv2-lumi-nd-h1.yaml script/depth/train_baseline_chmv2.sh
 CONFIG=${CONFIG:-config/baseline_chmv2-lumi-nd.yaml}

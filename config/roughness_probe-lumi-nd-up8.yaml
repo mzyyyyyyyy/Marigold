@@ -1,0 +1,25 @@
+base_config:
+- config/baseline_chmv2-lumi-nd-up8-h120.yaml
+
+wandb:
+  name: roughness_probe-lumi-nd-up8
+
+# Stage 0 of the latent-guided generative refiner (script/depth/train_roughness_probe.py):
+# is local canopy roughness predictable from Landsat beyond the coarse height mu?
+# Dataset, split, batch (2 x 64 GPUs) and nominal max_iter are inherited from
+# baseline_chmv2-lumi-nd-up8-h120, whose trained weights are the frozen mu and
+# feature extractor here. Only the three small probe heads train.
+probe:
+  coarse_ckpt: "/flash/project_465002934/Marigold_output/baseline_chmv2-lumi-nd-up8-h120/checkpoint/best.pth"
+  # Label px. HF = GT - G_hf(GT): same hf_sigma as eval_detail_metrics_nd.py.
+  hf_sigma: 2.0
+  # Local roughness window, ~30 m (= one up8 token cell).
+  rough_sigma: 8.0
+  # Forest-only metrics: cells whose mean mu exceeds this (metres).
+  forest_mu: 5.0
+  head_width: 256
+
+# Heads train from scratch (frozen inputs), so a higher lr than the DPT head's 4e-4.
+optimizer:
+  lr: 1.0e-03
+  weight_decay: 1.0e-04
