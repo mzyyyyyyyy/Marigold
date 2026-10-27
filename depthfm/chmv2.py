@@ -68,7 +68,7 @@ class CHMv2Height(nn.Module):
 
     def __init__(self, model_id: str, mean: list, std: list, pretrained: bool = True,
                  freeze_backbone: bool = True, upsample_input: bool = False,
-                 out_in_scale_factor: int = 1):
+                 out_in_scale_factor: int = 1, input_scale: int = 1):
         super().__init__()
         if pretrained:
             self.model = AutoModelForDepthEstimation.from_pretrained(model_id, trust_remote_code=True)
@@ -84,6 +84,10 @@ class CHMv2Height(nn.Module):
         self.out_in_scale_factor = round(out_in_scale_factor)
         assert not (upsample_input and self.out_in_scale_factor > 1), \
             "upsample_input and out_in_scale_factor > 1 would upsample twice"
+        # upsample_input resizes the input to input_scale x target size (more
+        # ViT tokens); the output is resized back to target size at the end.
+        self.input_scale = round(input_scale)
+        assert self.input_scale == 1 or upsample_input, "input_scale > 1 needs upsample_input"
         # Same trainable upsampling module as DepthAnythingV2Height (used when
         # labels are out_in_scale_factor x higher resolution than the input).
         self.upsample_head = _make_upsample_head(self.out_in_scale_factor) if self.out_in_scale_factor > 1 else None
@@ -109,7 +113,8 @@ class CHMv2Height(nn.Module):
         """x01: (B, C>=3, H, W) in [0, 1]. Returns (B, 1, *target_size) in metres."""
         x = (x01[:, :3] - self.mean) / self.std.clamp(min=1e-8)
         if self.upsample_input and target_size is not None:
-            x = F.interpolate(x, size=tuple(target_size), mode="bilinear", align_corners=False)
+            x = F.interpolate(x, size=tuple(s * self.input_scale for s in target_size),
+                              mode="bilinear", align_corners=False)
         H, W = x.shape[-2:]
         pad_h, pad_w = (-H) % self.PATCH, (-W) % self.PATCH
         if pad_h or pad_w:
@@ -143,17 +148,20 @@ class CHMv2Height(nn.Module):
 
 
 def load_chmv2_baseline(model_dir: str, ckpt_path: str, mean: list, std: list,
-                        out_in_scale_factor: int = 1) -> nn.Module:
+                        out_in_scale_factor: int = 1, upsample_input: bool = False,
+                        input_scale: int = 1) -> nn.Module:
     """Load a CHMv2Height checkpoint trained by script/depth/train_baseline_chmv2.py
     (CHMv2 + learnable upsample_head) as a frozen coarse-height predictor.
 
     model_dir: local dir of facebook/dinov3-vitl16-chmv2-dpt-head (only config is
         read here -- pretrained=False -- all weights come from ckpt_path).
-    out_in_scale_factor: must match the value used in that training run.
+    out_in_scale_factor, upsample_input, input_scale: must match the values
+        used in that training run.
     Call as model(landsat_01, target_size) -> (B, 1, *target_size) in metres.
     """
     model = CHMv2Height(model_id=model_dir, mean=mean, std=std, pretrained=False,
-                        freeze_backbone=False, out_in_scale_factor=out_in_scale_factor)
+                        freeze_backbone=False, out_in_scale_factor=out_in_scale_factor,
+                        upsample_input=upsample_input, input_scale=input_scale)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=True)
     model.requires_grad_(False)

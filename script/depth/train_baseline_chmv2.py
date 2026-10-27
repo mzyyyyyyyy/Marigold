@@ -538,6 +538,7 @@ if __name__ == "__main__":
         freeze_backbone=cfg.model.get("freeze_backbone", True),
         upsample_input=cfg.model.get("upsample_input_to_target", False),
         out_in_scale_factor=cfg.model.get("out_in_scale_factor", 1),
+        input_scale=cfg.model.get("input_scale", 1),
     ).to(device)
     model.train()
     # DDP with find_unused_parameters=False raises if any trainable param gets
