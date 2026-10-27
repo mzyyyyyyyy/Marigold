@@ -60,8 +60,11 @@ SIF=/flash/project_465002934/env/marigold_env.sif
 # transformers 5.17.0 (+ matching tokenizers/safetensors), prepended to
 # PYTHONPATH for this job only, so the sif itself (and other jobs) are untouched.
 OVERLAY=/flash/project_465002934/env/py_overlay_tf517
-SCRIPT=/users/mazhanyu/Projects/Marigold/script/depth/train_baseline_chmv2.py
-CONFIG=config/baseline_chmv2-lumi-nd.yaml
+# This worktree's own copy (the main checkout may be on another branch).
+SCRIPT=$(pwd)/script/depth/train_baseline_chmv2.py
+# Override per job without editing this file, e.g.
+#   sbatch --export=ALL,CONFIG=config/baseline_chmv2-lumi-nd-h1.yaml script/depth/train_baseline_chmv2.sh
+CONFIG=${CONFIG:-config/baseline_chmv2-lumi-nd.yaml}
 # Checkpoints (best.pth/latest.pth) run tens of GB; the home filesystem
 # (/users/mazhanyu, 20G quota) filled up from these and killed a run
 # mid-checkpoint-write (see train_sr_fm_refiner.sh). Write outputs to the
