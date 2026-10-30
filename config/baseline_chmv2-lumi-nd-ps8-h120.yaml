@@ -1,0 +1,25 @@
+base_config:
+- config/baseline_chmv2-lumi-nd-up8-h120.yaml
+
+wandb:
+  name: baseline_chmv2-lumi-nd-ps8-h120
+
+# Teacher for output distillation into baseline_chmv2-lumi-nd-up8-h120: the same
+# model and recipe (frozen DINOv3, DPT head, MSE), fed the PlanetScope patch
+# (3.75 m, the target grid) instead of Landsat. PS is bilinearly upsampled 8x
+# (~0.47 m/px, near CHMv2's ~0.6 m pretraining imagery): 7.5 m (2x2 PS px) per
+# token. Only used at training time; the student still sees Landsat only.
+model:
+  input_source: ps
+  # input = input_scale x the target size (PS is already at target size)
+  input_scale: 8
+  # Evaluate the head's input-size layers only at the pixels the final resize
+  # to target size reads (identical outputs/gradients, ~1/16 of the memory).
+  sampled_head: True
+
+# Train on random 240 px crops (1920 px / 120x120 tokens at 8x, batch 2 fits);
+# validation, test and the teacher's targets for the student use the full
+# 480 px patches (3840 px / 240x240 tokens; the frozen backbone uses RoPE and
+# the head is fully convolutional).
+trainer:
+  train_crop: 240

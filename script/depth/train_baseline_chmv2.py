@@ -9,6 +9,15 @@ Pipeline:
   Landsat (3-band, p50) -> [0,1] -> mean/std norm -> CHMv2 -> H_pred (metres)
   loss = Huber(H_pred, H_gt)
 
+model.input_source: ps feeds the PlanetScope patch (selected_bands_hr, PS
+stats) instead of Landsat, e.g. to train a teacher for output distillation.
+distill.teacher_run (a finished run of this script, with its train-patch
+predictions precomputed by script/depth/precompute_teacher.py) + distill.weight
+w adds output-level distillation from that teacher:
+  loss = (1 - w) * Huber(H_pred, H_gt) + w * Huber(H_pred, H_teacher)
+trainer.train_crop trains on random crops of that size (validation and test
+keep the full patches).
+
 Usage (single GPU):
   python script/depth/train_baseline_chmv2.py --config config/baseline_chmv2-lumi.yaml
 Usage (multi-GPU / multi-node): see script/depth/train_baseline_chmv2.sh.
@@ -173,6 +182,44 @@ def _raw(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
 
 
+def _input_mean_std(cfg):
+    """CHMv2 input mean/std for cfg.model.input_source, from the stats file /
+    year the dataloader minmax-scales that input with (matches run_chmv2 in
+    sr_fm_refiner; PS: the selected_bands_hr entries)."""
+    d = cfg.dataset
+    if cfg.model.get("input_source", "landsat") == "ps":
+        with open(d.input_hr_stats_file) as f:
+            s = json.load(f)[str(d.year)]
+        return [s["mean"][i] for i in d.selected_bands_hr], [s["std"][i] for i in d.selected_bands_hr]
+    with open(d.input_stats_file) as f:
+        s = json.load(f)[str(d.year)]
+    return s["mean"], s["std"]
+
+
+def _random_crop(inputs_lr, inputs_hr, targets, size, gen):
+    """Per-sample random size x size crop (target grid) of a training batch.
+    The PS and target crops share the offset; offsets are multiples of the
+    target/Landsat ratio so the Landsat crop covers the same ground."""
+    H, W = targets.shape[-2:]
+    if H <= size and W <= size:
+        return inputs_lr, inputs_hr, targets
+    r = H // inputs_lr.shape[-2]
+    lrs, hrs, ts = [], [], []
+    for b in range(targets.shape[0]):
+        oy = int(torch.randint(0, (H - size) // r + 1, (1,), generator=gen)) * r
+        ox = int(torch.randint(0, (W - size) // r + 1, (1,), generator=gen)) * r
+        lrs.append(inputs_lr[b, :, oy // r:(oy + size) // r, ox // r:(ox + size) // r])
+        hrs.append(inputs_hr[b, :, oy:oy + size, ox:ox + size])
+        ts.append(targets[b, :, oy:oy + size, ox:ox + size])
+    return torch.stack(lrs), torch.stack(hrs), torch.stack(ts)
+
+
+def _model_input(inputs_lr, inputs_hr, input_source, n_landsat_bands):
+    """The [0,1] image CHMv2 is fed: the PS patch or the Landsat bands."""
+    x = inputs_hr if input_source == "ps" else inputs_lr[:, :n_landsat_bands]
+    return (x + 1.0) / 2.0
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -180,6 +227,7 @@ def validate(
     device: torch.device,
     n_landsat_bands: int,
     target_vmax: float,
+    input_source: str = "landsat",
     val_offset: int = 0,
     n_vis_samples: int = 5,
     full: bool = False,
@@ -213,17 +261,12 @@ def validate(
                               shuffle=False, num_workers=num_workers, pin_memory=True)
 
     for batch in tqdm(local_loader, desc="Validation", leave=False, disable=(global_rank != 0)):
-        inputs_lr, _inputs_hr, targets = batch
-        if inputs_lr.dim() == 5:
-            inputs_lr = inputs_lr.squeeze(0)
-        if targets.dim() == 5:
-            targets = targets.squeeze(0)
-
-        inputs_lr = inputs_lr.to(device)
-        targets = targets.to(device)
+        inputs_lr, inputs_hr, targets = (t.squeeze(0) if t.dim() == 5 else t for t in batch)
+        inputs_lr, inputs_hr, targets = inputs_lr.to(device), inputs_hr.to(device), targets.to(device)
 
         landsat = inputs_lr[:, :n_landsat_bands]
-        pred = raw_model((landsat + 1.0) / 2.0, target_size=tuple(targets.shape[-2:]))
+        pred = raw_model(_model_input(inputs_lr, inputs_hr, input_source, n_landsat_bands),
+                         target_size=tuple(targets.shape[-2:]))
 
         all_preds.append(pred.cpu().flatten())
         all_gts.append(targets.cpu().flatten())
@@ -519,26 +562,28 @@ if __name__ == "__main__":
                               sampler=train_sampler,
                               num_workers=cfg_data.workers, pin_memory=True,
                               worker_init_fn=_worker_init_fn,
+                              # Fork the workers once, before this process reads any raster
+                              # itself in validate(): workers forked after that segfaulted in
+                              # JP2 decoding (train_roughness_probe.py smoke runs).
+                              persistent_workers=True,
                               generator=torch.Generator().manual_seed(base_seed))
     # validate() builds its own on-demand DataLoader over a per-rank Subset.
 
     # ---- Model ----
     n_landsat_bands = len(cfg_data.selected_bands)
-
-    # CHMv2's input mean/std come from the same stats file / year the
-    # dataloader minmax-scales with (matches run_chmv2 in sr_fm_refiner).
-    with open(cfg_data.input_stats_file) as f:
-        input_stats = json.load(f)[str(cfg_data.year)]
+    input_source = cfg.model.get("input_source", "landsat")
+    input_mean, input_std = _input_mean_std(cfg)
 
     model = CHMv2Height(
         model_id=cfg.model.chmv2_model_id,
-        mean=input_stats["mean"],
-        std=input_stats["std"],
+        mean=input_mean,
+        std=input_std,
         pretrained=cfg.model.get("pretrained", True),
         freeze_backbone=cfg.model.get("freeze_backbone", True),
         upsample_input=cfg.model.get("upsample_input_to_target", False),
         out_in_scale_factor=cfg.model.get("out_in_scale_factor", 1),
         input_scale=cfg.model.get("input_scale", 1),
+        sampled_head=cfg.model.get("sampled_head", False),
     ).to(device)
     model.train()
     # DDP with find_unused_parameters=False raises if any trainable param gets
@@ -563,6 +608,25 @@ if __name__ == "__main__":
         model = DDP(model_raw, device_ids=ddp_ids,
                     output_device=ddp_ids[0] if ddp_ids else None,
                     find_unused_parameters=cfg.trainer.get("ddp_find_unused_parameters", False))
+
+    # trainer.train_crop: train on random crops of this size (target px);
+    # validation/test still use the full patches.
+    train_crop = cfg.trainer.get("train_crop", None)
+    crop_gen = torch.Generator().manual_seed(base_seed + global_rank)
+
+    # ---- Output distillation: the teacher's predictions on the train patches,
+    # precomputed by script/depth/precompute_teacher.py (running the teacher
+    # online would cost ~16 s per 480 px patch for the PS x8 teacher) ----
+    distill_w = 0.0
+    if cfg.get("distill") is not None:
+        t_dir = os.path.join(cfg.distill.teacher_run, "teacher_targets", "train")
+        assert os.path.isdir(t_dir), f"no precomputed teacher targets in {t_dir}"
+        assert not train_crop, "train_crop is not supported with distill"
+        # read by the train loader's workers, which are forked at the first batch
+        train_dataset.teacher_target_dir = t_dir
+        distill_w = float(cfg.distill.weight)
+        if is_main_process:
+            logging.info(f"Output distillation from {t_dir}, weight {distill_w}")
 
     # ---- Loss ----
     loss_fn = torch.nn.HuberLoss(delta=cfg.trainer.huber_delta)
@@ -618,21 +682,20 @@ if __name__ == "__main__":
                 pbar.close()
                 sys.exit(0)
 
-            inputs_lr, _inputs_hr, targets = batch
-            if inputs_lr.dim() == 5:
-                inputs_lr = inputs_lr.squeeze(0)
-            if targets.dim() == 5:
-                targets = targets.squeeze(0)
-
-            inputs_lr = inputs_lr.to(device)
-            targets = targets.to(device)
-
-            landsat = inputs_lr[:, :n_landsat_bands]
+            inputs_lr, inputs_hr, targets, *h_teacher = (t.squeeze(0) if t.dim() == 5 else t for t in batch)
+            if train_crop:
+                inputs_lr, inputs_hr, targets = _random_crop(inputs_lr, inputs_hr, targets, train_crop, crop_gen)
+            inputs_lr, inputs_hr, targets = inputs_lr.to(device), inputs_hr.to(device), targets.to(device)
+            target_size = tuple(targets.shape[-2:])
 
             is_last_micro = (micro_step == accumulation_steps - 1)
             with _maybe_no_sync(model, is_distributed and not is_last_micro):
-                pred = model((landsat + 1.0) / 2.0, target_size=tuple(targets.shape[-2:]))
-                loss = loss_fn(pred, targets)
+                pred = model(_model_input(inputs_lr, inputs_hr, input_source, n_landsat_bands),
+                             target_size=target_size)
+                loss = loss_gt = loss_fn(pred, targets)
+                if distill_w:
+                    loss_kd = loss_fn(pred, h_teacher[0].to(device))
+                    loss = (1.0 - distill_w) * loss_gt + distill_w * loss_kd
                 (loss / accumulation_steps).backward()
 
             if is_last_micro:
@@ -655,6 +718,8 @@ if __name__ == "__main__":
                 pbar.set_postfix(loss=f"{loss_val:.4f}", r2=f"{best_r2:.4f}")
                 logging.info(f"[step {step}] loss={loss_val:.5f} lr={lr_cur:.2e}")
                 log_dict = {"train/loss": loss_val, "lr": lr_cur}
+                if distill_w:
+                    log_dict.update({"train/loss_gt": loss_gt.item(), "train/loss_kd": loss_kd.item()})
                 wandb.log(log_dict, step=step)
                 tb_logger.log_dict(log_dict, global_step=step)
 
@@ -663,6 +728,7 @@ if __name__ == "__main__":
                     model, val_dataset, device,
                     n_landsat_bands=n_landsat_bands,
                     target_vmax=target_vmax,
+                    input_source=input_source,
                     val_offset=val_offset,
                     global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
                 )
@@ -694,47 +760,28 @@ if __name__ == "__main__":
 
     pbar.close()
 
-    # Final full validation from the best checkpoint. Every rank loads it so
-    # the sharded validate() combines consistent weights.
+    # Final evaluation from the best checkpoint, on the held-out test set only
+    # (the number to report; best.pth is picked by val R2 above). Every rank
+    # loads it so the sharded validate() combines consistent weights.
     if is_distributed:
         _barrier()
     best_ckpt_path = os.path.join(out_dir_ckpt, "best.pth")
     if os.path.exists(best_ckpt_path):
         load_checkpoint(model, optimizer, lr_scheduler, best_ckpt_path)
         if is_main_process:
-            logging.info(f"Loaded best checkpoint from {best_ckpt_path} for final validation")
+            logging.info(f"Loaded best checkpoint from {best_ckpt_path} for the final test evaluation")
     elif is_main_process:
-        logging.warning("Best checkpoint not found, using final model weights for full validation")
+        logging.warning("Best checkpoint not found, using final model weights for the test evaluation")
 
-    if is_main_process:
-        logging.info("Running full validation on entire val set...")
-    final_metrics, final_fig = validate(
-        model, val_dataset, device,
-        n_landsat_bands=n_landsat_bands,
-        target_vmax=target_vmax,
-        full=True,
-        global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
-        num_workers=cfg_data.workers,
-    )
-    if is_main_process:
-        logging.info(f"Final val metrics: {final_metrics}")
-        final_log = {f"val_final/{k}": v for k, v in final_metrics.items()}
-        if final_fig is not None:
-            final_log["val_final/samples"] = wandb.Image(final_fig)
-            plt.close(final_fig)
-        wandb.log(final_log, step=step)
-
-    # Held-out test set: the number to report. Never used for model selection
-    # (best.pth is picked by val R2 above).
     if is_main_process:
         logging.info("Running full evaluation on the test set...")
     test_metrics, test_fig = validate(
         model, test_dataset, device,
         n_landsat_bands=n_landsat_bands,
         target_vmax=target_vmax,
+        input_source=input_source,
         full=True,
         global_rank=global_rank, world_size=world_size, is_distributed=is_distributed,
-        num_workers=cfg_data.workers,
         range_edges=range_edges,
     )
     if is_main_process:

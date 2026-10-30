@@ -89,6 +89,16 @@ class LazyPatchDataset(Dataset):
     # When True (set on eval copies), __getitem__ returns patch_coords[idx]
     # instead of a random patch of a random size.
     deterministic_eval = False
+    # When set (on a training copy), __getitem__ also returns each patch's
+    # precomputed distillation target, <dir>/<patch_key>.npy (target grid,
+    # metres), as a 4th tensor (script/depth/precompute_teacher.py).
+    teacher_target_dir = None
+
+    @staticmethod
+    def patch_key(patch_data):
+        """File-name-safe identity of a patch (tile, output crop, size)."""
+        return (f"{patch_data['tile_id'].replace(',', '-')}_y{patch_data['output_crop_y']}"
+                f"_x{patch_data['output_crop_x']}_s{patch_data['output_patch_height']}")
 
     def __init__(self, config):
         # 读取多模态文件地址，输出patch信息成pkl文件；如果pkl文件已经存在，则直接读取
@@ -742,7 +752,8 @@ class LazyPatchDataset(Dataset):
         inputs_lr = []
         targets = []
         inputs_hr = []
-        
+        teacher_targets = []
+
         for patch_data in batch_patches:
 
             # Last-resort safety net on top of _read_window_with_retry's
@@ -809,7 +820,10 @@ class LazyPatchDataset(Dataset):
             inputs_lr.append(input_patch_lr)
             targets.append(output_patch)
             inputs_hr.append(input_patch_hr)
-        
+            if self.teacher_target_dir is not None:
+                path = os.path.join(self.teacher_target_dir, LazyPatchDataset.patch_key(patch_data) + ".npy")
+                teacher_targets.append(torch.from_numpy(np.load(path).astype(np.float32))[None])
+
         # Stack into batches
         input_batch = torch.stack(inputs_lr, dim=0)  # (batch_size, C, H, W)
         target_batch = torch.stack(targets, dim=0)  # (batch_size, 1, H, W)
@@ -828,4 +842,6 @@ class LazyPatchDataset(Dataset):
             target_batch = torch.clamp(target_batch, min=-1.0, max=1.0)
         else:
             target_batch = torch.clamp(target_batch, min=0.0, max=50)  # for CHM
+        if self.teacher_target_dir is not None:
+            return input_batch, input_batch_hr, target_batch, torch.stack(teacher_targets, dim=0)
         return input_batch, input_batch_hr, target_batch

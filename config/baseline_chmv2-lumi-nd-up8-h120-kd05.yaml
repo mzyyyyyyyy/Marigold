@@ -1,0 +1,15 @@
+base_config:
+- config/baseline_chmv2-lumi-nd-up8-h120.yaml
+
+wandb:
+  name: baseline_chmv2-lumi-nd-up8-h120-kd05
+
+# Does PlanetScope available only at training time raise Landsat-only accuracy?
+# baseline_chmv2-lumi-nd-up8-h120 (Landsat only, unchanged model/recipe) with
+# output distillation from the PS teacher baseline_chmv2-lumi-nd-ps8-h120:
+#   loss = 0.5 * Huber(pred, GT) + 0.5 * Huber(pred, teacher)
+# The teacher's train-patch predictions are precomputed
+# (script/depth/precompute_teacher.py); inference uses Landsat only.
+distill:
+  teacher_run: /flash/project_465002934/Marigold_output/baseline_chmv2-lumi-nd-ps8-h120
+  weight: 0.5

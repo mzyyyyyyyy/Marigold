@@ -68,7 +68,7 @@ class CHMv2Height(nn.Module):
 
     def __init__(self, model_id: str, mean: list, std: list, pretrained: bool = True,
                  freeze_backbone: bool = True, upsample_input: bool = False,
-                 out_in_scale_factor: int = 1, input_scale: int = 1):
+                 out_in_scale_factor: int = 1, input_scale: int = 1, sampled_head: bool = False):
         super().__init__()
         if pretrained:
             self.model = AutoModelForDepthEstimation.from_pretrained(model_id, trust_remote_code=True)
@@ -88,6 +88,14 @@ class CHMv2Height(nn.Module):
         # ViT tokens); the output is resized back to target size at the end.
         self.input_scale = round(input_scale)
         assert self.input_scale == 1 or upsample_input, "input_scale > 1 needs upsample_input"
+        # The head's last layers run at the input size and the result is then
+        # bilinearly resized to target size; with input_scale k >= 4 (even)
+        # that resize only reads 2x2 of every k x k head pixels, so
+        # sampled_head evaluates those pixels alone (same output and
+        # gradients, see _sampled_head_depth).
+        self.sampled_head = sampled_head
+        assert not sampled_head or (self.input_scale >= 4 and self.input_scale % 2 == 0), \
+            "sampled_head needs an even input_scale >= 4"
         # Same trainable upsampling module as DepthAnythingV2Height (used when
         # labels are out_in_scale_factor x higher resolution than the input).
         self.upsample_head = _make_upsample_head(self.out_in_scale_factor) if self.out_in_scale_factor > 1 else None
@@ -117,6 +125,9 @@ class CHMv2Height(nn.Module):
                               mode="bilinear", align_corners=False)
         H, W = x.shape[-2:]
         pad_h, pad_w = (-H) % self.PATCH, (-W) % self.PATCH
+        if self.sampled_head and target_size is not None:
+            assert not (pad_h or pad_w), f"sampled_head needs an input size divisible by {self.PATCH}"
+            return self._sampled_head_depth(x, tuple(target_size))
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
         depth = self.model(pixel_values=x).predicted_depth
@@ -132,6 +143,59 @@ class CHMv2Height(nn.Module):
         if tuple(depth.shape[-2:]) != target_size:
             depth = F.interpolate(depth, size=target_size, mode="bilinear", align_corners=False)
         return depth
+
+    @staticmethod
+    def _upsample2x_matrix(n: int, idx: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """(len(idx), n) matrix M: M @ v = entries idx of nn.Upsample(scale_factor=2,
+        mode="bilinear", align_corners=True) applied along v's length-n axis.
+        Applied as a matmul rather than index_select, whose backward (an atomic
+        index_add) is extremely slow on ROCm."""
+        src = idx.to(torch.float64) * (n - 1) / (2 * n - 1)
+        i0 = src.floor().long().clamp(max=n - 1)
+        i1 = (i0 + 1).clamp(max=n - 1)
+        w1 = src - i0
+        r = torch.arange(len(idx), device=idx.device)
+        m = torch.zeros(len(idx), n, dtype=torch.float64, device=idx.device)
+        m.index_put_((r, i0), 1 - w1, accumulate=True)
+        m.index_put_((r, i1), w1, accumulate=True)
+        return m.to(dtype)
+
+    def _sampled_head_depth(self, x: torch.Tensor, target_size: tuple) -> torch.Tensor:
+        """Same result as the default path for an input of k x target size (k =
+        input_scale), computing the head's full-resolution layers only where
+        they are read. Default path: fused features F at input/2 -> conv3x3 ->
+        2x bilinear up -> conv3x3 -> ReLU -> conv1x1 (bin logits) -> per-pixel
+        bins-to-height at the input size k*T, then a bilinear resize to T
+        (align_corners=False), which for even k puts target pixel i exactly
+        between head pixels k*i + k/2 - 1 and k*i + k/2: the mean of those 2x2.
+        Their 3x3 conv reads rows/cols k*i + k/2 - 2 ... k*i + k/2 + 1 (inside
+        the image, so the zero padding never matters): gather those 4 per
+        target pixel (block i = gathered rows 4i ... 4i+3), then a valid 3x3
+        conv with stride 4 at offset a in {0, 1} gives exactly head pixel
+        k*i + k/2 - 1 + a. Needs the fused features at exactly input/2, which
+        holds when the token grid (input / 16) is even (an odd grid makes the
+        DPT fusion round up, and the default path then resizes)."""
+        m, k = self.model, self.input_scale
+        (Th, Tw), (H, W) = target_size, x.shape[-2:]
+        assert (H, W) == (k * Th, k * Tw), f"sampled_head needs an input of {k} x the target size"
+        bb = m.backbone(x)
+        feats = m.head.forward_features(list(zip(bb.feature_maps, bb.cls_tokens)), H // self.PATCH, W // self.PATCH)
+        assert tuple(feats.shape[-2:]) == (H // 2, W // 2), \
+            f"sampled_head: fused features {tuple(feats.shape[-2:])} != input/2 (odd token grid?)"
+        conv_a, up, conv_b, relu, conv_c = m.head.conv_depth.head
+        assert isinstance(up, nn.Upsample) and up.scale_factor == 2 and up.align_corners
+        h = conv_a(feats)  # (B, C, H/2, W/2)
+        off = torch.arange(-2, 2, device=x.device)
+        rows = (k * torch.arange(Th, device=x.device) + k // 2).view(-1, 1) + off  # (Th, 4)
+        cols = (k * torch.arange(Tw, device=x.device) + k // 2).view(-1, 1) + off
+        h = self._upsample2x_matrix(h.shape[2], rows.flatten(), h.dtype) @ h
+        h = h @ self._upsample2x_matrix(h.shape[3], cols.flatten(), h.dtype).t()  # (B, C, 4*Th, 4*Tw)
+        depth = 0.0
+        for a in (0, 1):
+            for b in (0, 1):
+                o = relu(F.conv2d(h[..., a:, b:], conv_b.weight, conv_b.bias, stride=4))  # (B, C, Th, Tw)
+                depth = depth + m.features_to_depth(conv_c(o))  # per-pixel: (B, 1, Th, Tw)
+        return depth / 4.0
 
     @torch.no_grad()
     def find_unused_trainable_params(self, size: int = 64) -> list:
@@ -149,19 +213,20 @@ class CHMv2Height(nn.Module):
 
 def load_chmv2_baseline(model_dir: str, ckpt_path: str, mean: list, std: list,
                         out_in_scale_factor: int = 1, upsample_input: bool = False,
-                        input_scale: int = 1) -> nn.Module:
+                        input_scale: int = 1, sampled_head: bool = False) -> nn.Module:
     """Load a CHMv2Height checkpoint trained by script/depth/train_baseline_chmv2.py
     (CHMv2 + learnable upsample_head) as a frozen coarse-height predictor.
 
     model_dir: local dir of facebook/dinov3-vitl16-chmv2-dpt-head (only config is
         read here -- pretrained=False -- all weights come from ckpt_path).
     out_in_scale_factor, upsample_input, input_scale: must match the values
-        used in that training run.
+        used in that training run (sampled_head only changes memory/speed).
     Call as model(landsat_01, target_size) -> (B, 1, *target_size) in metres.
     """
     model = CHMv2Height(model_id=model_dir, mean=mean, std=std, pretrained=False,
                         freeze_backbone=False, out_in_scale_factor=out_in_scale_factor,
-                        upsample_input=upsample_input, input_scale=input_scale)
+                        upsample_input=upsample_input, input_scale=input_scale,
+                        sampled_head=sampled_head)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=True)
     model.requires_grad_(False)
